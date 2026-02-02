@@ -42,6 +42,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
     Show an interactive preview window for tuning preprocessing parameters.
 
     Opens a window with a sample frame from the video and trackbars to adjust:
+    - Frame selection (slider to choose exact frame with trail signal)
     - CLAHE clip limit (contrast enhancement strength)
     - CLAHE tile grid size (local region size for contrast)
     - Gaussian blur kernel size (smoothing extent)
@@ -49,12 +50,13 @@ def show_preprocessing_preview(video_path, initial_params=None):
     - Canny edge detection thresholds (for visualization)
 
     Controls:
-    - Adjust sliders to see real-time preprocessing effect
+    - Use Frame slider to select exact frame containing trail signal
+    - Adjust other sliders to see real-time preprocessing effect
     - Press SPACE or ENTER to accept current settings
     - Press ESC to cancel and use default settings
     - Press 'R' to reset to default values
-    - Press 'N' to load next frame from video
-    - Press 'P' to load previous frame
+    - Press 'N' to jump forward 1 second
+    - Press 'P' to jump back 1 second
 
     Args:
         video_path: Path to the input video file
@@ -124,11 +126,28 @@ def show_preprocessing_preview(video_path, initial_params=None):
     # Flag to trigger update
     needs_update = [True]  # Using list to allow modification in nested function
 
+    # Track current frame index (mutable for callback access)
+    frame_state = {
+        'current_idx': current_frame_idx,
+        'frame': frame,
+        'needs_frame_update': False
+    }
+
     def on_trackbar_change(val):
         """Callback when any trackbar changes."""
         needs_update[0] = True
 
-    # Create trackbars
+    def on_frame_trackbar_change(val):
+        """Callback when frame slider changes."""
+        if val != frame_state['current_idx']:
+            frame_state['needs_frame_update'] = True
+        needs_update[0] = True
+
+    # Create frame selection trackbar FIRST (appears at top)
+    # Use frame index from 0 to total_frames-1
+    cv2.createTrackbar("Frame", window_name, current_frame_idx, max(1, total_frames - 1), on_frame_trackbar_change)
+
+    # Create preprocessing parameter trackbars
     # CLAHE clip limit: 1-100 (divided by 10 = 0.1 to 10.0)
     cv2.createTrackbar("CLAHE Clip (x0.1)", window_name, params['clahe_clip_limit'], 100, on_trackbar_change)
 
@@ -237,18 +256,31 @@ def show_preprocessing_preview(video_path, initial_params=None):
     print("\n" + "=" * 60)
     print("PREPROCESSING PREVIEW")
     print("=" * 60)
-    print("Adjust the sliders to tune preprocessing parameters.")
+    print("Use the Frame slider to find a frame with satellite trail signal.")
+    print("Then adjust other sliders to tune preprocessing parameters.")
     print("The goal is to preserve dim satellite trails while reducing noise.")
     print("\nControls:")
-    print("  SPACE/ENTER - Accept current settings and continue")
-    print("  ESC         - Cancel and use default settings")
-    print("  R           - Reset to default values")
-    print("  N           - Load next frame")
-    print("  P           - Load previous frame")
+    print("  Frame slider - Select exact frame to preview")
+    print("  SPACE/ENTER  - Accept current settings and continue")
+    print("  ESC          - Cancel and use default settings")
+    print("  R            - Reset to default values")
+    print("  N            - Jump forward 1 second")
+    print("  P            - Jump back 1 second")
     print("=" * 60 + "\n")
 
     # Main loop
     while True:
+        # Read frame slider and load new frame if changed
+        slider_frame_idx = cv2.getTrackbarPos("Frame", window_name)
+        if slider_frame_idx != current_frame_idx:
+            current_frame_idx = slider_frame_idx
+            cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_idx)
+            ret, new_frame = cap.read()
+            if ret:
+                frame = new_frame
+                frame_state['current_idx'] = current_frame_idx
+                frame_state['frame'] = frame
+
         # Read current trackbar values
         params['clahe_clip_limit'] = cv2.getTrackbarPos("CLAHE Clip (x0.1)", window_name)
         params['clahe_tile_size'] = cv2.getTrackbarPos("CLAHE Tile Size", window_name)
@@ -309,21 +341,25 @@ def show_preprocessing_preview(video_path, initial_params=None):
             # Jump forward by 1 second worth of frames
             current_frame_idx = min(total_frames - 1, current_frame_idx + int(fps))
             cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_idx)
-            ret, frame = cap.read()
+            ret, new_frame = cap.read()
             if not ret:
                 current_frame_idx = 0
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ret, frame = cap.read()
+                ret, new_frame = cap.read()
             if ret:
-                original_frame = frame.copy()
+                frame = new_frame
+                frame_state['current_idx'] = current_frame_idx
+                cv2.setTrackbarPos("Frame", window_name, current_frame_idx)
 
         elif key == ord('p') or key == ord('P'):  # Previous frame
             # Jump back by 1 second worth of frames
             current_frame_idx = max(0, current_frame_idx - int(fps))
             cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_idx)
-            ret, frame = cap.read()
+            ret, new_frame = cap.read()
             if ret:
-                original_frame = frame.copy()
+                frame = new_frame
+                frame_state['current_idx'] = current_frame_idx
+                cv2.setTrackbarPos("Frame", window_name, current_frame_idx)
 
         # Check if window was closed
         if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
