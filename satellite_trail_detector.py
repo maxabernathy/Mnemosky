@@ -37,6 +37,304 @@ from pathlib import Path
 from abc import ABC, abstractmethod
 
 
+def show_preprocessing_preview(video_path, initial_params=None):
+    """
+    Show an interactive preview window for tuning preprocessing parameters.
+
+    Opens a window with a sample frame from the video and trackbars to adjust:
+    - CLAHE clip limit (contrast enhancement strength)
+    - CLAHE tile grid size (local region size for contrast)
+    - Gaussian blur kernel size (smoothing extent)
+    - Gaussian blur sigma (smoothing intensity)
+    - Canny edge detection thresholds (for visualization)
+
+    Controls:
+    - Adjust sliders to see real-time preprocessing effect
+    - Press SPACE or ENTER to accept current settings
+    - Press ESC to cancel and use default settings
+    - Press 'R' to reset to default values
+    - Press 'N' to load next frame from video
+    - Press 'P' to load previous frame
+
+    Args:
+        video_path: Path to the input video file
+        initial_params: Optional dict with initial parameter values
+
+    Returns:
+        Dict with selected preprocessing parameters, or None if cancelled
+    """
+    # Default parameters
+    defaults = {
+        'clahe_clip_limit': 40,      # Stored as int, divide by 10 for actual value
+        'clahe_tile_size': 6,
+        'blur_kernel_size': 3,       # Must be odd
+        'blur_sigma': 3,             # Stored as int, divide by 10 for actual value
+        'canny_low': 5,
+        'canny_high': 50,
+    }
+
+    # Use initial params if provided
+    if initial_params:
+        for key in defaults:
+            if key in initial_params:
+                defaults[key] = initial_params[key]
+
+    # Open video and get a sample frame
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        print(f"Error: Could not open video for preview: {video_path}")
+        return None
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    # Sample frames at different points in the video for user to choose from
+    # Start with frame at 10% into the video (to skip any intro)
+    current_frame_idx = max(0, int(total_frames * 0.1))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_idx)
+
+    ret, frame = cap.read()
+    if not ret:
+        # Try from beginning
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ret, frame = cap.read()
+        current_frame_idx = 0
+        if not ret:
+            print("Error: Could not read any frame from video")
+            cap.release()
+            return None
+
+    # Store original frame for reset
+    original_frame = frame.copy()
+    height, width = frame.shape[:2]
+
+    # Create window
+    window_name = "Preprocessing Preview - Adjust parameters and press SPACE/ENTER to confirm, ESC to cancel"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    # Resize window to fit screen while maintaining aspect ratio
+    screen_scale = min(1.0, 1400 / width, 900 / height)
+    display_width = int(width * screen_scale)
+    display_height = int(height * screen_scale)
+    cv2.resizeWindow(window_name, display_width, display_height)
+
+    # Current parameter values (mutable)
+    params = defaults.copy()
+
+    # Flag to trigger update
+    needs_update = [True]  # Using list to allow modification in nested function
+
+    def on_trackbar_change(val):
+        """Callback when any trackbar changes."""
+        needs_update[0] = True
+
+    # Create trackbars
+    # CLAHE clip limit: 1-100 (divided by 10 = 0.1 to 10.0)
+    cv2.createTrackbar("CLAHE Clip (x0.1)", window_name, params['clahe_clip_limit'], 100, on_trackbar_change)
+
+    # CLAHE tile size: 2-16
+    cv2.createTrackbar("CLAHE Tile Size", window_name, params['clahe_tile_size'], 16, on_trackbar_change)
+
+    # Blur kernel size: 1-15 (will be forced to odd)
+    cv2.createTrackbar("Blur Kernel", window_name, params['blur_kernel_size'], 15, on_trackbar_change)
+
+    # Blur sigma: 0-50 (divided by 10 = 0.0 to 5.0)
+    cv2.createTrackbar("Blur Sigma (x0.1)", window_name, params['blur_sigma'], 50, on_trackbar_change)
+
+    # Canny thresholds for edge visualization
+    cv2.createTrackbar("Canny Low", window_name, params['canny_low'], 100, on_trackbar_change)
+    cv2.createTrackbar("Canny High", window_name, params['canny_high'], 200, on_trackbar_change)
+
+    def apply_preprocessing(frame, params):
+        """Apply preprocessing with current parameters."""
+        # Convert to grayscale
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Get actual parameter values
+        clip_limit = max(0.1, params['clahe_clip_limit'] / 10.0)
+        tile_size = max(2, params['clahe_tile_size'])
+        blur_kernel = params['blur_kernel_size']
+        blur_sigma = params['blur_sigma'] / 10.0
+
+        # Ensure blur kernel is odd
+        if blur_kernel < 1:
+            blur_kernel = 1
+        if blur_kernel % 2 == 0:
+            blur_kernel += 1
+
+        # Apply CLAHE
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_size, tile_size))
+        enhanced = clahe.apply(gray)
+
+        # Apply Gaussian blur
+        if blur_kernel >= 1 and blur_sigma > 0:
+            blurred = cv2.GaussianBlur(enhanced, (blur_kernel, blur_kernel), blur_sigma)
+        else:
+            blurred = enhanced
+
+        # Apply Canny edge detection for visualization
+        canny_low = max(1, params['canny_low'])
+        canny_high = max(canny_low + 1, params['canny_high'])
+        edges = cv2.Canny(blurred, canny_low, canny_high)
+
+        return gray, enhanced, blurred, edges
+
+    def create_display(frame, gray, enhanced, blurred, edges, params):
+        """Create a display showing original, preprocessed stages, and edges."""
+        h, w = frame.shape[:2]
+
+        # Create 2x2 grid: Original | CLAHE Enhanced
+        #                  Blurred  | Edges
+        # Each panel is half size
+        panel_h = h // 2
+        panel_w = w // 2
+
+        # Resize panels
+        original_small = cv2.resize(frame, (panel_w, panel_h))
+        enhanced_bgr = cv2.cvtColor(cv2.resize(enhanced, (panel_w, panel_h)), cv2.COLOR_GRAY2BGR)
+        blurred_bgr = cv2.cvtColor(cv2.resize(blurred, (panel_w, panel_h)), cv2.COLOR_GRAY2BGR)
+        edges_bgr = cv2.cvtColor(cv2.resize(edges, (panel_w, panel_h)), cv2.COLOR_GRAY2BGR)
+
+        # Create labels background
+        def add_label(img, text, position="top"):
+            overlay = img.copy()
+            if position == "top":
+                cv2.rectangle(overlay, (0, 0), (len(text) * 12 + 10, 25), (0, 0, 0), -1)
+                cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
+                cv2.putText(img, text, (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            return img
+
+        # Add labels
+        add_label(original_small, "1. Original Frame")
+        add_label(enhanced_bgr, f"2. CLAHE (clip={params['clahe_clip_limit']/10:.1f}, tile={params['clahe_tile_size']})")
+
+        blur_k = params['blur_kernel_size']
+        if blur_k % 2 == 0:
+            blur_k += 1
+        add_label(blurred_bgr, f"3. Gaussian Blur (k={blur_k}, s={params['blur_sigma']/10:.1f})")
+        add_label(edges_bgr, f"4. Canny Edges ({params['canny_low']}-{params['canny_high']})")
+
+        # Combine into grid
+        top_row = np.hstack([original_small, enhanced_bgr])
+        bottom_row = np.hstack([blurred_bgr, edges_bgr])
+        display = np.vstack([top_row, bottom_row])
+
+        # Add instructions at the bottom
+        instruction_bar = np.zeros((40, display.shape[1], 3), dtype=np.uint8)
+        instructions = "SPACE/ENTER: Accept | ESC: Cancel | R: Reset | N/P: Next/Prev frame"
+        cv2.putText(instruction_bar, instructions, (10, 25),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+
+        # Add frame info
+        frame_info = f"Frame {current_frame_idx}/{total_frames} | {width}x{height}"
+        cv2.putText(instruction_bar, frame_info, (display.shape[1] - 250, 25),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1, cv2.LINE_AA)
+
+        display = np.vstack([display, instruction_bar])
+
+        return display
+
+    print("\n" + "=" * 60)
+    print("PREPROCESSING PREVIEW")
+    print("=" * 60)
+    print("Adjust the sliders to tune preprocessing parameters.")
+    print("The goal is to preserve dim satellite trails while reducing noise.")
+    print("\nControls:")
+    print("  SPACE/ENTER - Accept current settings and continue")
+    print("  ESC         - Cancel and use default settings")
+    print("  R           - Reset to default values")
+    print("  N           - Load next frame")
+    print("  P           - Load previous frame")
+    print("=" * 60 + "\n")
+
+    # Main loop
+    while True:
+        # Read current trackbar values
+        params['clahe_clip_limit'] = cv2.getTrackbarPos("CLAHE Clip (x0.1)", window_name)
+        params['clahe_tile_size'] = cv2.getTrackbarPos("CLAHE Tile Size", window_name)
+        params['blur_kernel_size'] = cv2.getTrackbarPos("Blur Kernel", window_name)
+        params['blur_sigma'] = cv2.getTrackbarPos("Blur Sigma (x0.1)", window_name)
+        params['canny_low'] = cv2.getTrackbarPos("Canny Low", window_name)
+        params['canny_high'] = cv2.getTrackbarPos("Canny High", window_name)
+
+        # Apply preprocessing
+        gray, enhanced, blurred, edges = apply_preprocessing(frame, params)
+
+        # Create display
+        display = create_display(frame, gray, enhanced, blurred, edges, params)
+
+        # Show
+        cv2.imshow(window_name, display)
+
+        # Wait for key
+        key = cv2.waitKey(50) & 0xFF
+
+        if key == 27:  # ESC - cancel
+            print("Preview cancelled. Using default parameters.")
+            cv2.destroyWindow(window_name)
+            cap.release()
+            return None
+
+        elif key in [13, 32]:  # ENTER or SPACE - accept
+            # Convert to actual values
+            final_params = {
+                'clahe_clip_limit': max(0.1, params['clahe_clip_limit'] / 10.0),
+                'clahe_tile_size': max(2, params['clahe_tile_size']),
+                'blur_kernel_size': params['blur_kernel_size'] if params['blur_kernel_size'] % 2 == 1 else params['blur_kernel_size'] + 1,
+                'blur_sigma': params['blur_sigma'] / 10.0,
+                'canny_low': params['canny_low'],
+                'canny_high': params['canny_high'],
+            }
+            print(f"\nAccepted preprocessing parameters:")
+            print(f"  CLAHE clip limit: {final_params['clahe_clip_limit']:.1f}")
+            print(f"  CLAHE tile size: {final_params['clahe_tile_size']}")
+            print(f"  Blur kernel size: {final_params['blur_kernel_size']}")
+            print(f"  Blur sigma: {final_params['blur_sigma']:.1f}")
+            print(f"  Canny thresholds: {final_params['canny_low']}-{final_params['canny_high']}")
+            cv2.destroyWindow(window_name)
+            cap.release()
+            return final_params
+
+        elif key == ord('r') or key == ord('R'):  # Reset
+            params = defaults.copy()
+            cv2.setTrackbarPos("CLAHE Clip (x0.1)", window_name, params['clahe_clip_limit'])
+            cv2.setTrackbarPos("CLAHE Tile Size", window_name, params['clahe_tile_size'])
+            cv2.setTrackbarPos("Blur Kernel", window_name, params['blur_kernel_size'])
+            cv2.setTrackbarPos("Blur Sigma (x0.1)", window_name, params['blur_sigma'])
+            cv2.setTrackbarPos("Canny Low", window_name, params['canny_low'])
+            cv2.setTrackbarPos("Canny High", window_name, params['canny_high'])
+            print("Parameters reset to defaults.")
+
+        elif key == ord('n') or key == ord('N'):  # Next frame
+            # Jump forward by 1 second worth of frames
+            current_frame_idx = min(total_frames - 1, current_frame_idx + int(fps))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_idx)
+            ret, frame = cap.read()
+            if not ret:
+                current_frame_idx = 0
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = cap.read()
+            if ret:
+                original_frame = frame.copy()
+
+        elif key == ord('p') or key == ord('P'):  # Previous frame
+            # Jump back by 1 second worth of frames
+            current_frame_idx = max(0, current_frame_idx - int(fps))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_idx)
+            ret, frame = cap.read()
+            if ret:
+                original_frame = frame.copy()
+
+        # Check if window was closed
+        if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+            print("Preview window closed. Using default parameters.")
+            cap.release()
+            return None
+
+    cap.release()
+    return None
+
+
 class BaseDetectionAlgorithm(ABC):
     """
     Abstract base class for trail detection algorithms.
@@ -341,16 +639,35 @@ class DefaultDetectionAlgorithm(BaseDetectionAlgorithm):
 
         return num_peaks
 
-    def classify_trail(self, line, gray_frame, color_frame):
-    """Detects and classifies satellite and airplane trails in video frames using line detection and morphological operations."""
-    
-    def __init__(self, sensitivity='medium'):
+
+class SatelliteTrailDetector:
+    """
+    Satellite and airplane trail detector with configurable sensitivity presets.
+
+    Detects and classifies satellite and airplane trails in video frames using
+    line detection and morphological operations.
+
+    This class provides high-level detection interface with sensitivity presets
+    (low, medium, high) and optional custom preprocessing parameters.
+    """
+
+    def __init__(self, sensitivity='medium', preprocessing_params=None):
         """
-        Initialize detector with sensitivity level.
+        Initialize detector with sensitivity level and optional custom preprocessing.
 
         Args:
             sensitivity: 'low', 'medium', or 'high' - affects detection thresholds
+            preprocessing_params: Optional dict with custom preprocessing parameters:
+                - clahe_clip_limit: CLAHE clip limit (default: 4.0)
+                - clahe_tile_size: CLAHE tile grid size (default: 6)
+                - blur_kernel_size: Gaussian blur kernel size (default: 3, must be odd)
+                - blur_sigma: Gaussian blur sigma (default: 0.3)
+                - canny_low: Canny edge detection low threshold
+                - canny_high: Canny edge detection high threshold
         """
+        # Store custom preprocessing parameters
+        self.preprocessing_params = preprocessing_params
+
         # Sensitivity presets - rebalanced to reduce false positives
         presets = {
             'low': {
@@ -401,28 +718,52 @@ class DefaultDetectionAlgorithm(BaseDetectionAlgorithm):
         self.box_thickness = 1
         self.dot_length = 8  # Length of each dash in dotted line
         self.gap_length = 4  # Gap between dashes
-        
+
+        # Apply custom canny thresholds to params if provided
+        if self.preprocessing_params:
+            if 'canny_low' in self.preprocessing_params:
+                self.params['canny_low'] = self.preprocessing_params['canny_low']
+            if 'canny_high' in self.preprocessing_params:
+                self.params['canny_high'] = self.preprocessing_params['canny_high']
+
     def preprocess_frame(self, frame):
         """Convert frame to grayscale and enhance for trail detection."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
+        # Get preprocessing parameters (use custom if available, otherwise defaults)
+        if self.preprocessing_params:
+            clip_limit = self.preprocessing_params.get('clahe_clip_limit', 4.0)
+            tile_size = self.preprocessing_params.get('clahe_tile_size', 6)
+            blur_kernel = self.preprocessing_params.get('blur_kernel_size', 3)
+            blur_sigma = self.preprocessing_params.get('blur_sigma', 0.3)
+        else:
+            clip_limit = 4.0
+            tile_size = 6
+            blur_kernel = 3
+            blur_sigma = 0.3
+
+        # Ensure blur kernel is odd
+        if blur_kernel % 2 == 0:
+            blur_kernel += 1
+
         # Apply CLAHE for contrast enhancement (helps with dim trails)
-        # Increased clipLimit and smaller tiles for better detection of very dim satellites
-        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(6, 6))
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_size, tile_size))
         enhanced = clahe.apply(gray)
 
-        # Very minimal Gaussian blur - reduced to preserve more signal and detail
-        # Using sigma=0.3 for extremely light smoothing to reduce sensor noise only
-        blurred = cv2.GaussianBlur(enhanced, (3, 3), 0.3)
+        # Apply Gaussian blur - smoothing to reduce sensor noise
+        if blur_kernel >= 1 and blur_sigma > 0:
+            blurred = cv2.GaussianBlur(enhanced, (blur_kernel, blur_kernel), blur_sigma)
+        else:
+            blurred = enhanced
 
         return gray, blurred
-    
+
     def detect_lines(self, preprocessed):
         """Detect lines using Canny edge detection and Hough transform."""
         # Edge detection
         edges = cv2.Canny(
-            preprocessed, 
-            self.params['canny_low'], 
+            preprocessed,
+            self.params['canny_low'],
             self.params['canny_high']
         )
         
@@ -1191,7 +1532,7 @@ class DefaultDetectionAlgorithm(BaseDetectionAlgorithm):
         return panel
 
 
-def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False):
+def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None):
     """
     Process video to detect and highlight satellite and airplane trails.
 
@@ -1208,6 +1549,7 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         show_labels: Whether to show labels on bounding boxes (default: True)
         debug_mode: If True, creates side-by-side view with debug visualization (default: False)
         debug_only: If True, outputs ONLY debug visualization without normal output (default: False)
+        preprocessing_params: Optional dict with custom preprocessing parameters from preview
     """
     # Validate input
     input_path = Path(input_path)
@@ -1298,7 +1640,7 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         sys.exit(1)
     
     # Initialize detector
-    detector = SatelliteTrailDetector(sensitivity)
+    detector = SatelliteTrailDetector(sensitivity, preprocessing_params=preprocessing_params)
 
     frame_count = 0
     satellites_detected = 0
@@ -1495,6 +1837,7 @@ Examples:
     python satellite_trail_detector.py video.mp4 clean_output.mp4 --no-labels
     python satellite_trail_detector.py video.mp4 debug_output.mp4 --debug
     python satellite_trail_detector.py video.mp4 debug_viz.mp4 --debug-only
+    python satellite_trail_detector.py video.mp4 output.mp4 --preview
 
 Notes:
     - Output video maintains same resolution and quality as input
@@ -1508,6 +1851,7 @@ Notes:
     - Use --no-labels to hide text labels (shows only colored boxes)
     - Use --debug to create side-by-side view showing all detected lines (2x width output)
     - Use --debug-only to output ONLY the debug visualization (same width as input)
+    - Use --preview to interactively tune preprocessing parameters before processing
         """
     )
     
@@ -1567,7 +1911,20 @@ Notes:
         help='Output ONLY debug visualization (no normal output, no side-by-side)'
     )
 
+    parser.add_argument(
+        '--preview', '-p',
+        action='store_true',
+        help='Show interactive preprocessing preview to tune CLAHE, blur, and edge detection parameters before processing'
+    )
+
     args = parser.parse_args()
+
+    # Handle preprocessing preview if requested
+    preprocessing_params = None
+    if args.preview:
+        preprocessing_params = show_preprocessing_preview(args.input)
+        if preprocessing_params is None:
+            print("Using default preprocessing parameters.")
 
     process_video(
         args.input,
@@ -1578,7 +1935,8 @@ Notes:
         detect_type=args.detect_type,
         show_labels=not args.no_labels,
         debug_mode=args.debug,
-        debug_only=args.debug_only
+        debug_only=args.debug_only,
+        preprocessing_params=preprocessing_params
     )
 
 
