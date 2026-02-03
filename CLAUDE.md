@@ -9,7 +9,6 @@
 ```
 Mnemosky/
 ├── satellite_trail_detector.py   # Main application (single-file implementation)
-├── README.md                      # Basic project info
 ├── .gitignore                     # Standard Python gitignore
 └── CLAUDE.md                      # This file
 ```
@@ -40,16 +39,18 @@ pip install opencv-python numpy
    - `detect_trails()` - Main pipeline (can be overridden)
    - `merge_overlapping_boxes()` - Utility for combining detections
 
-2. **`DefaultDetectionAlgorithm`** (extends BaseDetectionAlgorithm) - Main implementation
-   - Implements all abstract methods
-   - Contains the core detection and classification logic
+2. **`DefaultDetectionAlgorithm`** (extends BaseDetectionAlgorithm) - Partial implementation
+   - Implements `preprocess_frame()`, `detect_lines()`, `detect_point_features()`
+   - Note: `classify_trail()` is not implemented (incomplete class)
 
-3. **`SatelliteTrailDetector`** - Wrapper class with sensitivity presets
+3. **`SatelliteTrailDetector`** - Main detector class with sensitivity presets
    - Provides `low`, `medium`, `high` sensitivity configurations
-   - Delegates to `DefaultDetectionAlgorithm`
+   - Contains full detection pipeline including `classify_trail()` logic
+   - Supports custom preprocessing parameters via `preprocessing_params` argument
 
 ### Key Functions
 
+- `show_preprocessing_preview()` - Interactive GUI for tuning preprocessing parameters (CLAHE, blur, Canny)
 - `process_video()` - Main video processing pipeline (handles I/O, frame iteration, output)
 - `main()` - CLI entry point with argument parsing
 
@@ -103,6 +104,9 @@ python satellite_trail_detector.py input.mp4 output.mp4 --debug-only  # Debug on
 
 # Hide labels
 python satellite_trail_detector.py input.mp4 output.mp4 --no-labels
+
+# Interactive preprocessing preview (tune CLAHE, blur, Canny parameters)
+python satellite_trail_detector.py input.mp4 output.mp4 --preview
 ```
 
 ## Code Conventions
@@ -203,9 +207,11 @@ Add to the `main()` function's argument parser, then handle in `process_video()`
 
 | Component | Location |
 |-----------|----------|
-| Main entry point | `satellite_trail_detector.py:main()` (line ~1483) |
-| Video processing | `satellite_trail_detector.py:process_video()` (line ~1194) |
-| Detection algorithm | `satellite_trail_detector.py:DefaultDetectionAlgorithm` (line ~198) |
-| Classification logic | `satellite_trail_detector.py:classify_trail()` (within DefaultDetectionAlgorithm) |
-| Sensitivity presets | `satellite_trail_detector.py:SatelliteTrailDetector.__init__()` |
-| Abstract interface | `satellite_trail_detector.py:BaseDetectionAlgorithm` (line ~40) |
+| Preprocessing preview | `satellite_trail_detector.py:show_preprocessing_preview()` (line ~40) |
+| Abstract interface | `satellite_trail_detector.py:BaseDetectionAlgorithm` (line ~338) |
+| Partial implementation | `satellite_trail_detector.py:DefaultDetectionAlgorithm` (line ~496) |
+| Main detector class | `satellite_trail_detector.py:SatelliteTrailDetector` (line ~643) |
+| Sensitivity presets | `satellite_trail_detector.py:SatelliteTrailDetector.__init__()` (line ~654) |
+| Classification logic | `satellite_trail_detector.py:SatelliteTrailDetector.classify_trail()` (line ~878) |
+| Video processing | `satellite_trail_detector.py:process_video()` (line ~1535) |
+| Main entry point | `satellite_trail_detector.py:main()` (line ~1825) |
