@@ -651,7 +651,7 @@ class SatelliteTrailDetector:
     (low, medium, high) and optional custom preprocessing parameters.
     """
 
-    def __init__(self, sensitivity='medium', preprocessing_params=None):
+    def __init__(self, sensitivity='medium', preprocessing_params=None, skip_aspect_ratio_check=False):
         """
         Initialize detector with sensitivity level and optional custom preprocessing.
 
@@ -664,9 +664,11 @@ class SatelliteTrailDetector:
                 - blur_sigma: Gaussian blur sigma (default: 0.3)
                 - canny_low: Canny edge detection low threshold
                 - canny_high: Canny edge detection high threshold
+            skip_aspect_ratio_check: If True, disables aspect ratio filtering (default: False)
         """
         # Store custom preprocessing parameters
         self.preprocessing_params = preprocessing_params
+        self.skip_aspect_ratio_check = skip_aspect_ratio_check
 
         # Sensitivity presets - rebalanced to reduce false positives
         presets = {
@@ -965,7 +967,7 @@ class SatelliteTrailDetector:
         # Check aspect ratio (trails are long and thin)
         aspect_ratio = max(width, height) / min(width, height)
 
-        if aspect_ratio < self.params['min_aspect_ratio']:
+        if not self.skip_aspect_ratio_check and aspect_ratio < self.params['min_aspect_ratio']:
             return None, None
 
         # CLOUD AND FALSE POSITIVE FILTERING
@@ -1554,7 +1556,7 @@ class SatelliteTrailDetector:
         return panel
 
 
-def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None):
+def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False):
     """
     Process video to detect and highlight satellite and airplane trails.
 
@@ -1572,6 +1574,7 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         debug_mode: If True, creates side-by-side view with debug visualization (default: False)
         debug_only: If True, outputs ONLY debug visualization without normal output (default: False)
         preprocessing_params: Optional dict with custom preprocessing parameters from preview
+        skip_aspect_ratio_check: If True, disables aspect ratio filtering (default: False)
     """
     # Validate input
     input_path = Path(input_path)
@@ -1662,7 +1665,7 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         sys.exit(1)
     
     # Initialize detector
-    detector = SatelliteTrailDetector(sensitivity, preprocessing_params=preprocessing_params)
+    detector = SatelliteTrailDetector(sensitivity, preprocessing_params=preprocessing_params, skip_aspect_ratio_check=skip_aspect_ratio_check)
 
     frame_count = 0
     satellites_detected = 0
@@ -1939,6 +1942,12 @@ Notes:
         help='Show interactive preprocessing preview to tune CLAHE, blur, and edge detection parameters before processing'
     )
 
+    parser.add_argument(
+        '--no-aspect-ratio-check',
+        action='store_true',
+        help='Disable aspect ratio filtering (may improve performance but increase false positives)'
+    )
+
     args = parser.parse_args()
 
     # Handle preprocessing preview if requested
@@ -1958,7 +1967,8 @@ Notes:
         show_labels=not args.no_labels,
         debug_mode=args.debug,
         debug_only=args.debug_only,
-        preprocessing_params=preprocessing_params
+        preprocessing_params=preprocessing_params,
+        skip_aspect_ratio_check=args.no_aspect_ratio_check
     )
 
 
