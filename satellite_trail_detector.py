@@ -875,7 +875,7 @@ class SatelliteTrailDetector:
 
         return num_peaks
 
-    def classify_trail(self, line, gray_frame, color_frame):
+    def classify_trail(self, line, gray_frame, color_frame, hsv_frame=None, reusable_mask=None):
         """
         Classify a detected line as either a satellite or airplane trail.
 
@@ -884,6 +884,13 @@ class SatelliteTrailDetector:
                     Sometimes colorful dots (red, green, white). Can be any length including 180-300px.
         - Satellites: SMOOTH, consistent brightness along trail. No bright point features.
                      Dim, monochromatic, uniform appearance. Typically 180-300 pixels for 1920x1080.
+
+        Args:
+            line: Detected line from HoughLinesP
+            gray_frame: Grayscale frame
+            color_frame: BGR color frame
+            hsv_frame: Pre-computed HSV frame (optional, for performance)
+            reusable_mask: Pre-allocated mask array (optional, for performance)
 
         Returns:
             trail_type: 'satellite', 'airplane', or None
@@ -897,8 +904,12 @@ class SatelliteTrailDetector:
         if length < self.params['min_line_length']:
             return None, None
 
-        # Create a mask for the line region
-        mask = np.zeros(gray_frame.shape, dtype=np.uint8)
+        # Use reusable mask if provided, otherwise allocate new one
+        if reusable_mask is not None:
+            mask = reusable_mask
+            mask.fill(0)  # Clear the mask
+        else:
+            mask = np.zeros(gray_frame.shape, dtype=np.uint8)
         cv2.line(mask, (x1, y1), (x2, y2), 255, thickness=5)
 
         # Check brightness along the trail
@@ -1011,8 +1022,11 @@ class SatelliteTrailDetector:
         # Analyze color information for airplane detection
         trail_pixels_color = color_frame[mask > 0]
 
-        # Convert to HSV to check color saturation
-        hsv_region = cv2.cvtColor(color_frame, cv2.COLOR_BGR2HSV)
+        # Use pre-computed HSV frame if available, otherwise convert (for backward compatibility)
+        if hsv_frame is not None:
+            hsv_region = hsv_frame
+        else:
+            hsv_region = cv2.cvtColor(color_frame, cv2.COLOR_BGR2HSV)
         trail_pixels_hsv = hsv_region[mask > 0]
 
         avg_saturation = np.mean(trail_pixels_hsv[:, 1]) if len(trail_pixels_hsv) > 0 else 0
@@ -1030,11 +1044,13 @@ class SatelliteTrailDetector:
         brightness_variation = brightness_std / (avg_brightness + 1e-5)
 
         # Detect local maxima (bright spots) along the trail
-        # Sort pixels by brightness to find brightest spots
+        # Find brightest spots using partition (faster than full sort)
         if len(trail_pixels_gray) > 20:
-            sorted_pixels = np.sort(trail_pixels_gray)
-            top_10_percent_count = max(1, len(sorted_pixels) // 10)
-            top_10_percent_mean = np.mean(sorted_pixels[-top_10_percent_count:])
+            top_10_percent_count = max(1, len(trail_pixels_gray) // 10)
+            # np.partition is O(n) vs O(n log n) for sort - only need top k elements
+            partition_idx = len(trail_pixels_gray) - top_10_percent_count
+            partitioned = np.partition(trail_pixels_gray, partition_idx)
+            top_10_percent_mean = np.mean(partitioned[partition_idx:])
 
             # If the brightest 10% of pixels are significantly brighter than average, it's dotted
             brightness_peak_ratio = top_10_percent_mean / (avg_brightness + 1e-5)
@@ -1179,11 +1195,17 @@ class SatelliteTrailDetector:
                 debug_info['gray_frame'] = gray
             return []
 
+        # Pre-compute HSV frame once for all line classifications (performance optimization)
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        # Pre-allocate reusable mask array (performance optimization)
+        reusable_mask = np.zeros(gray.shape, dtype=np.uint8)
+
         classified_trails = []
         all_classifications = []  # For debug: store all attempted classifications
 
         for line in lines:
-            trail_type, bbox = self.classify_trail(line, gray, frame)
+            trail_type, bbox = self.classify_trail(line, gray, frame, hsv_frame, reusable_mask)
 
             # Store for debug (even if filtered out)
             if debug_info is not None:
