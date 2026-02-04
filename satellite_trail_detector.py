@@ -1561,7 +1561,7 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     Process video to detect and highlight satellite and airplane trails.
 
     Output video maintains the same resolution and frame rate as input.
-    Uses H.264 codec when available for best quality preservation.
+    Uses MPEG-4 (mp4v) codec by default for broad compatibility.
 
     Args:
         input_path: Path to input MP4 video
@@ -1626,14 +1626,14 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     # Calculate freeze frames
     freeze_frame_count = int(fps * freeze_duration)
 
-    # Initialize video writer with high-quality codec
-    # Try H.264 codec first (best quality), fall back to mp4v if not available
+    # Initialize video writer with codec
+    # Try mp4v (MPEG-4) first for broad compatibility, fall back to H.264 variants
     codecs_to_try = [
+        ('mp4v', 'MPEG-4'),
         ('avc1', 'H.264'),
         ('h264', 'H.264'),
         ('H264', 'H.264'),
-        ('X264', 'H.264'),
-        ('mp4v', 'MPEG-4')
+        ('X264', 'H.264')
     ]
 
     out = None
@@ -1866,7 +1866,7 @@ Examples:
 
 Notes:
     - Output video maintains same resolution and quality as input
-    - Uses H.264 codec for best quality when available
+    - Uses MPEG-4 (mp4v) codec by default for broad compatibility
     - Satellites: GOLD boxes - smooth, uniform trails (180-300px)
     - Airplanes: ORANGE boxes - dotted/point-like bright features (any length)
     - Detection parameters optimized for 1920x1080 resolution
