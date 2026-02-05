@@ -12,6 +12,11 @@ Debug functionality
 
 <img width="1366" height="1024" alt="image" src="https://github.com/user-attachments/assets/6911a2f1-840d-4e76-b08f-5d59583c456c" />
 
+Output
+
+<img width="1366" height="1024" alt="image" src="https://github.com/user-attachments/assets/07d3a4d7-51ed-44ce-adb6-fde3623cd305" />
+
+
 
 ## Repository Structure
 
