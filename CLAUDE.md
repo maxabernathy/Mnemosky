@@ -4,6 +4,13 @@
 
 **Mnemosky** is a satellite and airplane trail detector for MP4 videos. It uses classical computer vision techniques to identify and classify celestial trails in night sky footage, distinguishing between satellites (smooth, uniform trails) and airplanes (dotted patterns with bright navigation lights).
 
+https://github.com/maxabernathy/Mnemosky/blob/main/preview_screenshot.png?raw=true<img width="2220" height="1150" alt="image" src="https://github.com/user-attachments/assets/94c7302c-26fa-40aa-a50f-65eccb800d3c" />
+
+Debug functionality
+
+<img width="1366" height="1024" alt="image" src="https://github.com/user-attachments/assets/6911a2f1-840d-4e76-b08f-5d59583c456c" />
+
+
 ## Repository Structure
 
 ```
