@@ -389,7 +389,10 @@ class BaseDetectionAlgorithm(ABC):
             color_frame: Color frame
 
         Returns:
-            Tuple of (trail_type, bbox) where trail_type is 'satellite', 'airplane', or None
+            Tuple of (trail_type, detection_info) where trail_type is
+            'satellite', 'airplane', or None, and detection_info is a dict
+            with at least a 'bbox' key (x_min, y_min, x_max, y_max) plus
+            optional metadata like 'angle', 'center', 'length', etc.
         """
         pass
 
@@ -402,7 +405,8 @@ class BaseDetectionAlgorithm(ABC):
             debug_info: Optional dict to collect debug information
 
         Returns:
-            List of tuples: [('satellite', bbox), ('airplane', bbox), ...]
+            List of tuples: [('satellite', detection_info), ('airplane', detection_info), ...]
+            where detection_info is a dict with at least 'bbox' key.
         """
         gray, preprocessed = self.preprocess_frame(frame)
         lines, edges = self.detect_lines(preprocessed)
@@ -419,17 +423,18 @@ class BaseDetectionAlgorithm(ABC):
         all_classifications = []
 
         for line in lines:
-            trail_type, bbox = self.classify_trail(line, gray, frame)
+            trail_type, detection_info = self.classify_trail(line, gray, frame)
 
             if debug_info is not None:
                 all_classifications.append({
                     'line': line,
                     'type': trail_type,
-                    'bbox': bbox
+                    'detection_info': detection_info,
+                    'bbox': detection_info['bbox'] if detection_info else None,
                 })
 
-            if trail_type and bbox:
-                classified_trails.append((trail_type, bbox))
+            if trail_type and detection_info:
+                classified_trails.append((trail_type, detection_info))
 
         if debug_info is not None:
             debug_info['all_lines'] = lines
@@ -438,16 +443,16 @@ class BaseDetectionAlgorithm(ABC):
             debug_info['gray_frame'] = gray
 
         # Separate by type for merging
-        satellite_boxes = [bbox for t, bbox in classified_trails if t == 'satellite']
-        airplane_boxes = [bbox for t, bbox in classified_trails if t == 'airplane']
+        satellite_boxes = [info['bbox'] for t, info in classified_trails if t == 'satellite']
+        airplane_boxes = [info['bbox'] for t, info in classified_trails if t == 'airplane']
 
         # Merge overlapping detections within each type
         merged_satellites = self.merge_overlapping_boxes(satellite_boxes)
         merged_airplanes = self.merge_overlapping_boxes(airplane_boxes)
 
-        # Combine results with type labels
-        results = [('satellite', bbox) for bbox in merged_satellites]
-        results.extend([('airplane', bbox) for bbox in merged_airplanes])
+        # Combine results with type labels (wrap in detection_info dicts)
+        results = [('satellite', {'bbox': bbox}) for bbox in merged_satellites]
+        results.extend([('airplane', {'bbox': bbox}) for bbox in merged_airplanes])
 
         return results
 
@@ -896,12 +901,18 @@ class SatelliteTrailDetector:
 
         Returns:
             trail_type: 'satellite', 'airplane', or None
-            bbox: Bounding box if trail detected, None otherwise
+            detection_info: dict with 'bbox' and metadata if trail detected, None otherwise.
+                Keys: 'bbox' (x_min, y_min, x_max, y_max), 'angle' (degrees 0-180),
+                'center' (x, y), 'length' (pixels), 'avg_brightness' (float),
+                'max_brightness' (int), 'line' (original line endpoints)
         """
         x1, y1, x2, y2 = line[0]
 
         # Calculate line properties
         length = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        # Angle in degrees (0-180 range, normalized so direction doesn't matter)
+        angle = np.degrees(np.arctan2(abs(y2 - y1), abs(x2 - x1)))
+        center = ((x1 + x2) / 2, (y1 + y2) / 2)
 
         if length < self.params['min_line_length']:
             return None, None
@@ -1070,6 +1081,18 @@ class SatelliteTrailDetector:
 
         bbox = (x_min, y_min, x_max, y_max)
 
+        # Build detection metadata (shared by both airplane and satellite results)
+        def _make_detection_info():
+            return {
+                'bbox': bbox,
+                'angle': angle,
+                'center': center,
+                'length': length,
+                'avg_brightness': float(avg_brightness),
+                'max_brightness': int(max_brightness),
+                'line': (x1, y1, x2, y2),
+            }
+
         # AIRPLANE DETECTION CRITERIA (check first - dotted features are distinctive)
         # PRIMARY: Dotted/point-like bright features (most important!)
         # SECONDARY: Colorful features, overall brightness
@@ -1087,23 +1110,23 @@ class SatelliteTrailDetector:
 
         # If clear dotted pattern detected, it's definitely an airplane
         if has_strong_dots or has_colored_dots or has_moderate_dots or has_spatial_dots:
-            return 'airplane', bbox
+            return 'airplane', _make_detection_info()
 
         # If multiple distinct point features detected (navigation lights pattern)
         # Require higher brightness to avoid false positives
         if has_multiple_points and max_brightness > 120 and is_bright:
-            return 'airplane', bbox
+            return 'airplane', _make_detection_info()
 
         # Calculate airplane score - require more evidence
         airplane_score = sum([is_bright, is_colorful, has_color_variation, has_dotted_pattern])
 
         # Require dotted pattern AND at least 2 other characteristics
         if has_dotted_pattern and airplane_score >= 3:
-            return 'airplane', bbox
+            return 'airplane', _make_detection_info()
 
         # Very strong dotted pattern with high brightness
         if has_dotted_pattern and brightness_peak_ratio > 2.0 and max_brightness > 120:
-            return 'airplane', bbox
+            return 'airplane', _make_detection_info()
 
         # SATELLITE DETECTION CRITERIA
         # Satellites have SMOOTH, consistent brightness (no dotted features)
@@ -1117,31 +1140,39 @@ class SatelliteTrailDetector:
 
         # Require ALL 4 satellite characteristics to be confident
         if satellite_score >= 4 and not has_dotted_pattern:
-            return 'satellite', bbox
+            return 'satellite', _make_detection_info()
 
         # Require at least 3 characteristics including smoothness and length
         if satellite_score >= 3 and is_smooth and is_satellite_length and not has_dotted_pattern:
-            return 'satellite', bbox
+            return 'satellite', _make_detection_info()
 
         # Very dim, smooth trails in correct length range
         if is_smooth and avg_brightness <= self.params['brightness_threshold'] * 1.5 and is_satellite_length and not has_dotted_pattern:
-            return 'satellite', bbox
+            return 'satellite', _make_detection_info()
 
         return None, None
     
     def merge_overlapping_boxes(self, boxes, overlap_threshold=0.3):
-        """Merge overlapping bounding boxes."""
+        """Merge overlapping bounding boxes.
+
+        Args:
+            boxes: List of (x_min, y_min, x_max, y_max) tuples
+            overlap_threshold: Minimum overlap ratio to trigger merge
+
+        Returns:
+            List of merged (x_min, y_min, x_max, y_max) tuples
+        """
         if not boxes:
             return []
-        
+
         boxes = sorted(boxes, key=lambda b: b[0])
         merged = []
-        
+
         for box in boxes:
             if not merged:
                 merged.append(list(box))
                 continue
-            
+
             # Check if current box overlaps with any merged box
             found_overlap = False
             for i, mbox in enumerate(merged):
@@ -1150,14 +1181,14 @@ class SatelliteTrailDetector:
                 y1 = max(box[1], mbox[1])
                 x2 = min(box[2], mbox[2])
                 y2 = min(box[3], mbox[3])
-                
+
                 if x1 < x2 and y1 < y2:
                     # Calculate overlap ratio
                     intersection = (x2 - x1) * (y2 - y1)
                     box_area = (box[2] - box[0]) * (box[3] - box[1])
                     mbox_area = (mbox[2] - mbox[0]) * (mbox[3] - mbox[1])
                     min_area = min(box_area, mbox_area)
-                    
+
                     if min_area > 0 and intersection / min_area > overlap_threshold:
                         # Merge boxes
                         merged[i] = [
@@ -1168,23 +1199,147 @@ class SatelliteTrailDetector:
                         ]
                         found_overlap = True
                         break
-            
+
             if not found_overlap:
                 merged.append(list(box))
-        
+
         return [tuple(b) for b in merged]
-    
+
+    def merge_airplane_detections(self, detection_infos, overlap_threshold=0.3, angle_threshold=20.0):
+        """Merge overlapping airplane detections, keeping distinct airplanes separate.
+
+        Unlike generic box merging, this considers trail angle to avoid merging
+        two different airplanes whose bounding boxes happen to overlap (e.g. crossing
+        paths). Two detections are only merged if their boxes overlap AND their
+        trail angles are similar (within angle_threshold degrees).
+
+        Args:
+            detection_infos: List of detection_info dicts from classify_trail,
+                each containing 'bbox', 'angle', 'center', 'length', etc.
+            overlap_threshold: Minimum overlap ratio to consider merging (0-1)
+            angle_threshold: Maximum angle difference (degrees) to allow merging
+
+        Returns:
+            List of merged detection_info dicts. Merged entries combine bounding
+            boxes and average the metadata from their constituent detections.
+        """
+        if not detection_infos:
+            return []
+
+        # Sort by x_min of bbox for consistent processing
+        infos = sorted(detection_infos, key=lambda d: d['bbox'][0])
+        merged = []
+
+        for info in infos:
+            if not merged:
+                # Wrap in a list to track constituent detections for averaging
+                merged.append({
+                    'bbox': list(info['bbox']),
+                    'angle': info['angle'],
+                    'center': info['center'],
+                    'length': info['length'],
+                    'avg_brightness': info['avg_brightness'],
+                    'max_brightness': info['max_brightness'],
+                    'line': info['line'],
+                    '_count': 1,
+                })
+                continue
+
+            box = info['bbox']
+            found_overlap = False
+
+            for i, minfo in enumerate(merged):
+                mbox = minfo['bbox']
+
+                # Calculate intersection
+                x1 = max(box[0], mbox[0])
+                y1 = max(box[1], mbox[1])
+                x2 = min(box[2], mbox[2])
+                y2 = min(box[3], mbox[3])
+
+                if x1 < x2 and y1 < y2:
+                    intersection = (x2 - x1) * (y2 - y1)
+                    box_area = (box[2] - box[0]) * (box[3] - box[1])
+                    mbox_area = (mbox[2] - mbox[0]) * (mbox[3] - mbox[1])
+                    min_area = min(box_area, mbox_area)
+
+                    if min_area > 0 and intersection / min_area > overlap_threshold:
+                        # Check angle similarity before merging
+                        angle_diff = abs(info['angle'] - minfo['angle'])
+                        # Angles wrap around (0 and 180 are similar for lines)
+                        angle_diff = min(angle_diff, 180 - angle_diff)
+
+                        if angle_diff <= angle_threshold:
+                            # Same airplane - merge bounding boxes and average metadata
+                            n = minfo['_count']
+                            merged[i]['bbox'] = [
+                                min(box[0], mbox[0]),
+                                min(box[1], mbox[1]),
+                                max(box[2], mbox[2]),
+                                max(box[3], mbox[3])
+                            ]
+                            # Running average of metadata
+                            merged[i]['angle'] = (minfo['angle'] * n + info['angle']) / (n + 1)
+                            merged[i]['center'] = (
+                                (minfo['center'][0] * n + info['center'][0]) / (n + 1),
+                                (minfo['center'][1] * n + info['center'][1]) / (n + 1),
+                            )
+                            merged[i]['length'] = max(minfo['length'], info['length'])
+                            merged[i]['avg_brightness'] = (minfo['avg_brightness'] * n + info['avg_brightness']) / (n + 1)
+                            merged[i]['max_brightness'] = max(minfo['max_brightness'], info['max_brightness'])
+                            merged[i]['_count'] = n + 1
+                            found_overlap = True
+                            break
+                        # else: angles differ too much - treat as separate airplanes
+
+            if not found_overlap:
+                merged.append({
+                    'bbox': list(info['bbox']),
+                    'angle': info['angle'],
+                    'center': info['center'],
+                    'length': info['length'],
+                    'avg_brightness': info['avg_brightness'],
+                    'max_brightness': info['max_brightness'],
+                    'line': info['line'],
+                    '_count': 1,
+                })
+
+        # Convert bbox lists back to tuples and remove internal _count
+        results = []
+        for m in merged:
+            results.append({
+                'bbox': tuple(m['bbox']),
+                'angle': m['angle'],
+                'center': m['center'],
+                'length': m['length'],
+                'avg_brightness': m['avg_brightness'],
+                'max_brightness': m['max_brightness'],
+                'line': m['line'],
+            })
+        return results
+
     def detect_trails(self, frame, debug_info=None):
         """
         Detect and classify trails in a frame as satellites or airplanes.
+
+        Supports multiple simultaneous detections of each type. Airplane
+        detections use angle-aware merging so that two airplanes with
+        crossing or nearby paths are kept as separate detections.
 
         Args:
             frame: Input frame
             debug_info: Optional dict to collect debug information
 
         Returns:
-            List of tuples: [('satellite', bbox), ('airplane', bbox), ...]
-            where bbox is (x_min, y_min, x_max, y_max)
+            List of tuples: [('satellite', detection_info), ('airplane', detection_info), ...]
+            where detection_info is a dict with keys:
+                'bbox': (x_min, y_min, x_max, y_max)
+                'angle': trail angle in degrees (0-180)
+                'center': (x, y) center point of the trail
+                'length': trail length in pixels
+                'avg_brightness': mean brightness along trail
+                'max_brightness': peak brightness along trail
+                'line': (x1, y1, x2, y2) original line endpoints
         """
         gray, preprocessed = self.preprocess_frame(frame)
         lines, edges = self.detect_lines(preprocessed)
@@ -1207,18 +1362,20 @@ class SatelliteTrailDetector:
         all_classifications = []  # For debug: store all attempted classifications
 
         for line in lines:
-            trail_type, bbox = self.classify_trail(line, gray, frame, hsv_frame, reusable_mask)
+            trail_type, detection_info = self.classify_trail(line, gray, frame, hsv_frame, reusable_mask)
 
             # Store for debug (even if filtered out)
             if debug_info is not None:
                 all_classifications.append({
                     'line': line,
                     'type': trail_type,
-                    'bbox': bbox
+                    'detection_info': detection_info,
+                    # Keep 'bbox' for backward compat with debug panel lookup
+                    'bbox': detection_info['bbox'] if detection_info else None,
                 })
 
-            if trail_type and bbox:
-                classified_trails.append((trail_type, bbox))
+            if trail_type and detection_info:
+                classified_trails.append((trail_type, detection_info))
 
         # Store debug info
         if debug_info is not None:
@@ -1228,16 +1385,39 @@ class SatelliteTrailDetector:
             debug_info['gray_frame'] = gray
 
         # Separate by type for merging
-        satellite_boxes = [bbox for t, bbox in classified_trails if t == 'satellite']
-        airplane_boxes = [bbox for t, bbox in classified_trails if t == 'airplane']
+        satellite_infos = [info for t, info in classified_trails if t == 'satellite']
+        airplane_infos = [info for t, info in classified_trails if t == 'airplane']
 
-        # Merge overlapping detections within each type
-        merged_satellites = self.merge_overlapping_boxes(satellite_boxes)
-        merged_airplanes = self.merge_overlapping_boxes(airplane_boxes)
+        # Merge overlapping satellite detections (simple box merge)
+        satellite_boxes = [info['bbox'] for info in satellite_infos]
+        merged_satellite_boxes = self.merge_overlapping_boxes(satellite_boxes)
+
+        # Rebuild satellite detection_info from merged boxes (use nearest original info)
+        merged_satellite_infos = []
+        for mbox in merged_satellite_boxes:
+            # Find the original detection whose center is closest to the merged box center
+            mx = (mbox[0] + mbox[2]) / 2
+            my = (mbox[1] + mbox[3]) / 2
+            best = None
+            best_dist = float('inf')
+            for info in satellite_infos:
+                dx = info['center'][0] - mx
+                dy = info['center'][1] - my
+                dist = dx * dx + dy * dy
+                if dist < best_dist:
+                    best_dist = dist
+                    best = info
+            if best:
+                merged_info = dict(best)
+                merged_info['bbox'] = mbox
+                merged_satellite_infos.append(merged_info)
+
+        # Merge airplane detections with angle awareness (keeps distinct airplanes separate)
+        merged_airplane_infos = self.merge_airplane_detections(airplane_infos)
 
         # Combine results with type labels
-        results = [('satellite', bbox) for bbox in merged_satellites]
-        results.extend([('airplane', bbox) for bbox in merged_airplanes])
+        results = [('satellite', info) for info in merged_satellite_infos]
+        results.extend([('airplane', info) for info in merged_airplane_infos])
 
         return results
     
@@ -1714,7 +1894,9 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
 
         if detected_trails:
             # Count detections by type and add new frozen regions
-            for trail_type, bbox in detected_trails:
+            for trail_type, detection_info in detected_trails:
+                bbox = detection_info['bbox']
+
                 if trail_type == 'satellite':
                     satellites_detected += 1
                 elif trail_type == 'airplane':
@@ -1739,11 +1921,12 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
                 frozen_region = highlighted_frame[freeze_y_min:freeze_y_max, freeze_x_min:freeze_x_max].copy()
                 freeze_bbox = (freeze_x_min, freeze_y_min, freeze_x_max, freeze_y_max)
 
-                # Add to frozen regions list
+                # Add to frozen regions list with full detection metadata
                 frozen_regions.append({
                     'region': frozen_region,
                     'bbox': freeze_bbox,
                     'trail_type': trail_type,
+                    'detection_info': detection_info,
                     'frames_remaining': freeze_frame_count
                 })
 
