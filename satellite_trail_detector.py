@@ -42,18 +42,13 @@ def show_preprocessing_preview(video_path, initial_params=None):
     Show an interactive preview window for tuning preprocessing parameters.
 
     Uses a sleek dark-grey GUI with minimal fluorescent accent highlights.
-    The layout is a 2x2 panel grid (Original, CLAHE, Blur, Edges) with a
-    slim parameter sidebar on the right and a status bar at the bottom.
-
-    Opens a window with a sample frame from the video and trackbars to adjust:
-    - CLAHE clip limit (contrast enhancement strength)
-    - CLAHE tile grid size (local region size for contrast)
-    - Gaussian blur kernel size (smoothing extent)
-    - Gaussian blur sigma (smoothing intensity)
-    - Canny edge detection thresholds (for visualization)
+    All controls — including custom-drawn sliders — live inside the single
+    main window.  The layout is a 2x2 panel grid (Original, CLAHE, Blur,
+    Edges) with a parameter sidebar containing interactive sliders on the
+    right, and a status bar at the bottom.
 
     Controls:
-    - Adjust sliders to see real-time preprocessing effect
+    - Click and drag sliders in the sidebar to adjust parameters
     - Press SPACE or ENTER to accept current settings
     - Press ESC to cancel and use default settings
     - Press 'R' to reset to default values
@@ -79,12 +74,13 @@ def show_preprocessing_preview(video_path, initial_params=None):
     ACCENT = (200, 255, 80)          # Fluorescent green-yellow accent (BGR)
     ACCENT_DIM = (100, 170, 50)      # Dimmed accent for less emphasis
     ACCENT_CYAN = (220, 220, 60)     # Cyan-ish accent for edges panel (BGR)
-    BAR_BG = (50, 50, 50)            # Slider track background
-    BAR_FILL = (200, 255, 80)        # Slider fill (accent)
+    SLIDER_TRACK = (50, 50, 50)      # Slider track background
+    SLIDER_FILL = (200, 255, 80)     # Slider filled portion (accent)
+    SLIDER_THUMB = (240, 255, 160)   # Slider thumb highlight
 
     # Default parameters
     defaults = {
-        'clahe_clip_limit': 60,      # Stored as int, divide by 10 for actual value (6.0 default)
+        'clahe_clip_limit': 60,      # Stored as int, divide by 10 for actual value (6.0)
         'clahe_tile_size': 6,
         'blur_kernel_size': 3,       # Must be odd
         'blur_sigma': 3,             # Stored as int, divide by 10 for actual value
@@ -124,44 +120,50 @@ def show_preprocessing_preview(video_path, initial_params=None):
     original_frame = frame.copy()
     src_h, src_w = frame.shape[:2]
 
+    # ── Slider definitions ───────────────────────────────────────────
+    # Each slider: (param_key, label, display_fmt, min_val, max_val)
+    slider_defs = [
+        ('clahe_clip_limit', 'CLAHE Clip',  lambda v: f"{v/10:.1f}", 0, 100),
+        ('clahe_tile_size',  'CLAHE Tile',  lambda v: f"{v}",        2, 16),
+        ('blur_kernel_size', 'Blur Kernel', lambda v: f"{v if v%2==1 else v+1}", 1, 15),
+        ('blur_sigma',       'Blur Sigma',  lambda v: f"{v/10:.1f}", 0, 50),
+        ('canny_low',        'Canny Low',   lambda v: f"{v}",        0, 100),
+        ('canny_high',       'Canny High',  lambda v: f"{v}",        0, 200),
+    ]
+
+    params = defaults.copy()
+
+    # ── Layout constants ─────────────────────────────────────────────
+    sidebar_w = 280
+    status_bar_h = 32
+    slider_row_h = 44           # Height per slider row
+    slider_pad_x = 16           # Horizontal padding inside sidebar
+    slider_track_h = 4          # Track bar height
+    slider_thumb_r = 6          # Thumb radius
+    slider_section_top = 62     # Y offset where sliders begin (below title)
+
+    # Mutable state for mouse interaction
+    # These will be set once we know the canvas geometry in the first frame.
+    dragging = {'idx': -1}      # Index of slider being dragged (-1 = none)
+    # Slider hit-test regions (populated by create_display, read by mouse_cb)
+    slider_regions = []         # List of (x_start, x_end, y_center, min_val, max_val, param_key)
+
     # ── Window setup ─────────────────────────────────────────────────
     window_name = "Mnemosky  -  Preprocessing Preview"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
-    # Create trackbar window (separate from display for cleaner look)
-    trackbar_window = "Parameters"
-    cv2.namedWindow(trackbar_window, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(trackbar_window, 420, 240)
-
-    params = defaults.copy()
-    needs_update = [True]
-
-    def on_trackbar_change(val):
-        needs_update[0] = True
-
-    cv2.createTrackbar("CLAHE Clip", trackbar_window, params['clahe_clip_limit'], 100, on_trackbar_change)
-    cv2.createTrackbar("CLAHE Tile", trackbar_window, params['clahe_tile_size'], 16, on_trackbar_change)
-    cv2.createTrackbar("Blur Kernel", trackbar_window, params['blur_kernel_size'], 15, on_trackbar_change)
-    cv2.createTrackbar("Blur Sigma", trackbar_window, params['blur_sigma'], 50, on_trackbar_change)
-    cv2.createTrackbar("Canny Low", trackbar_window, params['canny_low'], 100, on_trackbar_change)
-    cv2.createTrackbar("Canny High", trackbar_window, params['canny_high'], 200, on_trackbar_change)
-
     # ── Helper drawing functions ─────────────────────────────────────
 
     def _fill_rect(img, x, y, w, h, color):
-        """Fill a rectangle with a solid colour."""
         cv2.rectangle(img, (x, y), (x + w, y + h), color, -1)
 
     def _draw_border(img, x, y, w, h, color, thickness=1):
-        """Draw a rectangle border."""
         cv2.rectangle(img, (x, y), (x + w - 1, y + h - 1), color, thickness)
 
     def _put_text(img, text, x, y, color, scale=0.42, thickness=1):
-        """Draw anti-aliased text."""
         cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
 
     def _draw_tag(img, text, x, y, bg_color, text_color, scale=0.38):
-        """Draw a small rounded-ish tag label."""
         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
         pad_x, pad_y = 6, 4
         _fill_rect(img, x, y - th - pad_y, tw + pad_x * 2, th + pad_y * 2, bg_color)
@@ -169,12 +171,12 @@ def show_preprocessing_preview(video_path, initial_params=None):
 
     # ── Preprocessing logic ──────────────────────────────────────────
 
-    def apply_preprocessing(frame, params):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        clip_limit = max(0.1, params['clahe_clip_limit'] / 10.0)
-        tile_size = max(2, params['clahe_tile_size'])
-        blur_kernel = params['blur_kernel_size']
-        blur_sigma = params['blur_sigma'] / 10.0
+    def apply_preprocessing(frm, p):
+        gray = cv2.cvtColor(frm, cv2.COLOR_BGR2GRAY)
+        clip_limit = max(0.1, p['clahe_clip_limit'] / 10.0)
+        tile_size = max(2, p['clahe_tile_size'])
+        blur_kernel = p['blur_kernel_size']
+        blur_sigma = p['blur_sigma'] / 10.0
         if blur_kernel < 1:
             blur_kernel = 1
         if blur_kernel % 2 == 0:
@@ -185,72 +187,58 @@ def show_preprocessing_preview(video_path, initial_params=None):
             blurred = cv2.GaussianBlur(enhanced, (blur_kernel, blur_kernel), blur_sigma)
         else:
             blurred = enhanced
-        canny_low = max(1, params['canny_low'])
-        canny_high = max(canny_low + 1, params['canny_high'])
+        canny_low = max(1, p['canny_low'])
+        canny_high = max(canny_low + 1, p['canny_high'])
         edges = cv2.Canny(blurred, canny_low, canny_high)
         return gray, enhanced, blurred, edges
 
     # ── Composite display builder ────────────────────────────────────
 
-    def create_display(frame, gray, enhanced, blurred, edges, params):
-        h, w = frame.shape[:2]
+    def create_display(frm, gray, enhanced, blurred, edges, p):
+        nonlocal slider_regions
+        h, w = frm.shape[:2]
 
-        # Panel dimensions (2x2 grid with 2px gaps)
         gap = 2
         panel_w = (w - gap) // 2
         panel_h = (h - gap) // 2
 
-        # Sidebar width
-        sidebar_w = 260
-
-        # Total canvas size
         canvas_w = panel_w * 2 + gap + sidebar_w
-        status_bar_h = 32
         canvas_h = panel_h * 2 + gap + status_bar_h
 
         canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
         canvas[:] = BG_DARK
 
-        # Resize panels
-        orig_small = cv2.resize(frame, (panel_w, panel_h))
-        enh_gray = cv2.resize(enhanced, (panel_w, panel_h))
-        blur_gray = cv2.resize(blurred, (panel_w, panel_h))
-        edge_gray = cv2.resize(edges, (panel_w, panel_h))
+        # ── Panels ───────────────────────────────────────────────────
+        orig_small = cv2.resize(frm, (panel_w, panel_h))
+        enh_bgr = cv2.cvtColor(cv2.resize(enhanced, (panel_w, panel_h)), cv2.COLOR_GRAY2BGR)
+        blur_bgr = cv2.cvtColor(cv2.resize(blurred, (panel_w, panel_h)), cv2.COLOR_GRAY2BGR)
 
-        # Convert grays to BGR
-        enh_bgr = cv2.cvtColor(enh_gray, cv2.COLOR_GRAY2BGR)
-        blur_bgr = cv2.cvtColor(blur_gray, cv2.COLOR_GRAY2BGR)
-
-        # Tint edges with accent cyan on dark background
+        edge_gray_r = cv2.resize(edges, (panel_w, panel_h))
         edge_bgr = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
         edge_bgr[:] = BG_PANEL
-        edge_mask = edge_gray > 0
-        edge_bgr[edge_mask] = ACCENT_CYAN
+        edge_bgr[edge_gray_r > 0] = ACCENT_CYAN
 
-        # Place panels
-        positions = [
+        for px, py, panel in [
             (0, 0, orig_small),
             (panel_w + gap, 0, enh_bgr),
             (0, panel_h + gap, blur_bgr),
             (panel_w + gap, panel_h + gap, edge_bgr),
-        ]
-        for px, py, panel in positions:
+        ]:
             canvas[py:py + panel_h, px:px + panel_w] = panel
             _draw_border(canvas, px, py, panel_w, panel_h, BORDER)
 
-        # Panel labels (overlaid tags)
-        tag_y = 18
-        tag_x = 8
+        # Panel tags
+        tag_y, tag_x = 18, 8
         _draw_tag(canvas, "ORIGINAL", tag_x, tag_y, BG_DARK, TEXT_DIM)
-        clip_val = params['clahe_clip_limit'] / 10.0
-        _draw_tag(canvas, f"CLAHE  clip {clip_val:.1f}  tile {params['clahe_tile_size']}",
+        clip_val = p['clahe_clip_limit'] / 10.0
+        _draw_tag(canvas, f"CLAHE  clip {clip_val:.1f}  tile {p['clahe_tile_size']}",
                   panel_w + gap + tag_x, tag_y, BG_DARK, ACCENT)
-        blur_k = params['blur_kernel_size']
+        blur_k = p['blur_kernel_size']
         if blur_k % 2 == 0:
             blur_k += 1
-        _draw_tag(canvas, f"BLUR  k={blur_k}  s={params['blur_sigma']/10:.1f}",
+        _draw_tag(canvas, f"BLUR  k={blur_k}  s={p['blur_sigma']/10:.1f}",
                   tag_x, panel_h + gap + tag_y, BG_DARK, TEXT_PRIMARY)
-        _draw_tag(canvas, f"EDGES  {params['canny_low']}-{params['canny_high']}",
+        _draw_tag(canvas, f"EDGES  {p['canny_low']}-{p['canny_high']}",
                   panel_w + gap + tag_x, panel_h + gap + tag_y, BG_DARK, ACCENT_CYAN)
 
         # ── Sidebar ──────────────────────────────────────────────────
@@ -261,59 +249,117 @@ def show_preprocessing_preview(video_path, initial_params=None):
         # Title
         _put_text(canvas, "MNEMOSKY", sb_x + 14, 24, ACCENT, 0.52, 1)
         _put_text(canvas, "Preprocessing", sb_x + 14, 46, TEXT_HEADING, 0.40)
-
-        # Divider line
         cv2.line(canvas, (sb_x + 14, 56), (sb_x + sidebar_w - 14, 56), BORDER, 1)
 
-        # Parameter readout
-        readout_y = 78
-        line_h = 26
-        param_items = [
-            ("CLAHE Clip", f"{params['clahe_clip_limit'] / 10.0:.1f}"),
-            ("CLAHE Tile", f"{params['clahe_tile_size']}"),
-            ("Blur Kernel", f"{blur_k}"),
-            ("Blur Sigma", f"{params['blur_sigma'] / 10.0:.1f}"),
-            ("Canny Low", f"{params['canny_low']}"),
-            ("Canny High", f"{params['canny_high']}"),
-        ]
-        for label, value in param_items:
-            _put_text(canvas, label, sb_x + 14, readout_y, TEXT_DIM, 0.36)
-            _put_text(canvas, value, sb_x + sidebar_w - 50, readout_y, ACCENT, 0.40, 1)
-            readout_y += line_h
+        # ── Draw sliders ─────────────────────────────────────────────
+        new_regions = []
+        track_x_start = sb_x + slider_pad_x
+        track_x_end = sb_x + sidebar_w - slider_pad_x
+        track_width = track_x_end - track_x_start
 
-        # Divider
-        cv2.line(canvas, (sb_x + 14, readout_y), (sb_x + sidebar_w - 14, readout_y), BORDER, 1)
-        readout_y += 16
+        for i, (key, label, fmt_fn, v_min, v_max) in enumerate(slider_defs):
+            row_y = slider_section_top + i * slider_row_h
+            val = p[key]
 
-        # Controls help
-        _put_text(canvas, "CONTROLS", sb_x + 14, readout_y, TEXT_HEADING, 0.38)
-        readout_y += 22
-        controls = [
+            # Label (left) and value (right)
+            _put_text(canvas, label, track_x_start, row_y + 14, TEXT_DIM, 0.34)
+            _put_text(canvas, fmt_fn(val), track_x_end - 36, row_y + 14, ACCENT, 0.36, 1)
+
+            # Slider track
+            track_y = row_y + 28
+            _fill_rect(canvas, track_x_start, track_y - slider_track_h // 2,
+                       track_width, slider_track_h, SLIDER_TRACK)
+
+            # Fill
+            ratio = (val - v_min) / max(1, v_max - v_min)
+            fill_w = int(track_width * ratio)
+            if fill_w > 0:
+                _fill_rect(canvas, track_x_start, track_y - slider_track_h // 2,
+                           fill_w, slider_track_h, SLIDER_FILL)
+
+            # Thumb
+            thumb_x = track_x_start + fill_w
+            cv2.circle(canvas, (thumb_x, track_y), slider_thumb_r, SLIDER_THUMB, -1)
+            cv2.circle(canvas, (thumb_x, track_y), slider_thumb_r, ACCENT, 1, cv2.LINE_AA)
+
+            # Register region for hit testing
+            new_regions.append((track_x_start, track_x_end, track_y, v_min, v_max, key))
+
+        slider_regions = new_regions
+
+        # ── Controls help (below sliders) ────────────────────────────
+        help_y = slider_section_top + len(slider_defs) * slider_row_h + 12
+        cv2.line(canvas, (sb_x + 14, help_y - 6), (sb_x + sidebar_w - 14, help_y - 6), BORDER, 1)
+        _put_text(canvas, "CONTROLS", sb_x + 14, help_y + 10, TEXT_HEADING, 0.36)
+        help_y += 26
+        for key_str, desc in [
             ("SPACE / ENTER", "Accept"),
             ("ESC", "Cancel"),
             ("R", "Reset"),
             ("N / P", "Next / Prev frame"),
-        ]
-        for key_str, desc in controls:
-            _put_text(canvas, key_str, sb_x + 14, readout_y, ACCENT_DIM, 0.33)
-            _put_text(canvas, desc, sb_x + 130, readout_y, TEXT_DIM, 0.33)
-            readout_y += 18
+        ]:
+            _put_text(canvas, key_str, sb_x + 14, help_y, ACCENT_DIM, 0.30)
+            _put_text(canvas, desc, sb_x + 126, help_y, TEXT_DIM, 0.30)
+            help_y += 16
 
         # ── Status bar ───────────────────────────────────────────────
         sb_y = canvas_h - status_bar_h
         _fill_rect(canvas, 0, sb_y, canvas_w, status_bar_h, BG_PANEL)
         cv2.line(canvas, (0, sb_y), (canvas_w, sb_y), BORDER, 1)
 
-        frame_text = f"Frame {current_frame_idx}/{total_frames}"
-        res_text = f"{src_w}x{src_h}"
-        _put_text(canvas, frame_text, 12, sb_y + 21, TEXT_DIM, 0.36)
-        _put_text(canvas, res_text, canvas_w - 90, sb_y + 21, TEXT_DIM, 0.36)
-
-        # Small accent dot as a "live" indicator
+        _put_text(canvas, f"Frame {current_frame_idx}/{total_frames}", 12, sb_y + 21, TEXT_DIM, 0.36)
+        _put_text(canvas, f"{src_w}x{src_h}", canvas_w - 90, sb_y + 21, TEXT_DIM, 0.36)
         cv2.circle(canvas, (canvas_w // 2, sb_y + 16), 4, ACCENT, -1)
         _put_text(canvas, "LIVE", canvas_w // 2 + 10, sb_y + 21, ACCENT_DIM, 0.33)
 
         return canvas
+
+    # ── Mouse callback for slider interaction ────────────────────────
+
+    # The display is shown via WINDOW_NORMAL which may be scaled.  We need
+    # to map mouse coords (which are in *displayed* pixel space) back to
+    # canvas coords.  We track the canvas size so we can compute the ratio.
+    canvas_size = [1, 1]  # [w, h] — will be set on first render
+
+    def _update_slider_from_x(mouse_x, mouse_y):
+        """Find which slider the mouse is on and update its value."""
+        # Convert displayed coords to canvas coords
+        win_rect = cv2.getWindowImageRect(window_name)
+        if win_rect[2] > 0 and win_rect[3] > 0:
+            sx = canvas_size[0] / win_rect[2]
+            sy = canvas_size[1] / win_rect[3]
+        else:
+            sx, sy = 1.0, 1.0
+        cx = int(mouse_x * sx)
+        cy = int(mouse_y * sy)
+
+        for i, (x_start, x_end, y_center, v_min, v_max, key) in enumerate(slider_regions):
+            if abs(cy - y_center) < slider_row_h // 2 and x_start - 4 <= cx <= x_end + 4:
+                ratio = max(0.0, min(1.0, (cx - x_start) / max(1, x_end - x_start)))
+                params[key] = int(round(v_min + ratio * (v_max - v_min)))
+                dragging['idx'] = i
+                return
+        dragging['idx'] = -1
+
+    def on_mouse(event, x, y, flags, userdata):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            _update_slider_from_x(x, y)
+        elif event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON):
+            if dragging['idx'] >= 0:
+                # Continue dragging the same slider
+                win_rect = cv2.getWindowImageRect(window_name)
+                if win_rect[2] > 0 and win_rect[3] > 0:
+                    sx = canvas_size[0] / win_rect[2]
+                else:
+                    sx = 1.0
+                cx = int(x * sx)
+                x_start, x_end, _, v_min, v_max, key = slider_regions[dragging['idx']]
+                ratio = max(0.0, min(1.0, (cx - x_start) / max(1, x_end - x_start)))
+                params[key] = int(round(v_min + ratio * (v_max - v_min)))
+        elif event == cv2.EVENT_LBUTTONUP:
+            dragging['idx'] = -1
+
+    cv2.setMouseCallback(window_name, on_mouse)
 
     print("\n" + "=" * 60)
     print("PREPROCESSING PREVIEW")
@@ -321,6 +367,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
     print("Adjust the sliders to tune preprocessing parameters.")
     print("The goal is to preserve dim satellite trails while reducing noise.")
     print("\nControls:")
+    print("  Click+drag  - Adjust sliders in the sidebar")
     print("  SPACE/ENTER - Accept current settings and continue")
     print("  ESC         - Cancel and use default settings")
     print("  R           - Reset to default values")
@@ -328,33 +375,28 @@ def show_preprocessing_preview(video_path, initial_params=None):
     print("  P           - Load previous frame")
     print("=" * 60 + "\n")
 
+    first_render = True
+
     # ── Main loop ────────────────────────────────────────────────────
     while True:
-        params['clahe_clip_limit'] = cv2.getTrackbarPos("CLAHE Clip", trackbar_window)
-        params['clahe_tile_size'] = cv2.getTrackbarPos("CLAHE Tile", trackbar_window)
-        params['blur_kernel_size'] = cv2.getTrackbarPos("Blur Kernel", trackbar_window)
-        params['blur_sigma'] = cv2.getTrackbarPos("Blur Sigma", trackbar_window)
-        params['canny_low'] = cv2.getTrackbarPos("Canny Low", trackbar_window)
-        params['canny_high'] = cv2.getTrackbarPos("Canny High", trackbar_window)
-
         gray, enhanced, blurred, edges = apply_preprocessing(frame, params)
         display = create_display(frame, gray, enhanced, blurred, edges, params)
+        canvas_size[0] = display.shape[1]
+        canvas_size[1] = display.shape[0]
 
         cv2.imshow(window_name, display)
 
-        # Fit window on first display
-        if needs_update[0]:
+        if first_render:
             dh, dw = display.shape[:2]
             screen_scale = min(1.0, 1600 / dw, 950 / dh)
             cv2.resizeWindow(window_name, int(dw * screen_scale), int(dh * screen_scale))
-            needs_update[0] = False
+            first_render = False
 
-        key = cv2.waitKey(50) & 0xFF
+        key = cv2.waitKey(30) & 0xFF
 
         if key == 27:  # ESC
             print("Preview cancelled. Using default parameters.")
             cv2.destroyWindow(window_name)
-            cv2.destroyWindow(trackbar_window)
             cap.release()
             return None
 
@@ -374,18 +416,11 @@ def show_preprocessing_preview(video_path, initial_params=None):
             print(f"  Blur sigma: {final_params['blur_sigma']:.1f}")
             print(f"  Canny thresholds: {final_params['canny_low']}-{final_params['canny_high']}")
             cv2.destroyWindow(window_name)
-            cv2.destroyWindow(trackbar_window)
             cap.release()
             return final_params
 
         elif key == ord('r') or key == ord('R'):  # Reset
             params = defaults.copy()
-            cv2.setTrackbarPos("CLAHE Clip", trackbar_window, params['clahe_clip_limit'])
-            cv2.setTrackbarPos("CLAHE Tile", trackbar_window, params['clahe_tile_size'])
-            cv2.setTrackbarPos("Blur Kernel", trackbar_window, params['blur_kernel_size'])
-            cv2.setTrackbarPos("Blur Sigma", trackbar_window, params['blur_sigma'])
-            cv2.setTrackbarPos("Canny Low", trackbar_window, params['canny_low'])
-            cv2.setTrackbarPos("Canny High", trackbar_window, params['canny_high'])
             print("Parameters reset to defaults.")
 
         elif key == ord('n') or key == ord('N'):  # Next frame
@@ -409,7 +444,6 @@ def show_preprocessing_preview(video_path, initial_params=None):
         # Check if window was closed
         if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
             print("Preview window closed. Using default parameters.")
-            cv2.destroyWindow(trackbar_window)
             cap.release()
             return None
 
