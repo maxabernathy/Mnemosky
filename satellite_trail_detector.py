@@ -676,10 +676,12 @@ class SatelliteTrailDetector:
         self.skip_aspect_ratio_check = skip_aspect_ratio_check
 
         # Sensitivity presets - rebalanced to reduce false positives
+        # Satellite length ranges are generous because trails can span large
+        # portions of the frame depending on exposure and satellite altitude.
         presets = {
             'low': {
                 'min_line_length': 80,  # Longer minimum to reduce noise
-                'max_line_gap': 30,  # Moderate gap tolerance
+                'max_line_gap': 40,  # Moderate gap tolerance
                 'canny_low': 8,  # Less sensitive to reduce edge noise
                 'canny_high': 60,
                 'hough_threshold': 45,  # Higher threshold for fewer false detections
@@ -687,34 +689,37 @@ class SatelliteTrailDetector:
                 'brightness_threshold': 25,
                 'airplane_brightness_min': 90,
                 'airplane_saturation_min': 10,
-                'satellite_min_length': 180,  # Satellite trail length (1920x1080)
-                'satellite_max_length': 300,
+                'satellite_min_length': 120,  # Satellite trail length range (1920x1080)
+                'satellite_max_length': 800,
+                'satellite_contrast_min': 1.10,  # Minimum trail-to-background contrast
             },
             'medium': {
-                'min_line_length': 60,  # Balanced length requirement
-                'max_line_gap': 35,  # Balanced gap tolerance
-                'canny_low': 5,  # Balanced edge detection
-                'canny_high': 50,
-                'hough_threshold': 35,  # Balanced threshold
+                'min_line_length': 50,  # Lower to catch dim trail fragments
+                'max_line_gap': 50,  # Wider gap tolerance for dim fragmented trails
+                'canny_low': 4,  # Slightly more sensitive for dim trails
+                'canny_high': 45,
+                'hough_threshold': 30,  # Lower threshold to catch dim trails
                 'min_aspect_ratio': 4,  # Require trails to be relatively long and thin
                 'brightness_threshold': 18,
                 'airplane_brightness_min': 75,
                 'airplane_saturation_min': 8,
-                'satellite_min_length': 180,
-                'satellite_max_length': 300,
+                'satellite_min_length': 100,  # Satellites can be shorter segments
+                'satellite_max_length': 1200,  # Very long trails for full-frame crossings
+                'satellite_contrast_min': 1.08,  # Lower contrast for dim satellites
             },
             'high': {
-                'min_line_length': 45,  # Still catches shorter trails
-                'max_line_gap': 40,  # More tolerant of breaks
-                'canny_low': 3,  # More sensitive edge detection
-                'canny_high': 40,
-                'hough_threshold': 25,  # Lower threshold for more detections
+                'min_line_length': 35,  # Catches shorter trail fragments
+                'max_line_gap': 60,  # Very tolerant of breaks in dim trails
+                'canny_low': 2,  # Very sensitive edge detection
+                'canny_high': 35,
+                'hough_threshold': 20,  # Lower threshold for more detections
                 'min_aspect_ratio': 3,  # More relaxed but not too permissive
                 'brightness_threshold': 12,
                 'airplane_brightness_min': 45,
                 'airplane_saturation_min': 2,
-                'satellite_min_length': 100,  # Slightly lower for high sensitivity
-                'satellite_max_length': 500,
+                'satellite_min_length': 60,  # Very short fragments allowed
+                'satellite_max_length': 2000,  # No practical upper limit
+                'satellite_contrast_min': 1.05,  # Very dim trails allowed
             }
         }
 
@@ -733,18 +738,30 @@ class SatelliteTrailDetector:
             if 'canny_high' in self.preprocessing_params:
                 self.params['canny_high'] = self.preprocessing_params['canny_high']
 
+    @staticmethod
+    def _rotated_kernel_endpoints(size, angle_deg):
+        """Return two endpoint tuples for a line through the center of a (size x size) grid."""
+        import math
+        cx = cy = size // 2
+        half = size // 2
+        rad = math.radians(angle_deg)
+        dx = int(round(half * math.cos(rad)))
+        dy = int(round(half * math.sin(rad)))
+        return (cx - dx, cy - dy), (cx + dx, cy + dy)
+
     def preprocess_frame(self, frame):
         """Convert frame to grayscale and enhance for trail detection."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # Get preprocessing parameters (use custom if available, otherwise defaults)
+        # Higher CLAHE clip limit (6.0) enhances dim satellite trails more aggressively
         if self.preprocessing_params:
-            clip_limit = self.preprocessing_params.get('clahe_clip_limit', 4.0)
+            clip_limit = self.preprocessing_params.get('clahe_clip_limit', 6.0)
             tile_size = self.preprocessing_params.get('clahe_tile_size', 6)
             blur_kernel = self.preprocessing_params.get('blur_kernel_size', 3)
             blur_sigma = self.preprocessing_params.get('blur_sigma', 0.3)
         else:
-            clip_limit = 4.0
+            clip_limit = 6.0
             tile_size = 6
             blur_kernel = 3
             blur_sigma = 0.3
@@ -773,16 +790,27 @@ class SatelliteTrailDetector:
             self.params['canny_low'],
             self.params['canny_high']
         )
-        
+
         # Morphological operations to connect broken trails
-        # Enhanced to better connect dim, fragmented, and less steady satellite trails
+        # Enhanced to better connect dim, fragmented satellite trails
         kernel = np.ones((3, 3), np.uint8)
 
-        # Dilate more aggressively to connect gaps in dim trails
+        # Dilate to connect gaps in dim trails
         edges = cv2.dilate(edges, kernel, iterations=3)
-        # Erode less to preserve dim features
+        # Light erosion to preserve dim features
         edges = cv2.erode(edges, kernel, iterations=1)
-        
+
+        # Additional directional dilation to bridge gaps in linear features.
+        # Dim satellite trails fragment into short segments with small gaps;
+        # elongated kernels reconnect them without bloating non-linear noise.
+        for angle in [0, 45, 90, 135]:
+            line_kernel = np.zeros((7, 7), dtype=np.uint8)
+            cv2.line(line_kernel, *self._rotated_kernel_endpoints(7, angle), 1, thickness=1)
+            edges = cv2.dilate(edges, line_kernel, iterations=1)
+
+        # Clean up directional dilation
+        edges = cv2.erode(edges, kernel, iterations=1)
+
         # Hough line detection
         lines = cv2.HoughLinesP(
             edges,
@@ -792,9 +820,9 @@ class SatelliteTrailDetector:
             minLineLength=self.params['min_line_length'],
             maxLineGap=self.params['max_line_gap']
         )
-        
+
         return lines, edges
-    
+
     def detect_point_features(self, line, gray_frame, return_debug_info=False):
         """
         Detect point-like features (bright spots) along a trail using spatial analysis.
@@ -943,7 +971,7 @@ class SatelliteTrailDetector:
             return None, None
 
         # Check minimum contrast - trail should stand out from background
-        # Sample surrounding area to check if trail is actually brighter
+        # Use per-sensitivity threshold so dim satellite trails aren't rejected
         surround_sample_size = 30
         x_center = (x1 + x2) // 2
         y_center = (y1 + y2) // 2
@@ -955,11 +983,12 @@ class SatelliteTrailDetector:
         bg_y_max = min(gray_frame.shape[0], y_center + surround_sample_size)
 
         background_region = gray_frame[bg_y_min:bg_y_max, bg_x_min:bg_x_max]
+        contrast_ratio = None
         if background_region.size > 0:
             background_brightness = np.median(background_region)
-            # Trail should be at least 20% brighter than background
             contrast_ratio = avg_brightness / (background_brightness + 1e-5)
-            if contrast_ratio < 1.2:
+            min_contrast = self.params.get('satellite_contrast_min', 1.08)
+            if contrast_ratio < min_contrast:
                 return None, None
 
         # Calculate bounding box
@@ -1130,24 +1159,57 @@ class SatelliteTrailDetector:
 
         # SATELLITE DETECTION CRITERIA
         # Satellites have SMOOTH, consistent brightness (no dotted features)
-        # Typically dim, monochromatic, 180-300px length
+        # They are dim, monochromatic, and can range from short segments to
+        # very long trails spanning much of the frame.
         is_dim = avg_brightness < self.params['airplane_brightness_min']
         is_monochrome = avg_saturation < self.params['airplane_saturation_min']
-        is_smooth = brightness_variation < 0.35 and not has_bright_spots  # Smooth, no bright points
+
+        # Smoothness check: use adaptive threshold for very dim trails.
+        # When avg_brightness is very low (e.g. 8), even small noise in pixel
+        # values causes brightness_std / avg to spike, falsely failing the
+        # smoothness test. Use absolute std as a fallback for dim trails.
+        smooth_threshold = 0.40
+        is_smooth_relative = brightness_variation < smooth_threshold and not has_bright_spots
+        is_smooth_absolute = brightness_std < 8.0 and not has_bright_spots  # Low absolute variation
+        is_smooth = is_smooth_relative or (is_dim and is_smooth_absolute)
+
         is_satellite_length = self.params['satellite_min_length'] <= length <= self.params['satellite_max_length']
+
+        # Check if trail has good contrast with background (useful for dim trails)
+        has_contrast = contrast_ratio is not None and contrast_ratio >= self.params.get('satellite_contrast_min', 1.08)
 
         satellite_score = sum([is_dim, is_monochrome, is_smooth, is_satellite_length])
 
-        # Require ALL 4 satellite characteristics to be confident
+        # --- Primary paths (strongest confidence) ---
+
+        # All 4 characteristics met
         if satellite_score >= 4 and not has_dotted_pattern:
             return 'satellite', _make_detection_info()
 
-        # Require at least 3 characteristics including smoothness and length
+        # 3 characteristics including both smoothness and length
         if satellite_score >= 3 and is_smooth and is_satellite_length and not has_dotted_pattern:
             return 'satellite', _make_detection_info()
 
         # Very dim, smooth trails in correct length range
         if is_smooth and avg_brightness <= self.params['brightness_threshold'] * 1.5 and is_satellite_length and not has_dotted_pattern:
+            return 'satellite', _make_detection_info()
+
+        # --- Extended paths for dim/long trails that miss primary criteria ---
+
+        # Long smooth dim trail outside the "typical" length range but clearly
+        # not an airplane: no dotted pattern, dim, monochrome, smooth
+        if is_smooth and is_dim and is_monochrome and not has_dotted_pattern and length >= self.params['satellite_min_length']:
+            return 'satellite', _make_detection_info()
+
+        # Dim smooth trail with confirmed background contrast — even if
+        # length or monochrome criteria aren't perfectly met
+        if is_smooth and is_dim and has_contrast and not has_dotted_pattern and length >= self.params['satellite_min_length']:
+            return 'satellite', _make_detection_info()
+
+        # Very dim trail (below brightness_threshold) that is smooth and long
+        # enough — relaxed monochrome requirement since very dim trails have
+        # negligible color information anyway
+        if is_smooth and avg_brightness <= self.params['brightness_threshold'] and not has_dotted_pattern and length >= self.params['satellite_min_length']:
             return 'satellite', _make_detection_info()
 
         return None, None
