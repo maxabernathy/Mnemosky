@@ -4,6 +4,20 @@
 
 **Mnemosky** is a satellite and airplane trail detector for MP4 videos. It uses classical computer vision techniques to identify and classify celestial trails in night sky footage, distinguishing between satellites (smooth, uniform trails) and airplanes (dotted patterns with bright navigation lights).
 
+Preprocessing adjustments
+
+<img width="2220" height="1150" alt="image" src="https://github.com/user-attachments/assets/94c7302c-26fa-40aa-a50f-65eccb800d3c" />
+
+Debug functionality
+
+<img width="1366" height="1024" alt="image" src="https://github.com/user-attachments/assets/6911a2f1-840d-4e76-b08f-5d59583c456c" />
+
+Output
+
+<img width="1366" height="1024" alt="image" src="https://github.com/user-attachments/assets/07d3a4d7-51ed-44ce-adb6-fde3623cd305" />
+
+
+
 ## Repository Structure
 
 ```
@@ -35,9 +49,9 @@ pip install opencv-python numpy
 1. **`BaseDetectionAlgorithm`** (ABC) - Abstract base class defining the detection interface
    - `preprocess_frame()` - Frame preprocessing
    - `detect_lines()` - Line detection
-   - `classify_trail()` - Trail classification
-   - `detect_trails()` - Main pipeline (can be overridden)
-   - `merge_overlapping_boxes()` - Utility for combining detections
+   - `classify_trail()` - Trail classification — returns `(trail_type, detection_info)` where `detection_info` is a dict with `bbox`, `angle`, `center`, `length`, `avg_brightness`, `max_brightness`, `line`
+   - `detect_trails()` - Main pipeline (can be overridden) — returns `[('satellite', detection_info), ...]`
+   - `merge_overlapping_boxes()` - Utility for combining detections (angle-agnostic)
 
 2. **`DefaultDetectionAlgorithm`** (extends BaseDetectionAlgorithm) - Partial implementation
    - Implements `preprocess_frame()`, `detect_lines()`, `detect_point_features()`
@@ -46,23 +60,45 @@ pip install opencv-python numpy
 3. **`SatelliteTrailDetector`** - Main detector class with sensitivity presets
    - Provides `low`, `medium`, `high` sensitivity configurations
    - Contains full detection pipeline including `classify_trail()` logic
+   - `merge_airplane_detections()` - Angle-aware merge that keeps distinct airplanes separate (crossing paths are not merged)
    - Supports custom preprocessing parameters via `preprocessing_params` argument
 
 ### Key Functions
 
-- `show_preprocessing_preview()` - Interactive GUI for tuning preprocessing parameters (CLAHE, blur, Canny)
+- `show_preprocessing_preview()` - Interactive GUI for tuning preprocessing parameters (CLAHE, blur, Canny). Sleek dark-grey theme with fluorescent accent highlights, 2x2 panel grid with sidebar containing custom-drawn sliders (single window, no external trackbar window).
 - `process_video()` - Main video processing pipeline (handles I/O, frame iteration, output)
 - `main()` - CLI entry point with argument parsing
+
+### Detection Data Structures
+
+Detection results use enriched `detection_info` dicts instead of bare bounding-box tuples:
+
+```python
+# detect_trails() returns:
+[
+    ('satellite', {
+        'bbox': (x_min, y_min, x_max, y_max),
+        'angle': 45.0,          # degrees 0-180
+        'center': (640.0, 360.0),
+        'length': 285.0,        # pixels
+        'avg_brightness': 12.5,
+        'max_brightness': 28,
+        'line': (x1, y1, x2, y2),
+    }),
+    ('airplane', { ... }),
+    ('airplane', { ... }),  # Multiple airplanes per frame supported
+]
+```
 
 ## Detection Algorithm
 
 ### Pipeline
 
-1. **Preprocessing**: Grayscale conversion → CLAHE enhancement → Gaussian blur
+1. **Preprocessing**: Grayscale conversion → CLAHE enhancement (clip=6.0) → Gaussian blur
 2. **Edge Detection**: Canny edge detection with configurable thresholds
-3. **Morphological Operations**: Dilation (3x) + Erosion (1x) to connect trail fragments
-4. **Line Detection**: Hough line transform (HoughLinesP)
-5. **Classification**: Brightness analysis, color analysis, point feature detection
+3. **Morphological Operations**: Dilation (3x) + Erosion (1x), then directional dilation with elongated kernels at 0/45/90/135 degrees to bridge gaps in dim linear features, followed by a cleanup erosion
+4. **Line Detection**: Hough line transform (HoughLinesP) with wider gap tolerance for fragmented trails
+5. **Classification**: Brightness analysis, color analysis, point feature detection, contrast-to-background measurement
 
 ### Classification Criteria
 
@@ -71,8 +107,22 @@ pip install opencv-python numpy
 | Trail pattern | Smooth, uniform | Dotted, bright points |
 | Brightness | Dim, consistent | Variable, with peaks |
 | Color | Monochromatic | May have colored lights |
-| Length (1080p) | 180-300px | Any length |
+| Length (1080p) | 100-1200px (medium) | Any length |
 | Visual marker | GOLD box | ORANGE box |
+| Smoothness | Adaptive threshold (relative + absolute std fallback for dim trails) | N/A |
+| Contrast | Configurable per sensitivity (1.08 medium) | N/A |
+| Merge strategy | Angle-agnostic box merge | Angle-aware merge (keeps distinct airplanes with >20deg angle difference separate) |
+
+### Satellite Detection Paths
+
+The satellite classifier uses multiple detection paths to catch dim and long trails:
+
+1. **Primary**: All 4 criteria met (dim + monochrome + smooth + length range)
+2. **Strong 3/4**: At least 3 criteria including smoothness and length
+3. **Very dim**: Smooth + below brightness threshold + in length range
+4. **Extended — dim+smooth+monochrome**: No max-length cap, catches long trails
+5. **Extended — dim+smooth+contrast**: Uses measured trail-to-background contrast ratio
+6. **Extended — very dim+smooth**: Below brightness threshold, relaxed monochrome (dim trails have negligible colour)
 
 ## Running the Application
 
@@ -120,17 +170,31 @@ python satellite_trail_detector.py input.mp4 output.mp4 --preview
 
 ### Parameter Organization
 
-Detection parameters are organized in dictionaries by sensitivity level:
-- `low_sensitivity_params` - Stricter detection, fewer false positives
-- `medium_sensitivity_params` - Balanced (default)
-- `high_sensitivity_params` - More permissive, more detections
+Detection parameters are organized in dictionaries by sensitivity level within `SatelliteTrailDetector.__init__()`:
+- `low` - Stricter detection, fewer false positives
+- `medium` - Balanced (default)
+- `high` - More permissive, catches dimmer and longer trails
+
+Each preset includes `satellite_contrast_min` (configurable contrast-to-background threshold) and widened `satellite_max_length` ranges.
 
 ### Key Constants
 
 - **Resolution optimization**: Tuned for 1920x1080 video
-- **CLAHE settings**: clipLimit=4.0, tileGridSize=(6, 6)
-- **Satellite length range**: 180-300 pixels (at 1080p)
-- **Color codes**: GOLD (255, 215, 0) for satellites, ORANGE (255, 165, 0) for airplanes
+- **CLAHE settings**: clipLimit=6.0, tileGridSize=(6, 6)
+- **Satellite length range (medium)**: 100-1200 pixels (at 1080p)
+- **Satellite contrast minimum (medium)**: 1.08 (trail must be 8% brighter than background)
+- **Color codes**: GOLD (0, 185, 255 BGR) for satellites, ORANGE (0, 140, 255 BGR) for airplanes
+- **Angle merge threshold**: 20 degrees (airplanes with >20deg angle difference stay separate)
+
+### Preview GUI Theme
+
+The preprocessing preview window uses a custom-drawn dark-grey theme — everything lives in a single window with no external dialogs:
+- **Background**: Dark grey (#1E1E1E) with panel cards (#2A2A2A)
+- **Text**: Light grey (#D2D2D2) primary, dim grey (#787878) secondary
+- **Accents**: Fluorescent green-yellow (#50FFC8 / BGR 200,255,80) for active values, slider fills, and CLAHE label
+- **Edges panel**: Cyan-tinted edge overlay instead of raw white edges
+- **Sliders**: Custom-drawn in the sidebar — thin accent-coloured track with circular thumb, mouse click+drag interaction via `cv2.setMouseCallback`. Coordinate mapping handles window scaling.
+- **Layout**: 2x2 panel grid + right sidebar with interactive sliders, controls help + bottom status bar with frame counter
 
 ## Development Workflow
 
@@ -156,7 +220,7 @@ class CustomDetectionAlgorithm(BaseDetectionAlgorithm):
         pass
 
     def classify_trail(self, line, gray_frame, color_frame):
-        # Custom classification logic
+        # Must return (trail_type, detection_info_dict) or (None, None)
         pass
 ```
 
@@ -170,11 +234,17 @@ class CustomDetectionAlgorithm(BaseDetectionAlgorithm):
 
 4. **Debug modes**: Preserve the `--debug` and `--debug-only` functionality when making changes.
 
-5. **Classification balance**: The algorithm prioritizes avoiding false positives. Satellites require ALL criteria to be met; airplanes only need characteristic point features.
+5. **Classification balance**: Satellites use multiple graduated detection paths (primary + extended). Airplanes only need characteristic point features. The extended paths allow detection of very dim and very long satellite trails that would have been missed by the strict primary criteria.
 
 6. **No external dependencies beyond OpenCV/NumPy**: Keep the dependency footprint minimal.
 
 7. **Boundary checking**: ROI operations include boundary checks. Maintain these when working with image regions.
+
+8. **Detection data format**: `detect_trails()` returns `(trail_type, detection_info)` tuples where `detection_info` is a dict with `bbox` and metadata keys. Do not assume bare bbox tuples — always access `detection_info['bbox']`.
+
+9. **Multi-airplane support**: The `merge_airplane_detections()` method uses angle-aware merging. Two airplane detections only merge if their bounding boxes overlap AND trail angles are within 20 degrees. This prevents crossing flight paths from being collapsed into a single detection.
+
+10. **Preview GUI theme**: The preview window uses a custom dark-grey/fluorescent-accent theme drawn entirely with OpenCV primitives in a single window. Sliders are custom-drawn (not native trackbars) with mouse callback interaction. Maintain the sleek minimal aesthetic when modifying.
 
 ## Common Tasks
 
@@ -182,16 +252,19 @@ class CustomDetectionAlgorithm(BaseDetectionAlgorithm):
 
 Add to `SatelliteTrailDetector.__init__()`:
 ```python
-self.sensitivity_presets['custom'] = {
+presets['custom'] = {
     'canny_low': ...,
     'canny_high': ...,
+    'satellite_min_length': ...,
+    'satellite_max_length': ...,
+    'satellite_contrast_min': ...,
     # ... other parameters
 }
 ```
 
 ### Modifying classification logic
 
-Edit `DefaultDetectionAlgorithm.classify_trail()` - this is the core decision function.
+Edit `SatelliteTrailDetector.classify_trail()` - this is the core decision function. Returns `(trail_type, detection_info_dict)`.
 
 ### Adding new CLI arguments
 
@@ -202,16 +275,18 @@ Add to the `main()` function's argument parser, then handle in `process_video()`
 - Box styling: `draw_dotted_rectangle()`
 - Labels: `draw_highlight()`
 - Debug panels: `create_detection_debug_panel()`
+- Preview GUI: `show_preprocessing_preview()` — uses custom dark theme with `_fill_rect`, `_put_text`, `_draw_tag` helpers
 
 ## File Locations Quick Reference
 
 | Component | Location |
 |-----------|----------|
 | Preprocessing preview | `satellite_trail_detector.py:show_preprocessing_preview()` (line ~40) |
-| Abstract interface | `satellite_trail_detector.py:BaseDetectionAlgorithm` (line ~338) |
-| Partial implementation | `satellite_trail_detector.py:DefaultDetectionAlgorithm` (line ~496) |
-| Main detector class | `satellite_trail_detector.py:SatelliteTrailDetector` (line ~643) |
-| Sensitivity presets | `satellite_trail_detector.py:SatelliteTrailDetector.__init__()` (line ~654) |
-| Classification logic | `satellite_trail_detector.py:SatelliteTrailDetector.classify_trail()` (line ~878) |
-| Video processing | `satellite_trail_detector.py:process_video()` (line ~1535) |
-| Main entry point | `satellite_trail_detector.py:main()` (line ~1825) |
+| Abstract interface | `satellite_trail_detector.py:BaseDetectionAlgorithm` (line ~420) |
+| Partial implementation | `satellite_trail_detector.py:DefaultDetectionAlgorithm` (line ~583) |
+| Main detector class | `satellite_trail_detector.py:SatelliteTrailDetector` (line ~730) |
+| Sensitivity presets | `satellite_trail_detector.py:SatelliteTrailDetector.__init__()` (line ~741) |
+| Classification logic | `satellite_trail_detector.py:SatelliteTrailDetector.classify_trail()` (line ~995) |
+| Angle-aware airplane merge | `satellite_trail_detector.py:SatelliteTrailDetector.merge_airplane_detections()` (line ~1352) |
+| Video processing | `satellite_trail_detector.py:process_video()` (line ~1883) |
+| Main entry point | `satellite_trail_detector.py:main()` (line ~2177) |
