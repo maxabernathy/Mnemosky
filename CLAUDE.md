@@ -65,7 +65,7 @@ pip install opencv-python numpy
 
 ### Key Functions
 
-- `show_preprocessing_preview()` - Interactive GUI for tuning preprocessing parameters (CLAHE, blur, Canny). Sleek dark-grey theme with fluorescent accent highlights, 2x2 panel grid with sidebar.
+- `show_preprocessing_preview()` - Interactive GUI for tuning preprocessing parameters (CLAHE, blur, Canny). Sleek dark-grey theme with fluorescent accent highlights, 2x2 panel grid with sidebar containing custom-drawn sliders (single window, no external trackbar window).
 - `process_video()` - Main video processing pipeline (handles I/O, frame iteration, output)
 - `main()` - CLI entry point with argument parsing
 
@@ -188,12 +188,13 @@ Each preset includes `satellite_contrast_min` (configurable contrast-to-backgrou
 
 ### Preview GUI Theme
 
-The preprocessing preview window uses a custom-drawn dark-grey theme:
+The preprocessing preview window uses a custom-drawn dark-grey theme — everything lives in a single window with no external dialogs:
 - **Background**: Dark grey (#1E1E1E) with panel cards (#2A2A2A)
 - **Text**: Light grey (#D2D2D2) primary, dim grey (#787878) secondary
-- **Accents**: Fluorescent green-yellow (#50FFC8 / BGR 200,255,80) for active values and CLAHE label
+- **Accents**: Fluorescent green-yellow (#50FFC8 / BGR 200,255,80) for active values, slider fills, and CLAHE label
 - **Edges panel**: Cyan-tinted edge overlay instead of raw white edges
-- **Layout**: 2x2 panel grid + right sidebar with parameter readout and controls help + bottom status bar with frame counter
+- **Sliders**: Custom-drawn in the sidebar — thin accent-coloured track with circular thumb, mouse click+drag interaction via `cv2.setMouseCallback`. Coordinate mapping handles window scaling.
+- **Layout**: 2x2 panel grid + right sidebar with interactive sliders, controls help + bottom status bar with frame counter
 
 ## Development Workflow
 
@@ -243,7 +244,7 @@ class CustomDetectionAlgorithm(BaseDetectionAlgorithm):
 
 9. **Multi-airplane support**: The `merge_airplane_detections()` method uses angle-aware merging. Two airplane detections only merge if their bounding boxes overlap AND trail angles are within 20 degrees. This prevents crossing flight paths from being collapsed into a single detection.
 
-10. **Preview GUI theme**: The preview window uses a custom dark-grey/fluorescent-accent theme drawn with OpenCV primitives. Trackbars are in a separate "Parameters" window. Maintain the sleek minimal aesthetic when modifying.
+10. **Preview GUI theme**: The preview window uses a custom dark-grey/fluorescent-accent theme drawn entirely with OpenCV primitives in a single window. Sliders are custom-drawn (not native trackbars) with mouse callback interaction. Maintain the sleek minimal aesthetic when modifying.
 
 ## Common Tasks
 
