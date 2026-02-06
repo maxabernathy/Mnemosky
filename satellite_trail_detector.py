@@ -41,6 +41,10 @@ def show_preprocessing_preview(video_path, initial_params=None):
     """
     Show an interactive preview window for tuning preprocessing parameters.
 
+    Uses a sleek dark-grey GUI with minimal fluorescent accent highlights.
+    The layout is a 2x2 panel grid (Original, CLAHE, Blur, Edges) with a
+    slim parameter sidebar on the right and a status bar at the bottom.
+
     Opens a window with a sample frame from the video and trackbars to adjust:
     - CLAHE clip limit (contrast enhancement strength)
     - CLAHE tile grid size (local region size for contrast)
@@ -63,14 +67,29 @@ def show_preprocessing_preview(video_path, initial_params=None):
     Returns:
         Dict with selected preprocessing parameters, or None if cancelled
     """
+
+    # ── Theme colours (BGR) ──────────────────────────────────────────
+    BG_DARK = (30, 30, 30)           # Main background
+    BG_PANEL = (42, 42, 42)          # Panel / card background
+    BG_SIDEBAR = (36, 36, 36)        # Sidebar background
+    BORDER = (58, 58, 58)            # Subtle panel borders
+    TEXT_PRIMARY = (210, 210, 210)    # Primary text (light grey)
+    TEXT_DIM = (120, 120, 120)        # Secondary / dim text
+    TEXT_HEADING = (180, 180, 180)    # Section headings
+    ACCENT = (200, 255, 80)          # Fluorescent green-yellow accent (BGR)
+    ACCENT_DIM = (100, 170, 50)      # Dimmed accent for less emphasis
+    ACCENT_CYAN = (220, 220, 60)     # Cyan-ish accent for edges panel (BGR)
+    BAR_BG = (50, 50, 50)            # Slider track background
+    BAR_FILL = (200, 255, 80)        # Slider fill (accent)
+
     # Default parameters
     defaults = {
-        'clahe_clip_limit': 40,      # Stored as int, divide by 10 for actual value
+        'clahe_clip_limit': 60,      # Stored as int, divide by 10 for actual value (6.0 default)
         'clahe_tile_size': 6,
         'blur_kernel_size': 3,       # Must be odd
         'blur_sigma': 3,             # Stored as int, divide by 10 for actual value
-        'canny_low': 5,
-        'canny_high': 50,
+        'canny_low': 4,
+        'canny_high': 45,
     }
 
     # Use initial params if provided
@@ -88,14 +107,12 @@ def show_preprocessing_preview(video_path, initial_params=None):
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
 
-    # Sample frames at different points in the video for user to choose from
-    # Start with frame at 10% into the video (to skip any intro)
+    # Start at 10% into the video to skip any intro
     current_frame_idx = max(0, int(total_frames * 0.1))
     cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_idx)
 
     ret, frame = cap.read()
     if not ret:
-        # Try from beginning
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         ret, frame = cap.read()
         current_frame_idx = 0
@@ -104,135 +121,199 @@ def show_preprocessing_preview(video_path, initial_params=None):
             cap.release()
             return None
 
-    # Store original frame for reset
     original_frame = frame.copy()
-    height, width = frame.shape[:2]
+    src_h, src_w = frame.shape[:2]
 
-    # Create window
-    window_name = "Preprocessing Preview - Adjust parameters and press SPACE/ENTER to confirm, ESC to cancel"
+    # ── Window setup ─────────────────────────────────────────────────
+    window_name = "Mnemosky  -  Preprocessing Preview"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
-    # Resize window to fit screen while maintaining aspect ratio
-    screen_scale = min(1.0, 1400 / width, 900 / height)
-    display_width = int(width * screen_scale)
-    display_height = int(height * screen_scale)
-    cv2.resizeWindow(window_name, display_width, display_height)
+    # Create trackbar window (separate from display for cleaner look)
+    trackbar_window = "Parameters"
+    cv2.namedWindow(trackbar_window, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(trackbar_window, 420, 240)
 
-    # Current parameter values (mutable)
     params = defaults.copy()
-
-    # Flag to trigger update
-    needs_update = [True]  # Using list to allow modification in nested function
+    needs_update = [True]
 
     def on_trackbar_change(val):
-        """Callback when any trackbar changes."""
         needs_update[0] = True
 
-    # Create trackbars
-    # CLAHE clip limit: 1-100 (divided by 10 = 0.1 to 10.0)
-    cv2.createTrackbar("CLAHE Clip (x0.1)", window_name, params['clahe_clip_limit'], 100, on_trackbar_change)
+    cv2.createTrackbar("CLAHE Clip", trackbar_window, params['clahe_clip_limit'], 100, on_trackbar_change)
+    cv2.createTrackbar("CLAHE Tile", trackbar_window, params['clahe_tile_size'], 16, on_trackbar_change)
+    cv2.createTrackbar("Blur Kernel", trackbar_window, params['blur_kernel_size'], 15, on_trackbar_change)
+    cv2.createTrackbar("Blur Sigma", trackbar_window, params['blur_sigma'], 50, on_trackbar_change)
+    cv2.createTrackbar("Canny Low", trackbar_window, params['canny_low'], 100, on_trackbar_change)
+    cv2.createTrackbar("Canny High", trackbar_window, params['canny_high'], 200, on_trackbar_change)
 
-    # CLAHE tile size: 2-16
-    cv2.createTrackbar("CLAHE Tile Size", window_name, params['clahe_tile_size'], 16, on_trackbar_change)
+    # ── Helper drawing functions ─────────────────────────────────────
 
-    # Blur kernel size: 1-15 (will be forced to odd)
-    cv2.createTrackbar("Blur Kernel", window_name, params['blur_kernel_size'], 15, on_trackbar_change)
+    def _fill_rect(img, x, y, w, h, color):
+        """Fill a rectangle with a solid colour."""
+        cv2.rectangle(img, (x, y), (x + w, y + h), color, -1)
 
-    # Blur sigma: 0-50 (divided by 10 = 0.0 to 5.0)
-    cv2.createTrackbar("Blur Sigma (x0.1)", window_name, params['blur_sigma'], 50, on_trackbar_change)
+    def _draw_border(img, x, y, w, h, color, thickness=1):
+        """Draw a rectangle border."""
+        cv2.rectangle(img, (x, y), (x + w - 1, y + h - 1), color, thickness)
 
-    # Canny thresholds for edge visualization
-    cv2.createTrackbar("Canny Low", window_name, params['canny_low'], 100, on_trackbar_change)
-    cv2.createTrackbar("Canny High", window_name, params['canny_high'], 200, on_trackbar_change)
+    def _put_text(img, text, x, y, color, scale=0.42, thickness=1):
+        """Draw anti-aliased text."""
+        cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+
+    def _draw_tag(img, text, x, y, bg_color, text_color, scale=0.38):
+        """Draw a small rounded-ish tag label."""
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+        pad_x, pad_y = 6, 4
+        _fill_rect(img, x, y - th - pad_y, tw + pad_x * 2, th + pad_y * 2, bg_color)
+        _put_text(img, text, x + pad_x, y - 1, text_color, scale)
+
+    # ── Preprocessing logic ──────────────────────────────────────────
 
     def apply_preprocessing(frame, params):
-        """Apply preprocessing with current parameters."""
-        # Convert to grayscale
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # Get actual parameter values
         clip_limit = max(0.1, params['clahe_clip_limit'] / 10.0)
         tile_size = max(2, params['clahe_tile_size'])
         blur_kernel = params['blur_kernel_size']
         blur_sigma = params['blur_sigma'] / 10.0
-
-        # Ensure blur kernel is odd
         if blur_kernel < 1:
             blur_kernel = 1
         if blur_kernel % 2 == 0:
             blur_kernel += 1
-
-        # Apply CLAHE
         clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_size, tile_size))
         enhanced = clahe.apply(gray)
-
-        # Apply Gaussian blur
         if blur_kernel >= 1 and blur_sigma > 0:
             blurred = cv2.GaussianBlur(enhanced, (blur_kernel, blur_kernel), blur_sigma)
         else:
             blurred = enhanced
-
-        # Apply Canny edge detection for visualization
         canny_low = max(1, params['canny_low'])
         canny_high = max(canny_low + 1, params['canny_high'])
         edges = cv2.Canny(blurred, canny_low, canny_high)
-
         return gray, enhanced, blurred, edges
 
+    # ── Composite display builder ────────────────────────────────────
+
     def create_display(frame, gray, enhanced, blurred, edges, params):
-        """Create a display showing original, preprocessed stages, and edges."""
         h, w = frame.shape[:2]
 
-        # Create 2x2 grid: Original | CLAHE Enhanced
-        #                  Blurred  | Edges
-        # Each panel is half size
-        panel_h = h // 2
-        panel_w = w // 2
+        # Panel dimensions (2x2 grid with 2px gaps)
+        gap = 2
+        panel_w = (w - gap) // 2
+        panel_h = (h - gap) // 2
+
+        # Sidebar width
+        sidebar_w = 260
+
+        # Total canvas size
+        canvas_w = panel_w * 2 + gap + sidebar_w
+        status_bar_h = 32
+        canvas_h = panel_h * 2 + gap + status_bar_h
+
+        canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+        canvas[:] = BG_DARK
 
         # Resize panels
-        original_small = cv2.resize(frame, (panel_w, panel_h))
-        enhanced_bgr = cv2.cvtColor(cv2.resize(enhanced, (panel_w, panel_h)), cv2.COLOR_GRAY2BGR)
-        blurred_bgr = cv2.cvtColor(cv2.resize(blurred, (panel_w, panel_h)), cv2.COLOR_GRAY2BGR)
-        edges_bgr = cv2.cvtColor(cv2.resize(edges, (panel_w, panel_h)), cv2.COLOR_GRAY2BGR)
+        orig_small = cv2.resize(frame, (panel_w, panel_h))
+        enh_gray = cv2.resize(enhanced, (panel_w, panel_h))
+        blur_gray = cv2.resize(blurred, (panel_w, panel_h))
+        edge_gray = cv2.resize(edges, (panel_w, panel_h))
 
-        # Create labels background
-        def add_label(img, text, position="top"):
-            overlay = img.copy()
-            if position == "top":
-                cv2.rectangle(overlay, (0, 0), (len(text) * 12 + 10, 25), (0, 0, 0), -1)
-                cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
-                cv2.putText(img, text, (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-            return img
+        # Convert grays to BGR
+        enh_bgr = cv2.cvtColor(enh_gray, cv2.COLOR_GRAY2BGR)
+        blur_bgr = cv2.cvtColor(blur_gray, cv2.COLOR_GRAY2BGR)
 
-        # Add labels
-        add_label(original_small, "1. Original Frame")
-        add_label(enhanced_bgr, f"2. CLAHE (clip={params['clahe_clip_limit']/10:.1f}, tile={params['clahe_tile_size']})")
+        # Tint edges with accent cyan on dark background
+        edge_bgr = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
+        edge_bgr[:] = BG_PANEL
+        edge_mask = edge_gray > 0
+        edge_bgr[edge_mask] = ACCENT_CYAN
 
+        # Place panels
+        positions = [
+            (0, 0, orig_small),
+            (panel_w + gap, 0, enh_bgr),
+            (0, panel_h + gap, blur_bgr),
+            (panel_w + gap, panel_h + gap, edge_bgr),
+        ]
+        for px, py, panel in positions:
+            canvas[py:py + panel_h, px:px + panel_w] = panel
+            _draw_border(canvas, px, py, panel_w, panel_h, BORDER)
+
+        # Panel labels (overlaid tags)
+        tag_y = 18
+        tag_x = 8
+        _draw_tag(canvas, "ORIGINAL", tag_x, tag_y, BG_DARK, TEXT_DIM)
+        clip_val = params['clahe_clip_limit'] / 10.0
+        _draw_tag(canvas, f"CLAHE  clip {clip_val:.1f}  tile {params['clahe_tile_size']}",
+                  panel_w + gap + tag_x, tag_y, BG_DARK, ACCENT)
         blur_k = params['blur_kernel_size']
         if blur_k % 2 == 0:
             blur_k += 1
-        add_label(blurred_bgr, f"3. Gaussian Blur (k={blur_k}, s={params['blur_sigma']/10:.1f})")
-        add_label(edges_bgr, f"4. Canny Edges ({params['canny_low']}-{params['canny_high']})")
+        _draw_tag(canvas, f"BLUR  k={blur_k}  s={params['blur_sigma']/10:.1f}",
+                  tag_x, panel_h + gap + tag_y, BG_DARK, TEXT_PRIMARY)
+        _draw_tag(canvas, f"EDGES  {params['canny_low']}-{params['canny_high']}",
+                  panel_w + gap + tag_x, panel_h + gap + tag_y, BG_DARK, ACCENT_CYAN)
 
-        # Combine into grid
-        top_row = np.hstack([original_small, enhanced_bgr])
-        bottom_row = np.hstack([blurred_bgr, edges_bgr])
-        display = np.vstack([top_row, bottom_row])
+        # ── Sidebar ──────────────────────────────────────────────────
+        sb_x = panel_w * 2 + gap
+        _fill_rect(canvas, sb_x, 0, sidebar_w, canvas_h - status_bar_h, BG_SIDEBAR)
+        _draw_border(canvas, sb_x, 0, sidebar_w, canvas_h - status_bar_h, BORDER)
 
-        # Add instructions at the bottom
-        instruction_bar = np.zeros((40, display.shape[1], 3), dtype=np.uint8)
-        instructions = "SPACE/ENTER: Accept | ESC: Cancel | R: Reset | N/P: Next/Prev frame"
-        cv2.putText(instruction_bar, instructions, (10, 25),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+        # Title
+        _put_text(canvas, "MNEMOSKY", sb_x + 14, 24, ACCENT, 0.52, 1)
+        _put_text(canvas, "Preprocessing", sb_x + 14, 46, TEXT_HEADING, 0.40)
 
-        # Add frame info
-        frame_info = f"Frame {current_frame_idx}/{total_frames} | {width}x{height}"
-        cv2.putText(instruction_bar, frame_info, (display.shape[1] - 250, 25),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1, cv2.LINE_AA)
+        # Divider line
+        cv2.line(canvas, (sb_x + 14, 56), (sb_x + sidebar_w - 14, 56), BORDER, 1)
 
-        display = np.vstack([display, instruction_bar])
+        # Parameter readout
+        readout_y = 78
+        line_h = 26
+        param_items = [
+            ("CLAHE Clip", f"{params['clahe_clip_limit'] / 10.0:.1f}"),
+            ("CLAHE Tile", f"{params['clahe_tile_size']}"),
+            ("Blur Kernel", f"{blur_k}"),
+            ("Blur Sigma", f"{params['blur_sigma'] / 10.0:.1f}"),
+            ("Canny Low", f"{params['canny_low']}"),
+            ("Canny High", f"{params['canny_high']}"),
+        ]
+        for label, value in param_items:
+            _put_text(canvas, label, sb_x + 14, readout_y, TEXT_DIM, 0.36)
+            _put_text(canvas, value, sb_x + sidebar_w - 50, readout_y, ACCENT, 0.40, 1)
+            readout_y += line_h
 
-        return display
+        # Divider
+        cv2.line(canvas, (sb_x + 14, readout_y), (sb_x + sidebar_w - 14, readout_y), BORDER, 1)
+        readout_y += 16
+
+        # Controls help
+        _put_text(canvas, "CONTROLS", sb_x + 14, readout_y, TEXT_HEADING, 0.38)
+        readout_y += 22
+        controls = [
+            ("SPACE / ENTER", "Accept"),
+            ("ESC", "Cancel"),
+            ("R", "Reset"),
+            ("N / P", "Next / Prev frame"),
+        ]
+        for key_str, desc in controls:
+            _put_text(canvas, key_str, sb_x + 14, readout_y, ACCENT_DIM, 0.33)
+            _put_text(canvas, desc, sb_x + 130, readout_y, TEXT_DIM, 0.33)
+            readout_y += 18
+
+        # ── Status bar ───────────────────────────────────────────────
+        sb_y = canvas_h - status_bar_h
+        _fill_rect(canvas, 0, sb_y, canvas_w, status_bar_h, BG_PANEL)
+        cv2.line(canvas, (0, sb_y), (canvas_w, sb_y), BORDER, 1)
+
+        frame_text = f"Frame {current_frame_idx}/{total_frames}"
+        res_text = f"{src_w}x{src_h}"
+        _put_text(canvas, frame_text, 12, sb_y + 21, TEXT_DIM, 0.36)
+        _put_text(canvas, res_text, canvas_w - 90, sb_y + 21, TEXT_DIM, 0.36)
+
+        # Small accent dot as a "live" indicator
+        cv2.circle(canvas, (canvas_w // 2, sb_y + 16), 4, ACCENT, -1)
+        _put_text(canvas, "LIVE", canvas_w // 2 + 10, sb_y + 21, ACCENT_DIM, 0.33)
+
+        return canvas
 
     print("\n" + "=" * 60)
     print("PREPROCESSING PREVIEW")
@@ -247,36 +328,37 @@ def show_preprocessing_preview(video_path, initial_params=None):
     print("  P           - Load previous frame")
     print("=" * 60 + "\n")
 
-    # Main loop
+    # ── Main loop ────────────────────────────────────────────────────
     while True:
-        # Read current trackbar values
-        params['clahe_clip_limit'] = cv2.getTrackbarPos("CLAHE Clip (x0.1)", window_name)
-        params['clahe_tile_size'] = cv2.getTrackbarPos("CLAHE Tile Size", window_name)
-        params['blur_kernel_size'] = cv2.getTrackbarPos("Blur Kernel", window_name)
-        params['blur_sigma'] = cv2.getTrackbarPos("Blur Sigma (x0.1)", window_name)
-        params['canny_low'] = cv2.getTrackbarPos("Canny Low", window_name)
-        params['canny_high'] = cv2.getTrackbarPos("Canny High", window_name)
+        params['clahe_clip_limit'] = cv2.getTrackbarPos("CLAHE Clip", trackbar_window)
+        params['clahe_tile_size'] = cv2.getTrackbarPos("CLAHE Tile", trackbar_window)
+        params['blur_kernel_size'] = cv2.getTrackbarPos("Blur Kernel", trackbar_window)
+        params['blur_sigma'] = cv2.getTrackbarPos("Blur Sigma", trackbar_window)
+        params['canny_low'] = cv2.getTrackbarPos("Canny Low", trackbar_window)
+        params['canny_high'] = cv2.getTrackbarPos("Canny High", trackbar_window)
 
-        # Apply preprocessing
         gray, enhanced, blurred, edges = apply_preprocessing(frame, params)
-
-        # Create display
         display = create_display(frame, gray, enhanced, blurred, edges, params)
 
-        # Show
         cv2.imshow(window_name, display)
 
-        # Wait for key
+        # Fit window on first display
+        if needs_update[0]:
+            dh, dw = display.shape[:2]
+            screen_scale = min(1.0, 1600 / dw, 950 / dh)
+            cv2.resizeWindow(window_name, int(dw * screen_scale), int(dh * screen_scale))
+            needs_update[0] = False
+
         key = cv2.waitKey(50) & 0xFF
 
-        if key == 27:  # ESC - cancel
+        if key == 27:  # ESC
             print("Preview cancelled. Using default parameters.")
             cv2.destroyWindow(window_name)
+            cv2.destroyWindow(trackbar_window)
             cap.release()
             return None
 
-        elif key in [13, 32]:  # ENTER or SPACE - accept
-            # Convert to actual values
+        elif key in [13, 32]:  # ENTER or SPACE
             final_params = {
                 'clahe_clip_limit': max(0.1, params['clahe_clip_limit'] / 10.0),
                 'clahe_tile_size': max(2, params['clahe_tile_size']),
@@ -292,21 +374,21 @@ def show_preprocessing_preview(video_path, initial_params=None):
             print(f"  Blur sigma: {final_params['blur_sigma']:.1f}")
             print(f"  Canny thresholds: {final_params['canny_low']}-{final_params['canny_high']}")
             cv2.destroyWindow(window_name)
+            cv2.destroyWindow(trackbar_window)
             cap.release()
             return final_params
 
         elif key == ord('r') or key == ord('R'):  # Reset
             params = defaults.copy()
-            cv2.setTrackbarPos("CLAHE Clip (x0.1)", window_name, params['clahe_clip_limit'])
-            cv2.setTrackbarPos("CLAHE Tile Size", window_name, params['clahe_tile_size'])
-            cv2.setTrackbarPos("Blur Kernel", window_name, params['blur_kernel_size'])
-            cv2.setTrackbarPos("Blur Sigma (x0.1)", window_name, params['blur_sigma'])
-            cv2.setTrackbarPos("Canny Low", window_name, params['canny_low'])
-            cv2.setTrackbarPos("Canny High", window_name, params['canny_high'])
+            cv2.setTrackbarPos("CLAHE Clip", trackbar_window, params['clahe_clip_limit'])
+            cv2.setTrackbarPos("CLAHE Tile", trackbar_window, params['clahe_tile_size'])
+            cv2.setTrackbarPos("Blur Kernel", trackbar_window, params['blur_kernel_size'])
+            cv2.setTrackbarPos("Blur Sigma", trackbar_window, params['blur_sigma'])
+            cv2.setTrackbarPos("Canny Low", trackbar_window, params['canny_low'])
+            cv2.setTrackbarPos("Canny High", trackbar_window, params['canny_high'])
             print("Parameters reset to defaults.")
 
         elif key == ord('n') or key == ord('N'):  # Next frame
-            # Jump forward by 1 second worth of frames
             current_frame_idx = min(total_frames - 1, current_frame_idx + int(fps))
             cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_idx)
             ret, frame = cap.read()
@@ -318,7 +400,6 @@ def show_preprocessing_preview(video_path, initial_params=None):
                 original_frame = frame.copy()
 
         elif key == ord('p') or key == ord('P'):  # Previous frame
-            # Jump back by 1 second worth of frames
             current_frame_idx = max(0, current_frame_idx - int(fps))
             cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_idx)
             ret, frame = cap.read()
@@ -328,6 +409,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
         # Check if window was closed
         if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
             print("Preview window closed. Using default parameters.")
+            cv2.destroyWindow(trackbar_window)
             cap.release()
             return None
 
@@ -676,10 +758,12 @@ class SatelliteTrailDetector:
         self.skip_aspect_ratio_check = skip_aspect_ratio_check
 
         # Sensitivity presets - rebalanced to reduce false positives
+        # Satellite length ranges are generous because trails can span large
+        # portions of the frame depending on exposure and satellite altitude.
         presets = {
             'low': {
                 'min_line_length': 80,  # Longer minimum to reduce noise
-                'max_line_gap': 30,  # Moderate gap tolerance
+                'max_line_gap': 40,  # Moderate gap tolerance
                 'canny_low': 8,  # Less sensitive to reduce edge noise
                 'canny_high': 60,
                 'hough_threshold': 45,  # Higher threshold for fewer false detections
@@ -687,34 +771,37 @@ class SatelliteTrailDetector:
                 'brightness_threshold': 25,
                 'airplane_brightness_min': 90,
                 'airplane_saturation_min': 10,
-                'satellite_min_length': 180,  # Satellite trail length (1920x1080)
-                'satellite_max_length': 300,
+                'satellite_min_length': 120,  # Satellite trail length range (1920x1080)
+                'satellite_max_length': 800,
+                'satellite_contrast_min': 1.10,  # Minimum trail-to-background contrast
             },
             'medium': {
-                'min_line_length': 60,  # Balanced length requirement
-                'max_line_gap': 35,  # Balanced gap tolerance
-                'canny_low': 5,  # Balanced edge detection
-                'canny_high': 50,
-                'hough_threshold': 35,  # Balanced threshold
+                'min_line_length': 50,  # Lower to catch dim trail fragments
+                'max_line_gap': 50,  # Wider gap tolerance for dim fragmented trails
+                'canny_low': 4,  # Slightly more sensitive for dim trails
+                'canny_high': 45,
+                'hough_threshold': 30,  # Lower threshold to catch dim trails
                 'min_aspect_ratio': 4,  # Require trails to be relatively long and thin
                 'brightness_threshold': 18,
                 'airplane_brightness_min': 75,
                 'airplane_saturation_min': 8,
-                'satellite_min_length': 180,
-                'satellite_max_length': 300,
+                'satellite_min_length': 100,  # Satellites can be shorter segments
+                'satellite_max_length': 1200,  # Very long trails for full-frame crossings
+                'satellite_contrast_min': 1.08,  # Lower contrast for dim satellites
             },
             'high': {
-                'min_line_length': 45,  # Still catches shorter trails
-                'max_line_gap': 40,  # More tolerant of breaks
-                'canny_low': 3,  # More sensitive edge detection
-                'canny_high': 40,
-                'hough_threshold': 25,  # Lower threshold for more detections
+                'min_line_length': 35,  # Catches shorter trail fragments
+                'max_line_gap': 60,  # Very tolerant of breaks in dim trails
+                'canny_low': 2,  # Very sensitive edge detection
+                'canny_high': 35,
+                'hough_threshold': 20,  # Lower threshold for more detections
                 'min_aspect_ratio': 3,  # More relaxed but not too permissive
                 'brightness_threshold': 12,
                 'airplane_brightness_min': 45,
                 'airplane_saturation_min': 2,
-                'satellite_min_length': 100,  # Slightly lower for high sensitivity
-                'satellite_max_length': 500,
+                'satellite_min_length': 60,  # Very short fragments allowed
+                'satellite_max_length': 2000,  # No practical upper limit
+                'satellite_contrast_min': 1.05,  # Very dim trails allowed
             }
         }
 
@@ -733,18 +820,30 @@ class SatelliteTrailDetector:
             if 'canny_high' in self.preprocessing_params:
                 self.params['canny_high'] = self.preprocessing_params['canny_high']
 
+    @staticmethod
+    def _rotated_kernel_endpoints(size, angle_deg):
+        """Return two endpoint tuples for a line through the center of a (size x size) grid."""
+        import math
+        cx = cy = size // 2
+        half = size // 2
+        rad = math.radians(angle_deg)
+        dx = int(round(half * math.cos(rad)))
+        dy = int(round(half * math.sin(rad)))
+        return (cx - dx, cy - dy), (cx + dx, cy + dy)
+
     def preprocess_frame(self, frame):
         """Convert frame to grayscale and enhance for trail detection."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # Get preprocessing parameters (use custom if available, otherwise defaults)
+        # Higher CLAHE clip limit (6.0) enhances dim satellite trails more aggressively
         if self.preprocessing_params:
-            clip_limit = self.preprocessing_params.get('clahe_clip_limit', 4.0)
+            clip_limit = self.preprocessing_params.get('clahe_clip_limit', 6.0)
             tile_size = self.preprocessing_params.get('clahe_tile_size', 6)
             blur_kernel = self.preprocessing_params.get('blur_kernel_size', 3)
             blur_sigma = self.preprocessing_params.get('blur_sigma', 0.3)
         else:
-            clip_limit = 4.0
+            clip_limit = 6.0
             tile_size = 6
             blur_kernel = 3
             blur_sigma = 0.3
@@ -773,16 +872,27 @@ class SatelliteTrailDetector:
             self.params['canny_low'],
             self.params['canny_high']
         )
-        
+
         # Morphological operations to connect broken trails
-        # Enhanced to better connect dim, fragmented, and less steady satellite trails
+        # Enhanced to better connect dim, fragmented satellite trails
         kernel = np.ones((3, 3), np.uint8)
 
-        # Dilate more aggressively to connect gaps in dim trails
+        # Dilate to connect gaps in dim trails
         edges = cv2.dilate(edges, kernel, iterations=3)
-        # Erode less to preserve dim features
+        # Light erosion to preserve dim features
         edges = cv2.erode(edges, kernel, iterations=1)
-        
+
+        # Additional directional dilation to bridge gaps in linear features.
+        # Dim satellite trails fragment into short segments with small gaps;
+        # elongated kernels reconnect them without bloating non-linear noise.
+        for angle in [0, 45, 90, 135]:
+            line_kernel = np.zeros((7, 7), dtype=np.uint8)
+            cv2.line(line_kernel, *self._rotated_kernel_endpoints(7, angle), 1, thickness=1)
+            edges = cv2.dilate(edges, line_kernel, iterations=1)
+
+        # Clean up directional dilation
+        edges = cv2.erode(edges, kernel, iterations=1)
+
         # Hough line detection
         lines = cv2.HoughLinesP(
             edges,
@@ -792,9 +902,9 @@ class SatelliteTrailDetector:
             minLineLength=self.params['min_line_length'],
             maxLineGap=self.params['max_line_gap']
         )
-        
+
         return lines, edges
-    
+
     def detect_point_features(self, line, gray_frame, return_debug_info=False):
         """
         Detect point-like features (bright spots) along a trail using spatial analysis.
@@ -943,7 +1053,7 @@ class SatelliteTrailDetector:
             return None, None
 
         # Check minimum contrast - trail should stand out from background
-        # Sample surrounding area to check if trail is actually brighter
+        # Use per-sensitivity threshold so dim satellite trails aren't rejected
         surround_sample_size = 30
         x_center = (x1 + x2) // 2
         y_center = (y1 + y2) // 2
@@ -955,11 +1065,12 @@ class SatelliteTrailDetector:
         bg_y_max = min(gray_frame.shape[0], y_center + surround_sample_size)
 
         background_region = gray_frame[bg_y_min:bg_y_max, bg_x_min:bg_x_max]
+        contrast_ratio = None
         if background_region.size > 0:
             background_brightness = np.median(background_region)
-            # Trail should be at least 20% brighter than background
             contrast_ratio = avg_brightness / (background_brightness + 1e-5)
-            if contrast_ratio < 1.2:
+            min_contrast = self.params.get('satellite_contrast_min', 1.08)
+            if contrast_ratio < min_contrast:
                 return None, None
 
         # Calculate bounding box
@@ -1130,24 +1241,57 @@ class SatelliteTrailDetector:
 
         # SATELLITE DETECTION CRITERIA
         # Satellites have SMOOTH, consistent brightness (no dotted features)
-        # Typically dim, monochromatic, 180-300px length
+        # They are dim, monochromatic, and can range from short segments to
+        # very long trails spanning much of the frame.
         is_dim = avg_brightness < self.params['airplane_brightness_min']
         is_monochrome = avg_saturation < self.params['airplane_saturation_min']
-        is_smooth = brightness_variation < 0.35 and not has_bright_spots  # Smooth, no bright points
+
+        # Smoothness check: use adaptive threshold for very dim trails.
+        # When avg_brightness is very low (e.g. 8), even small noise in pixel
+        # values causes brightness_std / avg to spike, falsely failing the
+        # smoothness test. Use absolute std as a fallback for dim trails.
+        smooth_threshold = 0.40
+        is_smooth_relative = brightness_variation < smooth_threshold and not has_bright_spots
+        is_smooth_absolute = brightness_std < 8.0 and not has_bright_spots  # Low absolute variation
+        is_smooth = is_smooth_relative or (is_dim and is_smooth_absolute)
+
         is_satellite_length = self.params['satellite_min_length'] <= length <= self.params['satellite_max_length']
+
+        # Check if trail has good contrast with background (useful for dim trails)
+        has_contrast = contrast_ratio is not None and contrast_ratio >= self.params.get('satellite_contrast_min', 1.08)
 
         satellite_score = sum([is_dim, is_monochrome, is_smooth, is_satellite_length])
 
-        # Require ALL 4 satellite characteristics to be confident
+        # --- Primary paths (strongest confidence) ---
+
+        # All 4 characteristics met
         if satellite_score >= 4 and not has_dotted_pattern:
             return 'satellite', _make_detection_info()
 
-        # Require at least 3 characteristics including smoothness and length
+        # 3 characteristics including both smoothness and length
         if satellite_score >= 3 and is_smooth and is_satellite_length and not has_dotted_pattern:
             return 'satellite', _make_detection_info()
 
         # Very dim, smooth trails in correct length range
         if is_smooth and avg_brightness <= self.params['brightness_threshold'] * 1.5 and is_satellite_length and not has_dotted_pattern:
+            return 'satellite', _make_detection_info()
+
+        # --- Extended paths for dim/long trails that miss primary criteria ---
+
+        # Long smooth dim trail outside the "typical" length range but clearly
+        # not an airplane: no dotted pattern, dim, monochrome, smooth
+        if is_smooth and is_dim and is_monochrome and not has_dotted_pattern and length >= self.params['satellite_min_length']:
+            return 'satellite', _make_detection_info()
+
+        # Dim smooth trail with confirmed background contrast — even if
+        # length or monochrome criteria aren't perfectly met
+        if is_smooth and is_dim and has_contrast and not has_dotted_pattern and length >= self.params['satellite_min_length']:
+            return 'satellite', _make_detection_info()
+
+        # Very dim trail (below brightness_threshold) that is smooth and long
+        # enough — relaxed monochrome requirement since very dim trails have
+        # negligible color information anyway
+        if is_smooth and avg_brightness <= self.params['brightness_threshold'] and not has_dotted_pattern and length >= self.params['satellite_min_length']:
             return 'satellite', _make_detection_info()
 
         return None, None
