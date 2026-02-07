@@ -750,17 +750,30 @@ class DefaultDetectionAlgorithm(BaseDetectionAlgorithm):
         threshold = mean_brightness + std_brightness * 1.0
         peaks = brightness_array > threshold
 
-        # Count distinct peaks (consecutive peaks count as one)
+        # Count distinct peaks.  Consecutive above-threshold samples are
+        # merged into one peak group, and peak groups closer than
+        # min_peak_separation samples apart are also merged — a single
+        # star can produce nearby brightness bumps that should not count
+        # as separate airplane navigation-light features.
+        min_peak_separation = max(5, num_samples // 10)  # ≥10 % of trail apart
+
         num_peaks = 0
         in_peak = False
         peak_indices = []  # Store indices of peak starts for debug visualization
+        last_peak_end = -min_peak_separation  # Allow the first peak unconditionally
 
         for i, is_peak in enumerate(peaks):
             if is_peak and not in_peak:
-                num_peaks += 1
-                peak_indices.append(i)
+                if i - last_peak_end >= min_peak_separation:
+                    num_peaks += 1
+                    peak_indices.append(i)
+                else:
+                    # Too close to previous peak — merge (don't increment)
+                    pass
                 in_peak = True
             elif not is_peak:
+                if in_peak:
+                    last_peak_end = i  # Record where this peak group ended
                 in_peak = False
 
         if return_debug_info:
@@ -1016,17 +1029,30 @@ class SatelliteTrailDetector:
         threshold = mean_brightness + std_brightness * 1.0
         peaks = brightness_array > threshold
 
-        # Count distinct peaks (consecutive peaks count as one)
+        # Count distinct peaks.  Consecutive above-threshold samples are
+        # merged into one peak group, and peak groups closer than
+        # min_peak_separation samples apart are also merged — a single
+        # star can produce nearby brightness bumps that should not count
+        # as separate airplane navigation-light features.
+        min_peak_separation = max(5, num_samples // 10)  # ≥10 % of trail apart
+
         num_peaks = 0
         in_peak = False
         peak_indices = []  # Store indices of peak starts for debug visualization
+        last_peak_end = -min_peak_separation  # Allow the first peak unconditionally
 
         for i, is_peak in enumerate(peaks):
             if is_peak and not in_peak:
-                num_peaks += 1
-                peak_indices.append(i)
+                if i - last_peak_end >= min_peak_separation:
+                    num_peaks += 1
+                    peak_indices.append(i)
+                else:
+                    # Too close to previous peak — merge (don't increment)
+                    pass
                 in_peak = True
             elif not is_peak:
+                if in_peak:
+                    last_peak_end = i  # Record where this peak group ended
                 in_peak = False
 
         if return_debug_info:
@@ -1234,6 +1260,35 @@ class SatelliteTrailDetector:
 
         # Check for high brightness variance (indicates non-uniform, dotted pattern)
         has_high_variance = brightness_variation > 0.30  # Balanced threshold
+
+        # STAR FALSE-POSITIVE SUPPRESSION
+        # A single bright star on an otherwise dim trail can inflate
+        # brightness_peak_ratio and brightness_variation, mimicking a
+        # dotted airplane pattern.  Real airplane navigation-light dots
+        # are distributed along the trail; a star is localised.  Sample
+        # brightness along the line and check what fraction of the trail
+        # length the bright pixels span.
+        if has_bright_spots or has_high_variance:
+            n_spread = max(20, int(length / 5))
+            n_spread = min(n_spread, 100)
+            spread_samples = []
+            for si in range(n_spread):
+                st = si / (n_spread - 1) if n_spread > 1 else 0
+                spx = int(x1 + st * (x2 - x1))
+                spy = int(y1 + st * (y2 - y1))
+                if 0 <= spy < gray_frame.shape[0] and 0 <= spx < gray_frame.shape[1]:
+                    spread_samples.append(gray_frame[spy, spx])
+            if len(spread_samples) >= 10:
+                spread_arr = np.array(spread_samples)
+                spread_mean = np.mean(spread_arr)
+                spread_std = np.std(spread_arr)
+                bright_mask = spread_arr > (spread_mean + spread_std)
+                bright_fraction = np.sum(bright_mask) / len(spread_arr)
+                # Real airplane dots span >20 % of the trail length;
+                # a single star typically illuminates <15 %.
+                if bright_fraction < 0.15:
+                    has_bright_spots = False
+                    has_high_variance = False
 
         # SPATIAL ANALYSIS: Detect distinct point-like features along the trail
         num_point_features = self.detect_point_features(line, gray_frame)
