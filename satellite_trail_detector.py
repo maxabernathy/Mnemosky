@@ -43,9 +43,14 @@ def show_preprocessing_preview(video_path, initial_params=None):
 
     Uses a sleek dark-grey GUI with minimal fluorescent accent highlights.
     All controls — including custom-drawn sliders — live inside the single
-    main window.  The layout is a 2x2 panel grid (Original, CLAHE, Blur,
-    Edges) with a parameter sidebar containing interactive sliders on the
-    right, and a status bar at the bottom.
+    main window.  The layout is a 2x2 panel grid (Original, CLAHE,
+    MF Response, Edges) with a parameter sidebar containing interactive
+    sliders on the right, and a status bar at the bottom.
+
+    The MF Response panel shows the directional matched-filter SNR heatmap
+    — a warm-toned intensity map revealing dim linear features that Canny
+    edge detection misses.  Detected line segments are overlaid in bright
+    magenta.  The MF SNR slider controls the detection threshold.
 
     Controls:
     - Use Frame slider to select exact frame containing trail signal
@@ -82,6 +87,9 @@ def show_preprocessing_preview(video_path, initial_params=None):
     ACCENT = (200, 255, 80)          # Fluorescent green-yellow accent (BGR)
     ACCENT_DIM = (100, 170, 50)      # Dimmed accent for less emphasis
     ACCENT_CYAN = (220, 220, 60)     # Cyan-ish accent for edges panel (BGR)
+    ACCENT_MF = (120, 60, 255)       # Warm magenta for matched-filter panel (BGR)
+    ACCENT_MF_DIM = (70, 40, 140)   # Dimmed MF accent (below threshold)
+    ACCENT_MF_LINE = (140, 100, 255) # Bright MF accent for detected lines
     SLIDER_TRACK = (50, 50, 50)      # Slider track background
     SLIDER_FILL = (200, 255, 80)     # Slider filled portion (accent)
     SLIDER_THUMB = (240, 255, 160)   # Slider thumb highlight
@@ -94,6 +102,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
         'blur_sigma': 18,            # Stored as int, divide by 10 for actual value (1.8)
         'canny_low': 4,
         'canny_high': 100,
+        'mf_snr_threshold': 25,     # Stored as int, divide by 10 for actual value (2.5)
     }
 
     # Use initial params if provided
@@ -140,6 +149,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
         ('blur_sigma',       'Blur Sigma',  lambda v: f"{v/10:.1f}", 0, 50),
         ('canny_low',        'Canny Low',   lambda v: f"{v}",        0, 100),
         ('canny_high',       'Canny High',  lambda v: f"{v}",        0, 200),
+        ('mf_snr_threshold', 'MF SNR',      lambda v: f"{v/10:.1f}", 10, 60),
     ]
 
     params = defaults.copy()
@@ -208,6 +218,10 @@ def show_preprocessing_preview(video_path, initial_params=None):
     pending_click = [None]      # [None] or [(src_x, src_y)] awaiting end point
     mouse_pos = [0, 0]          # Live mouse position for rubber-band line
 
+    # Matched-filter cache — the SNR map only depends on the frame, not on
+    # the threshold slider, so we recompute it only when the frame changes.
+    mf_cache = {'frame_idx': -1, 'snr_map': None}
+
     # ── Window setup ─────────────────────────────────────────────────
     window_name = "Mnemosky  -  Preprocessing Preview"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -251,6 +265,100 @@ def show_preprocessing_preview(video_path, initial_params=None):
         canny_high = max(canny_low + 1, p['canny_high'])
         edges = cv2.Canny(blurred, canny_low, canny_high)
         return gray, enhanced, blurred, edges
+
+    # ── Matched-filter response computation ────────────────────────────
+
+    def compute_mf_response(gray_frm):
+        """Compute the directional matched-filter SNR map for a grayscale frame.
+
+        Runs the same pipeline as _detect_dim_lines_matched_filter in the
+        detector class: background subtraction → directional filter bank →
+        MAD noise estimation → SNR map.  The result is cached per frame.
+
+        Returns:
+            snr_map at full resolution (float32 array, same size as gray_frm)
+        """
+        import math as _math
+
+        h, w = gray_frm.shape
+
+        # Downsample for performance
+        scale = 0.5
+        small = cv2.resize(gray_frm, (int(w * scale), int(h * scale)),
+                           interpolation=cv2.INTER_AREA)
+
+        # Background subtraction
+        bg = cv2.medianBlur(small, 31)
+        signal = small.astype(np.float32) - bg.astype(np.float32)
+        signal = np.clip(signal, 0, None)
+
+        # MAD noise estimation
+        flat = signal.ravel()
+        median_val = np.median(flat)
+        mad = np.median(np.abs(flat - median_val))
+        noise_std = max(0.5, mad * 1.4826)
+
+        # Directional filter bank (36 angles, 5° steps)
+        num_angles = 36
+        kernel_length = 31
+        best_response = np.zeros_like(signal)
+
+        for i in range(num_angles):
+            angle_deg = i * 180.0 / num_angles
+            # Build oriented averaging kernel (same logic as the detector)
+            ksize = kernel_length  # already odd
+            kern = np.zeros((ksize, ksize), dtype=np.float32)
+            center = ksize // 2
+            rad = _math.radians(angle_deg)
+            cos_a, sin_a = _math.cos(rad), _math.sin(rad)
+            for j in range(-center, center + 1):
+                px = int(round(center + j * cos_a))
+                py = int(round(center + j * sin_a))
+                if 0 <= px < ksize and 0 <= py < ksize:
+                    kern[py, px] = 1.0
+            ksum = np.sum(kern)
+            if ksum > 0:
+                kern /= ksum
+
+            response = cv2.filter2D(signal, cv2.CV_32F, kern)
+            better = response > best_response
+            best_response[better] = response[better]
+
+        # SNR map
+        snr_map = best_response / noise_std
+
+        # Scale back to full resolution
+        return cv2.resize(snr_map, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    def get_mf_snr_map(gray_frm, frame_idx):
+        """Return the cached MF SNR map, recomputing only when frame changes."""
+        if mf_cache['frame_idx'] != frame_idx:
+            mf_cache['snr_map'] = compute_mf_response(gray_frm)
+            mf_cache['frame_idx'] = frame_idx
+        return mf_cache['snr_map']
+
+    def extract_mf_lines(snr_map, snr_thresh):
+        """Threshold the SNR map and extract candidate line segments."""
+        h, w = snr_map.shape
+        # Work at half resolution for Hough (matches detector behaviour)
+        scale = 0.5
+        small_snr = cv2.resize(snr_map, (int(w * scale), int(h * scale)),
+                               interpolation=cv2.INTER_AREA)
+        significant = (small_snr > snr_thresh).astype(np.uint8) * 255
+        cleanup = np.ones((3, 3), np.uint8)
+        significant = cv2.dilate(significant, cleanup, iterations=1)
+        significant = cv2.erode(significant, cleanup, iterations=1)
+
+        lines = cv2.HoughLinesP(significant, 1, np.pi / 180, 10,
+                                minLineLength=15, maxLineGap=30)
+        inv = 1.0 / scale
+        scaled = []
+        if lines is not None:
+            for ln in lines:
+                x1, y1, x2, y2 = ln[0]
+                scaled.append((int(x1 * inv), int(y1 * inv),
+                               int(x2 * inv), int(y2 * inv)))
+        return scaled
 
     # ── Trail analysis helper ─────────────────────────────────────────
 
@@ -350,21 +458,51 @@ def show_preprocessing_preview(video_path, initial_params=None):
         enh_resized = cv2.resize(enhanced, (small_w, small_h))
         enh_bgr = cv2.cvtColor(enh_resized, cv2.COLOR_GRAY2BGR)
 
-        # The actual processing pipeline blurs at full resolution, but a
-        # small kernel (e.g. 3×3) becomes sub-pixel after down-scaling to
-        # the panel and is invisible.  To give accurate visual feedback we
-        # re-apply the blur on the panel-sized CLAHE image so the user
-        # can see the effect at the scale they are viewing.
-        blur_k = p['blur_kernel_size']
-        if blur_k % 2 == 0:
-            blur_k += 1
-        blur_s = p['blur_sigma'] / 10.0
-        if blur_k >= 3 and blur_s > 0:
-            blur_panel = cv2.GaussianBlur(enh_resized, (blur_k, blur_k), blur_s)
-        else:
-            blur_panel = enh_resized
-        blur_bgr = cv2.cvtColor(blur_panel, cv2.COLOR_GRAY2BGR)
+        # ── Matched-filter response heatmap (replaces old Blur panel) ──
+        snr_thresh = p['mf_snr_threshold'] / 10.0
+        snr_map = get_mf_snr_map(gray, current_frame_idx)
+        snr_resized = cv2.resize(snr_map, (small_w, small_h),
+                                 interpolation=cv2.INTER_LINEAR)
 
+        # Two-tone heatmap: dim below threshold, bright above
+        mf_bgr = np.zeros((small_h, small_w, 3), dtype=np.uint8)
+        mf_bgr[:] = BG_PANEL
+
+        # Dim sub-threshold signal (subtle visibility so user sees the landscape)
+        has_signal = snr_resized > 0.5
+        below_thresh = has_signal & (snr_resized < snr_thresh)
+        above_thresh = snr_resized >= snr_thresh
+
+        # Intensity ramp for sub-threshold pixels
+        if np.any(below_thresh):
+            intensity_below = np.clip(snr_resized / snr_thresh, 0, 1)
+            for c in range(3):
+                channel = mf_bgr[:, :, c].astype(np.float32)
+                channel[below_thresh] = (
+                    BG_PANEL[c] + (ACCENT_MF_DIM[c] - BG_PANEL[c]) * intensity_below[below_thresh]
+                )
+                mf_bgr[:, :, c] = np.clip(channel, 0, 255).astype(np.uint8)
+
+        # Bright above-threshold pixels
+        if np.any(above_thresh):
+            intensity_above = np.clip(snr_resized / (snr_thresh * 3), 0.5, 1)
+            for c in range(3):
+                channel = mf_bgr[:, :, c].astype(np.float32)
+                channel[above_thresh] = (
+                    ACCENT_MF_DIM[c] + (ACCENT_MF[c] - ACCENT_MF_DIM[c]) * intensity_above[above_thresh]
+                )
+                mf_bgr[:, :, c] = np.clip(channel, 0, 255).astype(np.uint8)
+
+        # Overlay detected line segments from the matched filter
+        mf_lines = extract_mf_lines(snr_map, snr_thresh)
+        mf_scale_x = small_w / src_w
+        mf_scale_y = small_h / src_h
+        for lx1, ly1, lx2, ly2 in mf_lines:
+            pt1 = (int(lx1 * mf_scale_x), int(ly1 * mf_scale_y))
+            pt2 = (int(lx2 * mf_scale_x), int(ly2 * mf_scale_y))
+            cv2.line(mf_bgr, pt1, pt2, ACCENT_MF_LINE, 2, cv2.LINE_AA)
+
+        # ── Edges panel ────────────────────────────────────────────────
         edge_gray_r = cv2.resize(edges, (small_w, small_h))
         edge_bgr = np.zeros((small_h, small_w, 3), dtype=np.uint8)
         edge_bgr[:] = BG_PANEL
@@ -374,7 +512,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
         for px, py, pw, ph, panel in [
             (0,  0,                          orig_w,  orig_h,  orig_small),
             (sx, 0,                          small_w, small_h, enh_bgr),
-            (sx, small_h + gap,              small_w, small_h, blur_bgr),
+            (sx, small_h + gap,              small_w, small_h, mf_bgr),
             (sx, 2 * (small_h + gap),        small_w, small_h, edge_bgr),
         ]:
             canvas[py:py + ph, px:px + pw] = panel
@@ -405,11 +543,13 @@ def show_preprocessing_preview(video_path, initial_params=None):
         clip_val = p['clahe_clip_limit'] / 10.0
         _draw_tag(canvas, f"CLAHE  clip {clip_val:.1f}  tile {p['clahe_tile_size']}",
                   sx + tag_x, tag_y, BG_DARK, ACCENT)
-        blur_k = p['blur_kernel_size']
-        if blur_k % 2 == 0:
-            blur_k += 1
-        _draw_tag(canvas, f"BLUR  k={blur_k}  s={p['blur_sigma']/10:.1f}",
-                  sx + tag_x, small_h + gap + tag_y, BG_DARK, TEXT_PRIMARY)
+        mf_snr_val = p['mf_snr_threshold'] / 10.0
+        mf_line_count = len(mf_lines)
+        mf_tag = f"MF RESPONSE  SNR>={mf_snr_val:.1f}"
+        if mf_line_count > 0:
+            mf_tag += f"  [{mf_line_count}]"
+        _draw_tag(canvas, mf_tag,
+                  sx + tag_x, small_h + gap + tag_y, BG_DARK, ACCENT_MF)
         _draw_tag(canvas, f"EDGES  {p['canny_low']}-{p['canny_high']}",
                   sx + tag_x, 2 * (small_h + gap) + tag_y, BG_DARK, ACCENT_CYAN)
 
@@ -624,6 +764,8 @@ def show_preprocessing_preview(video_path, initial_params=None):
     print("Use the Frame slider to find a frame with satellite trail signal.")
     print("Then adjust other sliders to tune preprocessing parameters.")
     print("The goal is to preserve dim satellite trails while reducing noise.")
+    print("The MF RESPONSE panel (bottom-left) shows the directional matched")
+    print("filter heatmap — tune MF SNR to control dim-trail sensitivity.")
     print("\nTrail marking  (up to 3 examples):")
     print("  Click on the ORIGINAL panel to set the START of a trail,")
     print("  then click again to set the END. The detector will adapt")
@@ -676,6 +818,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
                 'blur_sigma': params['blur_sigma'] / 10.0,
                 'canny_low': params['canny_low'],
                 'canny_high': params['canny_high'],
+                'mf_snr_threshold': params['mf_snr_threshold'] / 10.0,
             }
             # Compute signal envelope from marked trail examples
             envelope = _compute_signal_envelope(marked_trails)
@@ -687,6 +830,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
             print(f"  Blur kernel size: {final_params['blur_kernel_size']}")
             print(f"  Blur sigma: {final_params['blur_sigma']:.1f}")
             print(f"  Canny thresholds: {final_params['canny_low']}-{final_params['canny_high']}")
+            print(f"  MF SNR threshold: {final_params['mf_snr_threshold']:.1f}")
             if envelope:
                 print(f"  Signal envelope: {envelope['num_examples']} trail(s) marked")
                 lr = envelope['length_range']
@@ -706,6 +850,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
             params['frame_idx'] = saved_frame_idx
             marked_trails.clear()
             pending_click[0] = None
+            mf_cache['frame_idx'] = -1  # Invalidate MF cache
             print("Parameters reset to defaults. Trail marks cleared.")
 
         elif key == ord('u') or key == ord('U'):  # Undo last trail / cancel pending
@@ -1162,12 +1307,14 @@ class SatelliteTrailDetector:
         self.dot_length = 8  # Length of each dash in dotted line
         self.gap_length = 4  # Gap between dashes
 
-        # Apply custom canny thresholds to params if provided
+        # Apply custom thresholds from preview to params if provided
         if self.preprocessing_params:
             if 'canny_low' in self.preprocessing_params:
                 self.params['canny_low'] = self.preprocessing_params['canny_low']
             if 'canny_high' in self.preprocessing_params:
                 self.params['canny_high'] = self.preprocessing_params['canny_high']
+            if 'mf_snr_threshold' in self.preprocessing_params:
+                self.params['mf_snr_threshold'] = self.preprocessing_params['mf_snr_threshold']
 
         # Adapt detection parameters from user-marked trail signal envelope
         if self.signal_envelope:
@@ -1431,7 +1578,7 @@ class SatelliteTrailDetector:
 
         # --- SNR-based thresholding ---
         snr_map = best_response / noise_std
-        snr_threshold = 2.5  # Detect features at SNR >= 2.5
+        snr_threshold = self.params.get('mf_snr_threshold', 2.5)
         significant = (snr_map > snr_threshold).astype(np.uint8) * 255
 
         # Light morphological cleanup
