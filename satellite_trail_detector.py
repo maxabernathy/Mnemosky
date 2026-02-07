@@ -2630,7 +2630,7 @@ class SatelliteTrailDetector:
         return panel
 
 
-def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None):
+def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False):
     """
     Process video to detect and highlight satellite and airplane trails.
 
@@ -2651,6 +2651,7 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         skip_aspect_ratio_check: If True, disables aspect ratio filtering (default: False)
         signal_envelope: Optional dict with signal characteristics from user-marked trail
             examples. Used to dynamically adapt detection thresholds.
+        save_dataset: If True, save detections as a YOLO-format ML dataset (default: False)
     """
     # Validate input
     input_path = Path(input_path)
@@ -2747,6 +2748,18 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     satellites_detected = 0
     airplanes_detected = 0
 
+    # ── YOLO dataset setup ────────────────────────────────────────
+    dataset_dir = None
+    dataset_images = 0
+    dataset_annotations = {'satellite': 0, 'airplane': 0}
+    if save_dataset:
+        out_p = Path(output_path)
+        dataset_dir = out_p.parent / (out_p.stem + '_dataset')
+        (dataset_dir / 'images').mkdir(parents=True, exist_ok=True)
+        (dataset_dir / 'labels').mkdir(parents=True, exist_ok=True)
+        video_stem = Path(input_path).stem
+        print(f"Dataset export enabled → {dataset_dir}")
+
     # Track frozen regions: list of (frozen_region, bbox, trail_type, frames_remaining)
     frozen_regions = []
 
@@ -2841,6 +2854,26 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
                             })
                             break  # Only create one panel per detection
 
+            # ── YOLO dataset export (one image + label per frame with detections)
+            if dataset_dir is not None:
+                img_name = f"{video_stem}_f{frame_count:06d}.jpg"
+                cv2.imwrite(str(dataset_dir / 'images' / img_name), frame,
+                            [cv2.IMWRITE_JPEG_QUALITY, 95])
+                label_lines = []
+                frame_h, frame_w = frame.shape[:2]
+                for trail_type_d, det_info_d in detected_trails:
+                    cls_id = 0 if trail_type_d == 'satellite' else 1
+                    bx0, by0, bx1, by1 = det_info_d['bbox']
+                    xc = ((bx0 + bx1) / 2) / frame_w
+                    yc = ((by0 + by1) / 2) / frame_h
+                    bw = (bx1 - bx0) / frame_w
+                    bh = (by1 - by0) / frame_h
+                    label_lines.append(f"{cls_id} {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}")
+                    dataset_annotations[trail_type_d] += 1
+                label_path = dataset_dir / 'labels' / img_name.replace('.jpg', '.txt')
+                label_path.write_text('\n'.join(label_lines) + '\n')
+                dataset_images += 1
+
         # Apply all active frozen regions to the output frame
         active_regions = []
         for frozen_data in frozen_regions:
@@ -2924,6 +2957,34 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
 
     print(f"Total trails detected: {satellites_detected + airplanes_detected}")
     print(f"Output saved to: {output_path}")
+
+    # ── YOLO dataset finalisation ─────────────────────────────────
+    if dataset_dir is not None and dataset_images > 0:
+        # Write data.yaml for Ultralytics / YOLO training
+        yaml_path = dataset_dir / 'data.yaml'
+        yaml_path.write_text(
+            "path: .\n"
+            "train: images\n"
+            "val: images\n"
+            "\n"
+            "names:\n"
+            "  0: satellite\n"
+            "  1: airplane\n"
+        )
+        total_ann = dataset_annotations['satellite'] + dataset_annotations['airplane']
+        sat_ann = dataset_annotations['satellite']
+        air_ann = dataset_annotations['airplane']
+        print(f"\n{'=' * 42}")
+        print(f"  ML Dataset Summary")
+        print(f"{'─' * 42}")
+        print(f"  Format:       YOLOv8")
+        print(f"  Location:     {dataset_dir}")
+        print(f"  Images:       {dataset_images}")
+        print(f"  Annotations:  {total_ann} ({sat_ann} satellite, {air_ann} airplane)")
+        print(f"  Class map:    0=satellite, 1=airplane")
+        print(f"{'=' * 42}")
+    elif dataset_dir is not None:
+        print("\nNo detections found — dataset directory is empty.")
 
 
 def main():
@@ -3027,6 +3088,12 @@ Notes:
         help='Disable aspect ratio filtering (may improve performance but increase false positives)'
     )
 
+    parser.add_argument(
+        '--dataset',
+        action='store_true',
+        help='Save detections as a YOLO-format ML dataset (images + labels) alongside the output video'
+    )
+
     args = parser.parse_args()
 
     # Handle preprocessing preview if requested
@@ -3052,7 +3119,8 @@ Notes:
         debug_only=args.debug_only,
         preprocessing_params=preprocessing_params,
         skip_aspect_ratio_check=args.no_aspect_ratio_check,
-        signal_envelope=signal_envelope
+        signal_envelope=signal_envelope,
+        save_dataset=args.dataset
     )
 
 
