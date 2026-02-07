@@ -236,8 +236,23 @@ def show_preprocessing_preview(video_path, initial_params=None):
 
         # ── Panels ───────────────────────────────────────────────────
         orig_small = cv2.resize(frm, (panel_w, panel_h))
-        enh_bgr = cv2.cvtColor(cv2.resize(enhanced, (panel_w, panel_h)), cv2.COLOR_GRAY2BGR)
-        blur_bgr = cv2.cvtColor(cv2.resize(blurred, (panel_w, panel_h)), cv2.COLOR_GRAY2BGR)
+        enh_resized = cv2.resize(enhanced, (panel_w, panel_h))
+        enh_bgr = cv2.cvtColor(enh_resized, cv2.COLOR_GRAY2BGR)
+
+        # The actual processing pipeline blurs at full resolution, but a
+        # small kernel (e.g. 3×3) becomes sub-pixel after down-scaling to
+        # the panel and is invisible.  To give accurate visual feedback we
+        # re-apply the blur on the panel-sized CLAHE image so the user
+        # can see the effect at the scale they are viewing.
+        blur_k = p['blur_kernel_size']
+        if blur_k % 2 == 0:
+            blur_k += 1
+        blur_s = p['blur_sigma'] / 10.0
+        if blur_k >= 3 and blur_s > 0:
+            blur_panel = cv2.GaussianBlur(enh_resized, (blur_k, blur_k), blur_s)
+        else:
+            blur_panel = enh_resized
+        blur_bgr = cv2.cvtColor(blur_panel, cv2.COLOR_GRAY2BGR)
 
         edge_gray_r = cv2.resize(edges, (panel_w, panel_h))
         edge_bgr = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
