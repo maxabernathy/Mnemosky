@@ -130,8 +130,10 @@ def show_preprocessing_preview(video_path, initial_params=None):
 
     # ── Slider definitions ───────────────────────────────────────────
     # Each slider: (param_key, label, display_fmt, min_val, max_val)
+    # Frame slider is handled separately in the status bar for finer control.
+    frame_v_min = 0
+    frame_v_max = max(1, total_frames - 1)
     slider_defs = [
-        ('frame_idx',        'Frame',       lambda v: f"{v}",        0, max(1, total_frames - 1)),
         ('clahe_clip_limit', 'CLAHE Clip',  lambda v: f"{v/10:.1f}", 0, 100),
         ('clahe_tile_size',  'CLAHE Tile',  lambda v: f"{v}",        2, 16),
         ('blur_kernel_size', 'Blur Kernel', lambda v: f"{v if v%2==1 else v+1}", 1, 15),
@@ -171,12 +173,18 @@ def show_preprocessing_preview(video_path, initial_params=None):
     target_win_w = int(_screen_w * 0.92)
     target_win_h = int(_screen_h * 0.88)
     sidebar_w = max(280, min(380, int(target_win_w * 0.18)))
-    status_bar_h = 36
+    status_bar_h = 56               # Taller to hold the wide frame slider
     gap = 2
-    panel_w = (target_win_w - sidebar_w - gap) // 2
-    panel_h = (target_win_h - status_bar_h - gap) // 2
-    canvas_w = panel_w * 2 + gap + sidebar_w
-    canvas_h = panel_h * 2 + gap + status_bar_h
+    content_w = target_win_w - sidebar_w
+    content_h = target_win_h - status_bar_h
+    # Original panel: large, full left column
+    orig_w = int(content_w * 0.58)
+    orig_h = content_h
+    # Processing panels: stacked vertically in the right column
+    small_w = content_w - orig_w - gap
+    small_h = (content_h - 2 * gap) // 3
+    canvas_w = orig_w + gap + small_w + sidebar_w
+    canvas_h = content_h + status_bar_h
     slider_row_h = 52           # Height per slider row
     slider_pad_x = 20           # Horizontal padding inside sidebar
     slider_track_h = 5          # Track bar height
@@ -336,8 +344,10 @@ def show_preprocessing_preview(video_path, initial_params=None):
         canvas[:] = BG_DARK
 
         # ── Panels ───────────────────────────────────────────────────
-        orig_small = cv2.resize(frm, (panel_w, panel_h))
-        enh_resized = cv2.resize(enhanced, (panel_w, panel_h))
+        # Original: large left column.  Processing panels: stacked right.
+        orig_small = cv2.resize(frm, (orig_w, orig_h))
+
+        enh_resized = cv2.resize(enhanced, (small_w, small_h))
         enh_bgr = cv2.cvtColor(enh_resized, cv2.COLOR_GRAY2BGR)
 
         # The actual processing pipeline blurs at full resolution, but a
@@ -355,42 +365,43 @@ def show_preprocessing_preview(video_path, initial_params=None):
             blur_panel = enh_resized
         blur_bgr = cv2.cvtColor(blur_panel, cv2.COLOR_GRAY2BGR)
 
-        edge_gray_r = cv2.resize(edges, (panel_w, panel_h))
-        edge_bgr = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
+        edge_gray_r = cv2.resize(edges, (small_w, small_h))
+        edge_bgr = np.zeros((small_h, small_w, 3), dtype=np.uint8)
         edge_bgr[:] = BG_PANEL
         edge_bgr[edge_gray_r > 0] = ACCENT_CYAN
 
-        for px, py, panel in [
-            (0, 0, orig_small),
-            (panel_w + gap, 0, enh_bgr),
-            (0, panel_h + gap, blur_bgr),
-            (panel_w + gap, panel_h + gap, edge_bgr),
+        sx = orig_w + gap  # x-offset for right column
+        for px, py, pw, ph, panel in [
+            (0,  0,                          orig_w,  orig_h,  orig_small),
+            (sx, 0,                          small_w, small_h, enh_bgr),
+            (sx, small_h + gap,              small_w, small_h, blur_bgr),
+            (sx, 2 * (small_h + gap),        small_w, small_h, edge_bgr),
         ]:
-            canvas[py:py + panel_h, px:px + panel_w] = panel
-            _draw_border(canvas, px, py, panel_w, panel_h, BORDER)
+            canvas[py:py + ph, px:px + pw] = panel
+            _draw_border(canvas, px, py, pw, ph, BORDER)
 
         # ── Draw marked trails on the Original panel ──────────────────
-        scale_x = panel_w / src_w
-        scale_y = panel_h / src_h
+        scale_x = orig_w / src_w
+        scale_y = orig_h / src_h
 
         for tr in marked_trails:
-            sx, sy = tr['start']
-            ex, ey = tr['end']
-            p1 = (int(sx * scale_x), int(sy * scale_y))
-            p2 = (int(ex * scale_x), int(ey * scale_y))
+            t_sx, t_sy = tr['start']
+            t_ex, t_ey = tr['end']
+            p1 = (int(t_sx * scale_x), int(t_sy * scale_y))
+            p2 = (int(t_ex * scale_x), int(t_ey * scale_y))
             cv2.line(canvas, p1, p2, TRAIL_MARK, 2, cv2.LINE_AA)
             cv2.circle(canvas, p1, 4, TRAIL_MARK, -1, cv2.LINE_AA)
             cv2.circle(canvas, p2, 4, TRAIL_MARK, -1, cv2.LINE_AA)
 
         # Pending start point (first click placed, waiting for end)
         if pending_click[0] is not None:
-            sx, sy = pending_click[0]
-            p1 = (int(sx * scale_x), int(sy * scale_y))
+            t_sx, t_sy = pending_click[0]
+            p1 = (int(t_sx * scale_x), int(t_sy * scale_y))
             cv2.circle(canvas, p1, 6, TRAIL_PENDING, 2, cv2.LINE_AA)
             cv2.circle(canvas, p1, 2, TRAIL_PENDING, -1, cv2.LINE_AA)
             # Rubber-band line to current mouse position (if mouse is on panel)
             mx, my = mouse_pos
-            if 0 <= mx < panel_w and 0 <= my < panel_h:
+            if 0 <= mx < orig_w and 0 <= my < orig_h:
                 cv2.line(canvas, p1, (mx, my), TRAIL_RUBBER, 1, cv2.LINE_AA)
 
         # Panel tags
@@ -399,17 +410,17 @@ def show_preprocessing_preview(video_path, initial_params=None):
         _draw_tag(canvas, "ORIGINAL" + trail_count_str, tag_x, tag_y, BG_DARK, TEXT_DIM if not trail_count_str else TRAIL_MARK)
         clip_val = p['clahe_clip_limit'] / 10.0
         _draw_tag(canvas, f"CLAHE  clip {clip_val:.1f}  tile {p['clahe_tile_size']}",
-                  panel_w + gap + tag_x, tag_y, BG_DARK, ACCENT)
+                  sx + tag_x, tag_y, BG_DARK, ACCENT)
         blur_k = p['blur_kernel_size']
         if blur_k % 2 == 0:
             blur_k += 1
         _draw_tag(canvas, f"BLUR  k={blur_k}  s={p['blur_sigma']/10:.1f}",
-                  tag_x, panel_h + gap + tag_y, BG_DARK, TEXT_PRIMARY)
+                  sx + tag_x, small_h + gap + tag_y, BG_DARK, TEXT_PRIMARY)
         _draw_tag(canvas, f"EDGES  {p['canny_low']}-{p['canny_high']}",
-                  panel_w + gap + tag_x, panel_h + gap + tag_y, BG_DARK, ACCENT_CYAN)
+                  sx + tag_x, 2 * (small_h + gap) + tag_y, BG_DARK, ACCENT_CYAN)
 
         # ── Sidebar ──────────────────────────────────────────────────
-        sb_x = panel_w * 2 + gap
+        sb_x = orig_w + gap + small_w
         _fill_rect(canvas, sb_x, 0, sidebar_w, canvas_h - status_bar_h, BG_SIDEBAR)
         _draw_border(canvas, sb_x, 0, sidebar_w, canvas_h - status_bar_h, BORDER)
 
@@ -452,7 +463,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
             # Register region for hit testing
             new_regions.append((track_x_start, track_x_end, track_y, v_min, v_max, key))
 
-        slider_regions = new_regions
+        # slider_regions is assigned later, after appending the frame slider
 
         # ── Trail examples section (below sliders) ──────────────────
         trail_y = slider_section_top + len(slider_defs) * slider_row_h + 12
@@ -491,15 +502,40 @@ def show_preprocessing_preview(video_path, initial_params=None):
             _put_text(canvas, desc, sb_x + 126, help_y, TEXT_DIM, 0.30)
             help_y += 16
 
-        # ── Status bar ───────────────────────────────────────────────
+        # ── Status bar with wide frame slider ─────────────────────────
         sb_y = canvas_h - status_bar_h
         _fill_rect(canvas, 0, sb_y, canvas_w, status_bar_h, BG_PANEL)
         cv2.line(canvas, (0, sb_y), (canvas_w, sb_y), BORDER, 1)
 
-        _put_text(canvas, f"Frame {current_frame_idx}/{total_frames}", 12, sb_y + 21, TEXT_DIM, 0.36)
-        _put_text(canvas, f"{src_w}x{src_h}", canvas_w - 90, sb_y + 21, TEXT_DIM, 0.36)
-        cv2.circle(canvas, (canvas_w // 2, sb_y + 16), 4, ACCENT, -1)
-        _put_text(canvas, "LIVE", canvas_w // 2 + 10, sb_y + 21, ACCENT_DIM, 0.33)
+        # Top row: info text
+        _put_text(canvas, f"Frame {current_frame_idx}/{total_frames}", 12, sb_y + 16, TEXT_DIM, 0.36)
+        _put_text(canvas, f"{src_w}x{src_h}", canvas_w - 90, sb_y + 16, TEXT_DIM, 0.36)
+        cv2.circle(canvas, (canvas_w // 2, sb_y + 11), 4, ACCENT, -1)
+        _put_text(canvas, "LIVE", canvas_w // 2 + 10, sb_y + 16, ACCENT_DIM, 0.33)
+
+        # Bottom row: wide frame slider spanning full width
+        frame_track_pad = 14
+        frame_track_x0 = frame_track_pad
+        frame_track_x1 = canvas_w - frame_track_pad
+        frame_track_y = sb_y + 40
+        frame_track_w = frame_track_x1 - frame_track_x0
+
+        _fill_rect(canvas, frame_track_x0, frame_track_y - slider_track_h // 2,
+                   frame_track_w, slider_track_h, SLIDER_TRACK)
+        f_ratio = (p['frame_idx'] - frame_v_min) / max(1, frame_v_max - frame_v_min)
+        f_fill_w = int(frame_track_w * f_ratio)
+        if f_fill_w > 0:
+            _fill_rect(canvas, frame_track_x0, frame_track_y - slider_track_h // 2,
+                       f_fill_w, slider_track_h, SLIDER_FILL)
+        f_thumb_x = frame_track_x0 + f_fill_w
+        cv2.circle(canvas, (f_thumb_x, frame_track_y), slider_thumb_r, SLIDER_THUMB, -1)
+        cv2.circle(canvas, (f_thumb_x, frame_track_y), slider_thumb_r, ACCENT, 1, cv2.LINE_AA)
+
+        # Store frame slider region for hit testing (appended after sidebar sliders)
+        new_regions.append((frame_track_x0, frame_track_x1, frame_track_y,
+                            frame_v_min, frame_v_max, 'frame_idx'))
+
+        slider_regions = new_regions
 
         return canvas
 
@@ -524,11 +560,11 @@ def show_preprocessing_preview(video_path, initial_params=None):
             mouse_pos[1] = y
 
         if event == cv2.EVENT_LBUTTONDOWN:
-            # Check if click is inside the Original panel (top-left)
-            if 0 <= x < panel_w and 0 <= y < panel_h:
+            # Check if click is inside the Original panel (left column)
+            if 0 <= x < orig_w and 0 <= y < orig_h:
                 # Map panel coordinates → source frame coordinates
-                src_x = int(x / panel_w * src_w)
-                src_y = int(y / panel_h * src_h)
+                src_x = int(x / orig_w * src_w)
+                src_y = int(y / orig_h * src_h)
                 if pending_click[0] is None:
                     if len(marked_trails) < MAX_TRAILS:
                         pending_click[0] = (src_x, src_y)
