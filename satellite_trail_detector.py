@@ -50,9 +50,13 @@ def show_preprocessing_preview(video_path, initial_params=None):
     Controls:
     - Use Frame slider to select exact frame containing trail signal
     - Click and drag sliders in the sidebar to adjust parameters
+    - Click on the ORIGINAL panel to mark satellite trail start/end points
+      (up to 3 examples). Marked trails build a signal envelope used to
+      dynamically adapt detection thresholds.
     - Press SPACE or ENTER to accept current settings
     - Press ESC to cancel and use default settings
     - Press 'R' to reset to default values
+    - Press 'U' to undo last marked trail (or cancel pending start point)
     - Press 'N' to jump forward 1 second
     - Press 'P' to jump back 1 second
 
@@ -61,7 +65,10 @@ def show_preprocessing_preview(video_path, initial_params=None):
         initial_params: Optional dict with initial parameter values
 
     Returns:
-        Dict with selected preprocessing parameters, or None if cancelled
+        Dict with selected preprocessing parameters, or None if cancelled.
+        If user marked trail examples, the dict includes a 'signal_envelope'
+        key containing measured brightness, contrast, length, and angle
+        ranges from the marked trails.
     """
 
     # ── Theme colours (BGR) ──────────────────────────────────────────
@@ -176,11 +183,22 @@ def show_preprocessing_preview(video_path, initial_params=None):
     slider_thumb_r = 8          # Thumb radius
     slider_section_top = 72     # Y offset where sliders begin (below title)
 
+    # Trail marking colours (BGR)
+    TRAIL_MARK = (80, 255, 200)      # Bright green for confirmed trails
+    TRAIL_PENDING = (80, 180, 255)   # Warm orange for pending start point
+    TRAIL_RUBBER = (60, 200, 180)    # Dimmer green for rubber-band preview
+
     # Mutable state for mouse interaction
     # These will be set once we know the canvas geometry in the first frame.
     dragging = {'idx': -1}      # Index of slider being dragged (-1 = none)
     # Slider hit-test regions (populated by create_display, read by mouse_cb)
     slider_regions = []         # List of (x_start, x_end, y_center, min_val, max_val, param_key)
+
+    # Trail marking state — user can click start+end on Original panel
+    MAX_TRAILS = 3
+    marked_trails = []          # List of analysis dicts (from _analyze_trail)
+    pending_click = [None]      # [None] or [(src_x, src_y)] awaiting end point
+    mouse_pos = [0, 0]          # Live mouse position for rubber-band line
 
     # ── Window setup ─────────────────────────────────────────────────
     window_name = "Mnemosky  -  Preprocessing Preview"
@@ -226,6 +244,89 @@ def show_preprocessing_preview(video_path, initial_params=None):
         edges = cv2.Canny(blurred, canny_low, canny_high)
         return gray, enhanced, blurred, edges
 
+    # ── Trail analysis helper ─────────────────────────────────────────
+
+    def _analyze_trail(start, end, gray_frm, color_frm):
+        """Sample brightness along a user-marked trail and return analysis."""
+        x1, y1 = start
+        x2, y2 = end
+        length = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        if length < 5:
+            return None
+        angle = np.degrees(np.arctan2(abs(y2 - y1), abs(x2 - x1)))
+
+        num_samples = max(20, int(length / 3))
+        num_samples = min(num_samples, 200)
+
+        brightness_samples = []
+        for i in range(num_samples):
+            t = i / (num_samples - 1) if num_samples > 1 else 0
+            px = int(x1 + t * (x2 - x1))
+            py = int(y1 + t * (y2 - y1))
+            if 0 <= py < gray_frm.shape[0] and 0 <= px < gray_frm.shape[1]:
+                y_lo = max(0, py - 1)
+                y_hi = min(gray_frm.shape[0], py + 2)
+                x_lo = max(0, px - 1)
+                x_hi = min(gray_frm.shape[1], px + 2)
+                brightness_samples.append(float(np.max(gray_frm[y_lo:y_hi, x_lo:x_hi])))
+
+        if not brightness_samples:
+            return None
+
+        arr = np.array(brightness_samples)
+        avg_brightness = float(np.mean(arr))
+        max_brightness = int(np.max(arr))
+        brightness_std = float(np.std(arr))
+
+        # Contrast against local background
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        bg_pad = 30
+        bg_region = gray_frm[
+            max(0, cy - bg_pad):min(gray_frm.shape[0], cy + bg_pad),
+            max(0, cx - bg_pad):min(gray_frm.shape[1], cx + bg_pad)
+        ]
+        bg_brightness = float(np.median(bg_region)) if bg_region.size > 0 else 0.0
+        contrast_ratio = avg_brightness / (bg_brightness + 1e-5)
+
+        return {
+            'start': start,
+            'end': end,
+            'length': length,
+            'angle': angle,
+            'avg_brightness': avg_brightness,
+            'max_brightness': max_brightness,
+            'brightness_std': brightness_std,
+            'contrast_ratio': contrast_ratio,
+            'smoothness': brightness_std / (avg_brightness + 1e-5),
+        }
+
+    def _compute_signal_envelope(trail_analyses):
+        """Derive a signal envelope from user-marked trail examples."""
+        if not trail_analyses:
+            return None
+        margin = 0.30  # 30 % margin on ranges
+
+        lengths = [t['length'] for t in trail_analyses]
+        avg_brs = [t['avg_brightness'] for t in trail_analyses]
+        max_brs = [t['max_brightness'] for t in trail_analyses]
+        contrasts = [t['contrast_ratio'] for t in trail_analyses]
+        smoothnesses = [t['smoothness'] for t in trail_analyses]
+        angles = [t['angle'] for t in trail_analyses]
+
+        return {
+            'num_examples': len(trail_analyses),
+            'trails': trail_analyses,
+            'length_range': (max(30, min(lengths) * (1 - margin)),
+                             max(lengths) * (1 + margin)),
+            'brightness_range': (min(avg_brs) * (1 - margin),
+                                 max(avg_brs) * (1 + margin)),
+            'max_brightness_range': (min(max_brs), max(max_brs)),
+            'contrast_range': (min(contrasts) * (1 - margin * 0.5),
+                               max(contrasts)),
+            'smoothness_max': max(smoothnesses) * (1 + margin),
+            'angles': angles,
+        }
+
     # ── Composite display builder ────────────────────────────────────
 
     def create_display(frm, gray, enhanced, blurred, edges, p):
@@ -253,9 +354,34 @@ def show_preprocessing_preview(video_path, initial_params=None):
             canvas[py:py + panel_h, px:px + panel_w] = panel
             _draw_border(canvas, px, py, panel_w, panel_h, BORDER)
 
+        # ── Draw marked trails on the Original panel ──────────────────
+        scale_x = panel_w / src_w
+        scale_y = panel_h / src_h
+
+        for tr in marked_trails:
+            sx, sy = tr['start']
+            ex, ey = tr['end']
+            p1 = (int(sx * scale_x), int(sy * scale_y))
+            p2 = (int(ex * scale_x), int(ey * scale_y))
+            cv2.line(canvas, p1, p2, TRAIL_MARK, 2, cv2.LINE_AA)
+            cv2.circle(canvas, p1, 4, TRAIL_MARK, -1, cv2.LINE_AA)
+            cv2.circle(canvas, p2, 4, TRAIL_MARK, -1, cv2.LINE_AA)
+
+        # Pending start point (first click placed, waiting for end)
+        if pending_click[0] is not None:
+            sx, sy = pending_click[0]
+            p1 = (int(sx * scale_x), int(sy * scale_y))
+            cv2.circle(canvas, p1, 6, TRAIL_PENDING, 2, cv2.LINE_AA)
+            cv2.circle(canvas, p1, 2, TRAIL_PENDING, -1, cv2.LINE_AA)
+            # Rubber-band line to current mouse position (if mouse is on panel)
+            mx, my = mouse_pos
+            if 0 <= mx < panel_w and 0 <= my < panel_h:
+                cv2.line(canvas, p1, (mx, my), TRAIL_RUBBER, 1, cv2.LINE_AA)
+
         # Panel tags
         tag_y, tag_x = 18, 8
-        _draw_tag(canvas, "ORIGINAL", tag_x, tag_y, BG_DARK, TEXT_DIM)
+        trail_count_str = f"  [{len(marked_trails)}/{MAX_TRAILS}]" if marked_trails or pending_click[0] else ""
+        _draw_tag(canvas, "ORIGINAL" + trail_count_str, tag_x, tag_y, BG_DARK, TEXT_DIM if not trail_count_str else TRAIL_MARK)
         clip_val = p['clahe_clip_limit'] / 10.0
         _draw_tag(canvas, f"CLAHE  clip {clip_val:.1f}  tile {p['clahe_tile_size']}",
                   panel_w + gap + tag_x, tag_y, BG_DARK, ACCENT)
@@ -313,8 +439,29 @@ def show_preprocessing_preview(video_path, initial_params=None):
 
         slider_regions = new_regions
 
-        # ── Controls help (below sliders) ────────────────────────────
-        help_y = slider_section_top + len(slider_defs) * slider_row_h + 12
+        # ── Trail examples section (below sliders) ──────────────────
+        trail_y = slider_section_top + len(slider_defs) * slider_row_h + 12
+        cv2.line(canvas, (sb_x + 14, trail_y - 6), (sb_x + sidebar_w - 14, trail_y - 6), BORDER, 1)
+        _put_text(canvas, f"TRAIL EXAMPLES  {len(marked_trails)}/{MAX_TRAILS}",
+                  sb_x + 14, trail_y + 10, TEXT_HEADING, 0.36)
+        trail_y += 22
+        if not marked_trails and pending_click[0] is None:
+            _put_text(canvas, "Click start+end on ORIGINAL", sb_x + 14, trail_y, TEXT_DIM, 0.28)
+            trail_y += 14
+            _put_text(canvas, "panel to mark satellite trails", sb_x + 14, trail_y, TEXT_DIM, 0.28)
+            trail_y += 14
+        elif pending_click[0] is not None:
+            _put_text(canvas, "Click trail END point ...", sb_x + 14, trail_y, TRAIL_PENDING, 0.30)
+            trail_y += 14
+        for ti, tr in enumerate(marked_trails):
+            _put_text(canvas, f"#{ti+1}", sb_x + 14, trail_y + 2, TRAIL_MARK, 0.30, 1)
+            info_str = f"L={tr['length']:.0f}  br={tr['avg_brightness']:.1f}  c={tr['contrast_ratio']:.2f}"
+            _put_text(canvas, info_str, sb_x + 38, trail_y + 2, TEXT_DIM, 0.26)
+            trail_y += 14
+        trail_y += 6
+
+        # ── Controls help ─────────────────────────────────────────
+        help_y = trail_y
         cv2.line(canvas, (sb_x + 14, help_y - 6), (sb_x + sidebar_w - 14, help_y - 6), BORDER, 1)
         _put_text(canvas, "CONTROLS", sb_x + 14, help_y + 10, TEXT_HEADING, 0.36)
         help_y += 26
@@ -322,6 +469,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
             ("SPACE / ENTER", "Accept"),
             ("ESC", "Cancel"),
             ("R", "Reset"),
+            ("U", "Undo last trail"),
             ("N / P", "Next / Prev frame"),
         ]:
             _put_text(canvas, key_str, sb_x + 14, help_y, ACCENT_DIM, 0.30)
@@ -355,8 +503,31 @@ def show_preprocessing_preview(video_path, initial_params=None):
         dragging['idx'] = -1
 
     def on_mouse(event, x, y, flags, userdata):
+        # Always track mouse position (for rubber-band preview)
+        if event == cv2.EVENT_MOUSEMOVE:
+            mouse_pos[0] = x
+            mouse_pos[1] = y
+
         if event == cv2.EVENT_LBUTTONDOWN:
-            _update_slider_from_x(x, y)
+            # Check if click is inside the Original panel (top-left)
+            if 0 <= x < panel_w and 0 <= y < panel_h:
+                # Map panel coordinates → source frame coordinates
+                src_x = int(x / panel_w * src_w)
+                src_y = int(y / panel_h * src_h)
+                if pending_click[0] is None:
+                    if len(marked_trails) < MAX_TRAILS:
+                        pending_click[0] = (src_x, src_y)
+                else:
+                    # Complete the trail — analyse on current grayscale frame
+                    gray_now = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    analysis = _analyze_trail(pending_click[0], (src_x, src_y),
+                                              gray_now, frame)
+                    if analysis is not None:
+                        marked_trails.append(analysis)
+                    pending_click[0] = None
+            else:
+                # Click is outside Original panel → slider interaction
+                _update_slider_from_x(x, y)
         elif event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON):
             if dragging['idx'] >= 0:
                 x_start, x_end, _, v_min, v_max, key = slider_regions[dragging['idx']]
@@ -373,11 +544,17 @@ def show_preprocessing_preview(video_path, initial_params=None):
     print("Use the Frame slider to find a frame with satellite trail signal.")
     print("Then adjust other sliders to tune preprocessing parameters.")
     print("The goal is to preserve dim satellite trails while reducing noise.")
+    print("\nTrail marking  (up to 3 examples):")
+    print("  Click on the ORIGINAL panel to set the START of a trail,")
+    print("  then click again to set the END. The detector will adapt")
+    print("  its parameters to match the brightness/contrast/length of")
+    print("  your marked examples.")
     print("\nControls:")
     print("  Click+drag   - Adjust sliders in the sidebar")
     print("  SPACE/ENTER  - Accept current settings and continue")
     print("  ESC          - Cancel and use default settings")
     print("  R            - Reset to default values")
+    print("  U            - Undo last marked trail")
     print("  N            - Jump forward 1 second")
     print("  P            - Jump back 1 second")
     print("=" * 60 + "\n")
@@ -420,12 +597,25 @@ def show_preprocessing_preview(video_path, initial_params=None):
                 'canny_low': params['canny_low'],
                 'canny_high': params['canny_high'],
             }
+            # Compute signal envelope from marked trail examples
+            envelope = _compute_signal_envelope(marked_trails)
+            if envelope is not None:
+                final_params['signal_envelope'] = envelope
             print(f"\nAccepted preprocessing parameters:")
             print(f"  CLAHE clip limit: {final_params['clahe_clip_limit']:.1f}")
             print(f"  CLAHE tile size: {final_params['clahe_tile_size']}")
             print(f"  Blur kernel size: {final_params['blur_kernel_size']}")
             print(f"  Blur sigma: {final_params['blur_sigma']:.1f}")
             print(f"  Canny thresholds: {final_params['canny_low']}-{final_params['canny_high']}")
+            if envelope:
+                print(f"  Signal envelope: {envelope['num_examples']} trail(s) marked")
+                lr = envelope['length_range']
+                br = envelope['brightness_range']
+                cr = envelope['contrast_range']
+                print(f"    Length range:     {lr[0]:.0f} - {lr[1]:.0f} px")
+                print(f"    Brightness range: {br[0]:.1f} - {br[1]:.1f}")
+                print(f"    Contrast range:   {cr[0]:.2f} - {cr[1]:.2f}")
+                print(f"    Angles:           {', '.join(f'{a:.1f}°' for a in envelope['angles'])}")
             cv2.destroyWindow(window_name)
             cap.release()
             return final_params
@@ -434,7 +624,19 @@ def show_preprocessing_preview(video_path, initial_params=None):
             saved_frame_idx = params['frame_idx']
             params = defaults.copy()
             params['frame_idx'] = saved_frame_idx
-            print("Parameters reset to defaults.")
+            marked_trails.clear()
+            pending_click[0] = None
+            print("Parameters reset to defaults. Trail marks cleared.")
+
+        elif key == ord('u') or key == ord('U'):  # Undo last trail / cancel pending
+            if pending_click[0] is not None:
+                pending_click[0] = None
+                print("Pending trail start point cancelled.")
+            elif marked_trails:
+                removed = marked_trails.pop()
+                print(f"Removed trail #{len(marked_trails)+1} (L={removed['length']:.0f}px)")
+            else:
+                print("No trails to undo.")
 
         elif key == ord('n') or key == ord('N'):  # Next frame (jump 1 second)
             current_frame_idx = min(total_frames - 1, current_frame_idx + int(fps))
@@ -800,7 +1002,7 @@ class SatelliteTrailDetector:
     (low, medium, high) and optional custom preprocessing parameters.
     """
 
-    def __init__(self, sensitivity='medium', preprocessing_params=None, skip_aspect_ratio_check=False):
+    def __init__(self, sensitivity='medium', preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None):
         """
         Initialize detector with sensitivity level and optional custom preprocessing.
 
@@ -814,10 +1016,15 @@ class SatelliteTrailDetector:
                 - canny_low: Canny edge detection low threshold
                 - canny_high: Canny edge detection high threshold
             skip_aspect_ratio_check: If True, disables aspect ratio filtering (default: False)
+            signal_envelope: Optional dict from user-marked trail examples (computed by
+                show_preprocessing_preview). Contains brightness, contrast, length, and
+                angle ranges measured on real satellite trails, used to dynamically adapt
+                detection thresholds.
         """
         # Store custom preprocessing parameters
         self.preprocessing_params = preprocessing_params
         self.skip_aspect_ratio_check = skip_aspect_ratio_check
+        self.signal_envelope = signal_envelope
 
         # Sensitivity presets - rebalanced to reduce false positives
         # Satellite length ranges are generous because trails can span large
@@ -881,6 +1088,51 @@ class SatelliteTrailDetector:
                 self.params['canny_low'] = self.preprocessing_params['canny_low']
             if 'canny_high' in self.preprocessing_params:
                 self.params['canny_high'] = self.preprocessing_params['canny_high']
+
+        # Adapt detection parameters from user-marked trail signal envelope
+        if self.signal_envelope:
+            self._apply_signal_envelope(self.signal_envelope)
+
+    def _apply_signal_envelope(self, env):
+        """Dynamically adapt detection thresholds to match user-marked trail examples.
+
+        The envelope provides measured brightness, contrast, length, and smoothness
+        from real satellite trails in the video. We widen the detector's acceptance
+        windows so that trails similar to the marked examples are reliably detected.
+        """
+        # ── Length range: ensure detector covers the marked examples ──
+        env_min_len, env_max_len = env['length_range']
+        self.params['satellite_min_length'] = min(
+            self.params['satellite_min_length'], max(30, int(env_min_len)))
+        self.params['satellite_max_length'] = max(
+            self.params['satellite_max_length'], int(env_max_len))
+
+        # Also lower min_line_length if examples are short
+        self.params['min_line_length'] = min(
+            self.params['min_line_length'], max(20, int(env_min_len * 0.5)))
+
+        # ── Contrast: lower threshold to admit dimmer trails ──────────
+        env_min_contrast = env['contrast_range'][0]
+        self.params['satellite_contrast_min'] = min(
+            self.params['satellite_contrast_min'],
+            max(1.01, env_min_contrast))
+
+        # ── Brightness: ensure marked-trail brightness isn't rejected ─
+        env_max_brightness = env['brightness_range'][1]
+        # Raise brightness_threshold ceiling so dim examples aren't lost
+        self.params['brightness_threshold'] = max(
+            self.params['brightness_threshold'],
+            int(env_max_brightness))
+        # Push airplane brightness floor above the satellite range so marked
+        # examples are not mis-classified as airplanes
+        self.params['airplane_brightness_min'] = max(
+            self.params['airplane_brightness_min'],
+            int(env_max_brightness * 1.5))
+
+        # ── Hough: be more lenient to catch fragments of similar trails ─
+        self.params['max_line_gap'] = max(
+            self.params['max_line_gap'],
+            min(80, int(env_max_len * 0.10)))
 
     @staticmethod
     def _rotated_kernel_endpoints(size, angle_deg):
@@ -1984,7 +2236,7 @@ class SatelliteTrailDetector:
         return panel
 
 
-def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False):
+def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None):
     """
     Process video to detect and highlight satellite and airplane trails.
 
@@ -2003,6 +2255,8 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         debug_only: If True, outputs ONLY debug visualization without normal output (default: False)
         preprocessing_params: Optional dict with custom preprocessing parameters from preview
         skip_aspect_ratio_check: If True, disables aspect ratio filtering (default: False)
+        signal_envelope: Optional dict with signal characteristics from user-marked trail
+            examples. Used to dynamically adapt detection thresholds.
     """
     # Validate input
     input_path = Path(input_path)
@@ -2093,7 +2347,7 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         sys.exit(1)
     
     # Initialize detector
-    detector = SatelliteTrailDetector(sensitivity, preprocessing_params=preprocessing_params, skip_aspect_ratio_check=skip_aspect_ratio_check)
+    detector = SatelliteTrailDetector(sensitivity, preprocessing_params=preprocessing_params, skip_aspect_ratio_check=skip_aspect_ratio_check, signal_envelope=signal_envelope)
 
     frame_count = 0
     satellites_detected = 0
@@ -2383,10 +2637,14 @@ Notes:
 
     # Handle preprocessing preview if requested
     preprocessing_params = None
+    signal_envelope = None
     if args.preview:
         preprocessing_params = show_preprocessing_preview(args.input)
         if preprocessing_params is None:
             print("Using default preprocessing parameters.")
+        else:
+            # Extract signal envelope (if user marked trail examples)
+            signal_envelope = preprocessing_params.pop('signal_envelope', None)
 
     process_video(
         args.input,
@@ -2399,7 +2657,8 @@ Notes:
         debug_mode=args.debug,
         debug_only=args.debug_only,
         preprocessing_params=preprocessing_params,
-        skip_aspect_ratio_check=args.no_aspect_ratio_check
+        skip_aspect_ratio_check=args.no_aspect_ratio_check,
+        signal_envelope=signal_envelope
     )
 
 
