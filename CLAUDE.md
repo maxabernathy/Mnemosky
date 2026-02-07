@@ -6,7 +6,7 @@
 
 Preprocessing adjustments
 
-<img width="2163" height="1269" alt="image" src="https://github.com/user-attachments/assets/0fb875ba-94b2-476c-8b0d-14f23285afcc" />
+<img width="1861" height="931" alt="image" src="https://github.com/user-attachments/assets/053cb18d-e020-44a2-b73f-3d9374eef083" />
 
 Debug functionality
 
