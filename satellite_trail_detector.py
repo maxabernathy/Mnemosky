@@ -269,11 +269,12 @@ def show_preprocessing_preview(video_path, initial_params=None):
     # ── Matched-filter response computation ────────────────────────────
 
     def compute_mf_response(gray_frm):
-        """Compute the directional matched-filter SNR map for a grayscale frame.
+        """Compute the multi-scale directional matched-filter SNR map.
 
         Runs the same pipeline as _detect_dim_lines_matched_filter in the
-        detector class: background subtraction → directional filter bank →
-        MAD noise estimation → SNR map.  The result is cached per frame.
+        detector class: background subtraction → multi-scale directional
+        filter bank with Gaussian-profile kernels → scale-corrected SNR.
+        The result is cached per frame.
 
         Returns:
             snr_map at full resolution (float32 array, same size as gray_frm)
@@ -282,9 +283,10 @@ def show_preprocessing_preview(video_path, initial_params=None):
 
         h, w = gray_frm.shape
 
-        # Downsample for performance
-        scale = 0.5
-        small = cv2.resize(gray_frm, (int(w * scale), int(h * scale)),
+        # Downsample at 2/3 resolution (matches detector, good detail)
+        scale = 2.0 / 3.0
+        sm_w, sm_h = int(w * scale), int(h * scale)
+        small = cv2.resize(gray_frm, (sm_w, sm_h),
                            interpolation=cv2.INTER_AREA)
 
         # Background subtraction
@@ -298,37 +300,46 @@ def show_preprocessing_preview(video_path, initial_params=None):
         mad = np.median(np.abs(flat - median_val))
         noise_std = max(0.5, mad * 1.4826)
 
-        # Directional filter bank (36 angles, 5° steps)
-        num_angles = 36
-        kernel_length = 31
-        best_response = np.zeros_like(signal)
+        # Multi-scale directional filter bank
+        # 72 angles (2.5° steps), 3 kernel lengths, Gaussian cross-section.
+        # Scale-corrected SNR: noise_factor = sqrt(sum(kernel²)) accounts
+        # for the per-kernel noise reduction so SNR values are comparable
+        # across scales.
+        num_angles = 72
+        kernel_lengths = [15, 31, 51]
+        best_snr = np.zeros_like(signal)
 
-        for i in range(num_angles):
-            angle_deg = i * 180.0 / num_angles
-            # Build oriented averaging kernel (same logic as the detector)
-            ksize = kernel_length  # already odd
-            kern = np.zeros((ksize, ksize), dtype=np.float32)
-            center = ksize // 2
-            rad = _math.radians(angle_deg)
-            cos_a, sin_a = _math.cos(rad), _math.sin(rad)
-            for j in range(-center, center + 1):
-                px = int(round(center + j * cos_a))
-                py = int(round(center + j * sin_a))
-                if 0 <= px < ksize and 0 <= py < ksize:
-                    kern[py, px] = 1.0
-            ksum = np.sum(kern)
-            if ksum > 0:
-                kern /= ksum
+        for klen in kernel_lengths:
+            for i in range(num_angles):
+                angle_deg = i * 180.0 / num_angles
 
-            response = cv2.filter2D(signal, cv2.CV_32F, kern)
-            better = response > best_response
-            best_response[better] = response[better]
+                # Gaussian-profile kernel (vectorised, no raster aliasing)
+                ksize = klen if klen % 2 == 1 else klen + 1
+                center = ksize // 2
+                rad = _math.radians(angle_deg)
+                cos_a, sin_a = _math.cos(rad), _math.sin(rad)
 
-        # SNR map
-        snr_map = best_response / noise_std
+                yc, xc = np.mgrid[:ksize, :ksize]
+                dx = (xc - center).astype(np.float32)
+                dy = (yc - center).astype(np.float32)
+                perp = np.abs(-sin_a * dx + cos_a * dy)
+                along = np.abs(cos_a * dx + sin_a * dy)
+
+                kern = np.exp(-0.5 * perp ** 2).astype(np.float32)  # sigma_perp=1.0
+                kern[along > center] = 0
+                ksum = np.sum(kern)
+                if ksum > 0:
+                    kern /= ksum
+
+                noise_factor = np.sqrt(np.sum(kern ** 2))
+                response = cv2.filter2D(signal, cv2.CV_32F, kern)
+                snr = response / (noise_std * noise_factor + 1e-10)
+
+                better = snr > best_snr
+                best_snr[better] = snr[better]
 
         # Scale back to full resolution
-        return cv2.resize(snr_map, (w, h), interpolation=cv2.INTER_LINEAR)
+        return cv2.resize(best_snr, (w, h), interpolation=cv2.INTER_LINEAR)
 
     def get_mf_snr_map(gray_frm, frame_idx):
         """Return the cached MF SNR map, recomputing only when frame changes."""
@@ -1470,18 +1481,22 @@ class SatelliteTrailDetector:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _create_matched_filter_kernel(length, angle_deg):
-        """Create an oriented averaging kernel for directional line detection.
+    def _create_matched_filter_kernel(length, angle_deg, sigma_perp=1.0):
+        """Create a Gaussian-profile oriented line kernel.
 
-        The kernel is a normalized line of 1s at the given angle through the
-        center of a (length × length) grid.  When convolved with a
-        background-subtracted image the response equals the average brightness
-        along a line segment of that length at that orientation — the optimal
-        matched filter for a straight line in additive Gaussian noise.
+        Uses an analytic Gaussian cross-section perpendicular to the line
+        direction — no integer-rasterisation artifacts, consistent effective
+        width at every orientation.  The along-line weight is uniform.
+
+        This matches real trail PSFs better than a 1-pixel-wide rasterised
+        line and produces orientation-independent filter responses.
 
         Args:
             length: Kernel side length (will be rounded up to odd)
             angle_deg: Line orientation in degrees (0 = horizontal)
+            sigma_perp: Gaussian width (std dev) perpendicular to the line.
+                Controls the effective trail width sensitivity.
+                1.0 ≈ 2.4 px FWHM (good for typical satellite trails).
 
         Returns:
             Normalized float32 kernel array
@@ -1489,21 +1504,26 @@ class SatelliteTrailDetector:
         import math
 
         ksize = length if length % 2 == 1 else length + 1
-        kernel = np.zeros((ksize, ksize), dtype=np.float32)
-
         center = ksize // 2
         rad = math.radians(angle_deg)
         cos_a = math.cos(rad)
         sin_a = math.sin(rad)
 
-        for i in range(-center, center + 1):
-            px = int(round(center + i * cos_a))
-            py = int(round(center + i * sin_a))
-            if 0 <= px < ksize and 0 <= py < ksize:
-                kernel[py, px] = 1.0
+        # Vectorised computation — no per-pixel loop
+        y_coords, x_coords = np.mgrid[:ksize, :ksize]
+        dx = (x_coords - center).astype(np.float32)
+        dy = (y_coords - center).astype(np.float32)
 
-        # Normalize by the number of unique lit pixels (not loop iterations,
-        # since diagonal angles cause multiple i values to map to the same pixel)
+        # Perpendicular distance to the line through the centre
+        perp_dist = np.abs(-sin_a * dx + cos_a * dy)
+        # Distance along the line from the centre
+        along_dist = np.abs(cos_a * dx + sin_a * dy)
+
+        # Gaussian profile perpendicular, uniform along the line
+        kernel = np.exp(-0.5 * (perp_dist / sigma_perp) ** 2).astype(np.float32)
+        # Zero out beyond the half-length
+        kernel[along_dist > center] = 0
+
         kernel_sum = np.sum(kernel)
         if kernel_sum > 0:
             kernel /= kernel_sum
@@ -1536,8 +1556,8 @@ class SatelliteTrailDetector:
 
         h, w = gray_frame.shape
 
-        # --- Downsample for performance (half resolution) ---
-        scale = 0.5
+        # --- Downsample for performance (2/3 resolution) ---
+        scale = 2.0 / 3.0
         small_w, small_h = int(w * scale), int(h * scale)
         small = cv2.resize(gray_frame, (small_w, small_h),
                            interpolation=cv2.INTER_AREA)
@@ -1560,26 +1580,38 @@ class SatelliteTrailDetector:
         if noise_std < 0.5:
             noise_std = 0.5
 
-        # --- Directional matched filter bank ---
-        num_angles = 36   # 5-degree angular resolution
-        kernel_length = 31  # ~5.6× SNR improvement (sqrt(31))
+        # --- Multi-scale directional matched filter bank ---
+        # Multiple kernel lengths catch both short bright fragments and
+        # long dim trails.  72 angles (2.5° steps) for fine angular
+        # resolution.  Gaussian-profile kernels avoid rasterisation
+        # aliasing.  Scale-corrected SNR ensures consistent thresholding
+        # across kernel sizes.
+        num_angles = 72   # 2.5-degree angular resolution
+        kernel_lengths = [21, 41, 61]  # Multi-scale: ~4.6×, 6.4×, 7.8× SNR
 
-        best_response = np.zeros_like(signal)
+        best_snr = np.zeros_like(signal)
         best_angle = np.zeros_like(signal)
 
-        for i in range(num_angles):
-            angle_deg = i * 180.0 / num_angles
-            kernel = self._create_matched_filter_kernel(kernel_length, angle_deg)
-            response = cv2.filter2D(signal, cv2.CV_32F, kernel)
+        for klen in kernel_lengths:
+            for i in range(num_angles):
+                angle_deg = i * 180.0 / num_angles
+                kernel = self._create_matched_filter_kernel(klen, angle_deg)
 
-            better = response > best_response
-            best_response[better] = response[better]
-            best_angle[better] = angle_deg
+                # Noise factor for this kernel: filtered noise std =
+                # noise_std * sqrt(sum(kernel²)).  Pre-compute once.
+                noise_factor = np.sqrt(np.sum(kernel ** 2))
+
+                response = cv2.filter2D(signal, cv2.CV_32F, kernel)
+                # Scale-corrected SNR: comparable across kernel sizes
+                snr = response / (noise_std * noise_factor + 1e-10)
+
+                better = snr > best_snr
+                best_snr[better] = snr[better]
+                best_angle[better] = angle_deg
 
         # --- SNR-based thresholding ---
-        snr_map = best_response / noise_std
         snr_threshold = self.params.get('mf_snr_threshold', 2.5)
-        significant = (snr_map > snr_threshold).astype(np.uint8) * 255
+        significant = (best_snr > snr_threshold).astype(np.uint8) * 255
 
         # Light morphological cleanup
         cleanup_kernel = np.ones((3, 3), np.uint8)
