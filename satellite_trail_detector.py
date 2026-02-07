@@ -139,8 +139,10 @@ def show_preprocessing_preview(video_path, initial_params=None):
 
     # ── Slider definitions ───────────────────────────────────────────
     # Each slider: (param_key, label, display_fmt, min_val, max_val)
+    # Frame slider is handled separately in the status bar for finer control.
+    frame_v_min = 0
+    frame_v_max = max(1, total_frames - 1)
     slider_defs = [
-        ('frame_idx',        'Frame',       lambda v: f"{v}",        0, max(1, total_frames - 1)),
         ('clahe_clip_limit', 'CLAHE Clip',  lambda v: f"{v/10:.1f}", 0, 100),
         ('clahe_tile_size',  'CLAHE Tile',  lambda v: f"{v}",        2, 16),
         ('blur_kernel_size', 'Blur Kernel', lambda v: f"{v if v%2==1 else v+1}", 1, 15),
@@ -181,12 +183,18 @@ def show_preprocessing_preview(video_path, initial_params=None):
     target_win_w = int(_screen_w * 0.92)
     target_win_h = int(_screen_h * 0.88)
     sidebar_w = max(280, min(380, int(target_win_w * 0.18)))
-    status_bar_h = 36
+    status_bar_h = 56               # Taller to hold the wide frame slider
     gap = 2
-    panel_w = (target_win_w - sidebar_w - gap) // 2
-    panel_h = (target_win_h - status_bar_h - gap) // 2
-    canvas_w = panel_w * 2 + gap + sidebar_w
-    canvas_h = panel_h * 2 + gap + status_bar_h
+    content_w = target_win_w - sidebar_w
+    content_h = target_win_h - status_bar_h
+    # Original panel: large, full left column
+    orig_w = int(content_w * 0.58)
+    orig_h = content_h
+    # Processing panels: stacked vertically in the right column
+    small_w = content_w - orig_w - gap
+    small_h = (content_h - 2 * gap) // 3
+    canvas_w = orig_w + gap + small_w + sidebar_w
+    canvas_h = content_h + status_bar_h
     slider_row_h = 52           # Height per slider row
     slider_pad_x = 20           # Horizontal padding inside sidebar
     slider_track_h = 5          # Track bar height
@@ -444,18 +452,20 @@ def show_preprocessing_preview(video_path, initial_params=None):
         canvas[:] = BG_DARK
 
         # ── Panels ───────────────────────────────────────────────────
-        orig_small = cv2.resize(frm, (panel_w, panel_h))
-        enh_resized = cv2.resize(enhanced, (panel_w, panel_h))
+        # Original: large left column.  Processing panels: stacked right.
+        orig_small = cv2.resize(frm, (orig_w, orig_h))
+
+        enh_resized = cv2.resize(enhanced, (small_w, small_h))
         enh_bgr = cv2.cvtColor(enh_resized, cv2.COLOR_GRAY2BGR)
 
         # ── Matched-filter response heatmap (replaces old Blur panel) ──
         snr_thresh = p['mf_snr_threshold'] / 10.0
         snr_map = get_mf_snr_map(gray, current_frame_idx)
-        snr_resized = cv2.resize(snr_map, (panel_w, panel_h),
+        snr_resized = cv2.resize(snr_map, (small_w, small_h),
                                  interpolation=cv2.INTER_LINEAR)
 
         # Two-tone heatmap: dim below threshold, bright above
-        mf_bgr = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
+        mf_bgr = np.zeros((small_h, small_w, 3), dtype=np.uint8)
         mf_bgr[:] = BG_PANEL
 
         # Dim sub-threshold signal (subtle visibility so user sees the landscape)
@@ -485,50 +495,45 @@ def show_preprocessing_preview(video_path, initial_params=None):
 
         # Overlay detected line segments from the matched filter
         mf_lines = extract_mf_lines(snr_map, snr_thresh)
-        mf_scale_x = panel_w / src_w
-        mf_scale_y = panel_h / src_h
+        mf_scale_x = small_w / src_w
+        mf_scale_y = small_h / src_h
         for lx1, ly1, lx2, ly2 in mf_lines:
             pt1 = (int(lx1 * mf_scale_x), int(ly1 * mf_scale_y))
             pt2 = (int(lx2 * mf_scale_x), int(ly2 * mf_scale_y))
             cv2.line(mf_bgr, pt1, pt2, ACCENT_MF_LINE, 2, cv2.LINE_AA)
 
         # ── Edges panel ────────────────────────────────────────────────
-        edge_gray_r = cv2.resize(edges, (panel_w, panel_h))
-        edge_bgr = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
+        edge_gray_r = cv2.resize(edges, (small_w, small_h))
+        edge_bgr = np.zeros((small_h, small_w, 3), dtype=np.uint8)
         edge_bgr[:] = BG_PANEL
         edge_bgr[edge_gray_r > 0] = ACCENT_CYAN
 
-        for px, py, panel in [
-            (0, 0, orig_small),
-            (panel_w + gap, 0, enh_bgr),
-            (0, panel_h + gap, mf_bgr),
-            (panel_w + gap, panel_h + gap, edge_bgr),
+        sx = orig_w + gap  # x-offset for right column
+        for px, py, pw, ph, panel in [
+            (0,  0,                          orig_w,  orig_h,  orig_small),
+            (sx, 0,                          small_w, small_h, enh_bgr),
+            (sx, small_h + gap,              small_w, small_h, mf_bgr),
+            (sx, 2 * (small_h + gap),        small_w, small_h, edge_bgr),
         ]:
-            canvas[py:py + panel_h, px:px + panel_w] = panel
-            _draw_border(canvas, px, py, panel_w, panel_h, BORDER)
+            canvas[py:py + ph, px:px + pw] = panel
+            _draw_border(canvas, px, py, pw, ph, BORDER)
 
-        # ── Draw marked trails on the Original panel ──────────────────
-        scale_x = panel_w / src_w
-        scale_y = panel_h / src_h
+        # ── Pending trail interaction on Original panel ─────────────
+        scale_x = orig_w / src_w
+        scale_y = orig_h / src_h
 
-        for tr in marked_trails:
-            sx, sy = tr['start']
-            ex, ey = tr['end']
-            p1 = (int(sx * scale_x), int(sy * scale_y))
-            p2 = (int(ex * scale_x), int(ey * scale_y))
-            cv2.line(canvas, p1, p2, TRAIL_MARK, 2, cv2.LINE_AA)
-            cv2.circle(canvas, p1, 4, TRAIL_MARK, -1, cv2.LINE_AA)
-            cv2.circle(canvas, p2, 4, TRAIL_MARK, -1, cv2.LINE_AA)
+        # Completed trails are shown as thumbnails in the sidebar instead
+        # of being drawn on the Original panel (keeps it clean).
 
         # Pending start point (first click placed, waiting for end)
         if pending_click[0] is not None:
-            sx, sy = pending_click[0]
-            p1 = (int(sx * scale_x), int(sy * scale_y))
+            t_sx, t_sy = pending_click[0]
+            p1 = (int(t_sx * scale_x), int(t_sy * scale_y))
             cv2.circle(canvas, p1, 6, TRAIL_PENDING, 2, cv2.LINE_AA)
             cv2.circle(canvas, p1, 2, TRAIL_PENDING, -1, cv2.LINE_AA)
             # Rubber-band line to current mouse position (if mouse is on panel)
             mx, my = mouse_pos
-            if 0 <= mx < panel_w and 0 <= my < panel_h:
+            if 0 <= mx < orig_w and 0 <= my < orig_h:
                 cv2.line(canvas, p1, (mx, my), TRAIL_RUBBER, 1, cv2.LINE_AA)
 
         # Panel tags
@@ -537,19 +542,19 @@ def show_preprocessing_preview(video_path, initial_params=None):
         _draw_tag(canvas, "ORIGINAL" + trail_count_str, tag_x, tag_y, BG_DARK, TEXT_DIM if not trail_count_str else TRAIL_MARK)
         clip_val = p['clahe_clip_limit'] / 10.0
         _draw_tag(canvas, f"CLAHE  clip {clip_val:.1f}  tile {p['clahe_tile_size']}",
-                  panel_w + gap + tag_x, tag_y, BG_DARK, ACCENT)
+                  sx + tag_x, tag_y, BG_DARK, ACCENT)
         mf_snr_val = p['mf_snr_threshold'] / 10.0
         mf_line_count = len(mf_lines)
         mf_tag = f"MF RESPONSE  SNR>={mf_snr_val:.1f}"
         if mf_line_count > 0:
             mf_tag += f"  [{mf_line_count}]"
         _draw_tag(canvas, mf_tag,
-                  tag_x, panel_h + gap + tag_y, BG_DARK, ACCENT_MF)
+                  sx + tag_x, small_h + gap + tag_y, BG_DARK, ACCENT_MF)
         _draw_tag(canvas, f"EDGES  {p['canny_low']}-{p['canny_high']}",
-                  panel_w + gap + tag_x, panel_h + gap + tag_y, BG_DARK, ACCENT_CYAN)
+                  sx + tag_x, 2 * (small_h + gap) + tag_y, BG_DARK, ACCENT_CYAN)
 
         # ── Sidebar ──────────────────────────────────────────────────
-        sb_x = panel_w * 2 + gap
+        sb_x = orig_w + gap + small_w
         _fill_rect(canvas, sb_x, 0, sidebar_w, canvas_h - status_bar_h, BG_SIDEBAR)
         _draw_border(canvas, sb_x, 0, sidebar_w, canvas_h - status_bar_h, BORDER)
 
@@ -592,7 +597,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
             # Register region for hit testing
             new_regions.append((track_x_start, track_x_end, track_y, v_min, v_max, key))
 
-        slider_regions = new_regions
+        # slider_regions is assigned later, after appending the frame slider
 
         # ── Trail examples section (below sliders) ──────────────────
         trail_y = slider_section_top + len(slider_defs) * slider_row_h + 12
@@ -608,11 +613,46 @@ def show_preprocessing_preview(video_path, initial_params=None):
         elif pending_click[0] is not None:
             _put_text(canvas, "Click trail END point ...", sb_x + 14, trail_y, TRAIL_PENDING, 0.30)
             trail_y += 14
+
+        thumb_pad_x = 10  # horizontal padding inside sidebar for thumbnails
+        thumb_w = sidebar_w - 2 * thumb_pad_x
+        crop_pad = 40  # padding around trail bbox in source pixels
         for ti, tr in enumerate(marked_trails):
-            _put_text(canvas, f"#{ti+1}", sb_x + 14, trail_y + 2, TRAIL_MARK, 0.30, 1)
-            info_str = f"L={tr['length']:.0f}  br={tr['avg_brightness']:.1f}  c={tr['contrast_ratio']:.2f}"
-            _put_text(canvas, info_str, sb_x + 38, trail_y + 2, TEXT_DIM, 0.26)
-            trail_y += 14
+            # Compute padded crop region in source coordinates
+            t_x0 = min(tr['start'][0], tr['end'][0]) - crop_pad
+            t_y0 = min(tr['start'][1], tr['end'][1]) - crop_pad
+            t_x1 = max(tr['start'][0], tr['end'][0]) + crop_pad
+            t_y1 = max(tr['start'][1], tr['end'][1]) + crop_pad
+            t_x0 = max(0, t_x0)
+            t_y0 = max(0, t_y0)
+            t_x1 = min(src_w, t_x1)
+            t_y1 = min(src_h, t_y1)
+            crop_w = t_x1 - t_x0
+            crop_h = t_y1 - t_y0
+            if crop_w > 0 and crop_h > 0:
+                crop = frm[t_y0:t_y1, t_x0:t_x1]
+                # Scale to sidebar width, preserving aspect ratio
+                thumb_h = max(1, int(thumb_w * crop_h / crop_w))
+                thumb_h = min(thumb_h, 120)  # cap height
+                thumb = cv2.resize(crop, (thumb_w, thumb_h))
+
+                # Draw trail line on thumbnail
+                ts_x = int((tr['start'][0] - t_x0) / crop_w * thumb_w)
+                ts_y = int((tr['start'][1] - t_y0) / crop_h * thumb_h)
+                te_x = int((tr['end'][0] - t_x0) / crop_w * thumb_w)
+                te_y = int((tr['end'][1] - t_y0) / crop_h * thumb_h)
+                cv2.line(thumb, (ts_x, ts_y), (te_x, te_y), TRAIL_MARK, 1, cv2.LINE_AA)
+
+                # Place thumbnail on canvas
+                tx = sb_x + thumb_pad_x
+                if trail_y + thumb_h + 18 < canvas_h - status_bar_h:
+                    # Label above thumbnail
+                    info_str = f"#{ti+1}  L={tr['length']:.0f}  br={tr['avg_brightness']:.1f}  c={tr['contrast_ratio']:.2f}"
+                    _put_text(canvas, info_str, tx, trail_y + 10, TRAIL_MARK, 0.26)
+                    trail_y += 14
+                    canvas[trail_y:trail_y + thumb_h, tx:tx + thumb_w] = thumb
+                    _draw_border(canvas, tx, trail_y, thumb_w, thumb_h, TRAIL_MARK)
+                    trail_y += thumb_h + 6
         trail_y += 6
 
         # ── Controls help ─────────────────────────────────────────
@@ -631,15 +671,40 @@ def show_preprocessing_preview(video_path, initial_params=None):
             _put_text(canvas, desc, sb_x + 126, help_y, TEXT_DIM, 0.30)
             help_y += 16
 
-        # ── Status bar ───────────────────────────────────────────────
+        # ── Status bar with wide frame slider ─────────────────────────
         sb_y = canvas_h - status_bar_h
         _fill_rect(canvas, 0, sb_y, canvas_w, status_bar_h, BG_PANEL)
         cv2.line(canvas, (0, sb_y), (canvas_w, sb_y), BORDER, 1)
 
-        _put_text(canvas, f"Frame {current_frame_idx}/{total_frames}", 12, sb_y + 21, TEXT_DIM, 0.36)
-        _put_text(canvas, f"{src_w}x{src_h}", canvas_w - 90, sb_y + 21, TEXT_DIM, 0.36)
-        cv2.circle(canvas, (canvas_w // 2, sb_y + 16), 4, ACCENT, -1)
-        _put_text(canvas, "LIVE", canvas_w // 2 + 10, sb_y + 21, ACCENT_DIM, 0.33)
+        # Top row: info text
+        _put_text(canvas, f"Frame {current_frame_idx}/{total_frames}", 12, sb_y + 16, TEXT_DIM, 0.36)
+        _put_text(canvas, f"{src_w}x{src_h}", canvas_w - 90, sb_y + 16, TEXT_DIM, 0.36)
+        cv2.circle(canvas, (canvas_w // 2, sb_y + 11), 4, ACCENT, -1)
+        _put_text(canvas, "LIVE", canvas_w // 2 + 10, sb_y + 16, ACCENT_DIM, 0.33)
+
+        # Bottom row: wide frame slider spanning full width
+        frame_track_pad = 14
+        frame_track_x0 = frame_track_pad
+        frame_track_x1 = canvas_w - frame_track_pad
+        frame_track_y = sb_y + 40
+        frame_track_w = frame_track_x1 - frame_track_x0
+
+        _fill_rect(canvas, frame_track_x0, frame_track_y - slider_track_h // 2,
+                   frame_track_w, slider_track_h, SLIDER_TRACK)
+        f_ratio = (p['frame_idx'] - frame_v_min) / max(1, frame_v_max - frame_v_min)
+        f_fill_w = int(frame_track_w * f_ratio)
+        if f_fill_w > 0:
+            _fill_rect(canvas, frame_track_x0, frame_track_y - slider_track_h // 2,
+                       f_fill_w, slider_track_h, SLIDER_FILL)
+        f_thumb_x = frame_track_x0 + f_fill_w
+        cv2.circle(canvas, (f_thumb_x, frame_track_y), slider_thumb_r, SLIDER_THUMB, -1)
+        cv2.circle(canvas, (f_thumb_x, frame_track_y), slider_thumb_r, ACCENT, 1, cv2.LINE_AA)
+
+        # Store frame slider region for hit testing (appended after sidebar sliders)
+        new_regions.append((frame_track_x0, frame_track_x1, frame_track_y,
+                            frame_v_min, frame_v_max, 'frame_idx'))
+
+        slider_regions = new_regions
 
         return canvas
 
@@ -664,11 +729,11 @@ def show_preprocessing_preview(video_path, initial_params=None):
             mouse_pos[1] = y
 
         if event == cv2.EVENT_LBUTTONDOWN:
-            # Check if click is inside the Original panel (top-left)
-            if 0 <= x < panel_w and 0 <= y < panel_h:
+            # Check if click is inside the Original panel (left column)
+            if 0 <= x < orig_w and 0 <= y < orig_h:
                 # Map panel coordinates → source frame coordinates
-                src_x = int(x / panel_w * src_w)
-                src_y = int(y / panel_h * src_h)
+                src_x = int(x / orig_w * src_w)
+                src_y = int(y / orig_h * src_h)
                 if pending_click[0] is None:
                     if len(marked_trails) < MAX_TRAILS:
                         pending_click[0] = (src_x, src_y)
@@ -2712,7 +2777,7 @@ class SatelliteTrailDetector:
         return panel
 
 
-def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None):
+def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False):
     """
     Process video to detect and highlight satellite and airplane trails.
 
@@ -2733,6 +2798,7 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         skip_aspect_ratio_check: If True, disables aspect ratio filtering (default: False)
         signal_envelope: Optional dict with signal characteristics from user-marked trail
             examples. Used to dynamically adapt detection thresholds.
+        save_dataset: If True, save detections as a YOLO-format ML dataset (default: False)
     """
     # Validate input
     input_path = Path(input_path)
@@ -2829,6 +2895,18 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     satellites_detected = 0
     airplanes_detected = 0
 
+    # ── YOLO dataset setup ────────────────────────────────────────
+    dataset_dir = None
+    dataset_images = 0
+    dataset_annotations = {'satellite': 0, 'airplane': 0}
+    if save_dataset:
+        out_p = Path(output_path)
+        dataset_dir = out_p.parent / (out_p.stem + '_dataset')
+        (dataset_dir / 'images').mkdir(parents=True, exist_ok=True)
+        (dataset_dir / 'labels').mkdir(parents=True, exist_ok=True)
+        video_stem = Path(input_path).stem
+        print(f"Dataset export enabled → {dataset_dir}")
+
     # Track frozen regions: list of (frozen_region, bbox, trail_type, frames_remaining)
     frozen_regions = []
 
@@ -2923,6 +3001,26 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
                             })
                             break  # Only create one panel per detection
 
+            # ── YOLO dataset export (one image + label per frame with detections)
+            if dataset_dir is not None:
+                img_name = f"{video_stem}_f{frame_count:06d}.jpg"
+                cv2.imwrite(str(dataset_dir / 'images' / img_name), frame,
+                            [cv2.IMWRITE_JPEG_QUALITY, 95])
+                label_lines = []
+                frame_h, frame_w = frame.shape[:2]
+                for trail_type_d, det_info_d in detected_trails:
+                    cls_id = 0 if trail_type_d == 'satellite' else 1
+                    bx0, by0, bx1, by1 = det_info_d['bbox']
+                    xc = ((bx0 + bx1) / 2) / frame_w
+                    yc = ((by0 + by1) / 2) / frame_h
+                    bw = (bx1 - bx0) / frame_w
+                    bh = (by1 - by0) / frame_h
+                    label_lines.append(f"{cls_id} {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}")
+                    dataset_annotations[trail_type_d] += 1
+                label_path = dataset_dir / 'labels' / img_name.replace('.jpg', '.txt')
+                label_path.write_text('\n'.join(label_lines) + '\n')
+                dataset_images += 1
+
         # Apply all active frozen regions to the output frame
         active_regions = []
         for frozen_data in frozen_regions:
@@ -3006,6 +3104,34 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
 
     print(f"Total trails detected: {satellites_detected + airplanes_detected}")
     print(f"Output saved to: {output_path}")
+
+    # ── YOLO dataset finalisation ─────────────────────────────────
+    if dataset_dir is not None and dataset_images > 0:
+        # Write data.yaml for Ultralytics / YOLO training
+        yaml_path = dataset_dir / 'data.yaml'
+        yaml_path.write_text(
+            "path: .\n"
+            "train: images\n"
+            "val: images\n"
+            "\n"
+            "names:\n"
+            "  0: satellite\n"
+            "  1: airplane\n"
+        )
+        total_ann = dataset_annotations['satellite'] + dataset_annotations['airplane']
+        sat_ann = dataset_annotations['satellite']
+        air_ann = dataset_annotations['airplane']
+        print(f"\n{'=' * 42}")
+        print(f"  ML Dataset Summary")
+        print(f"{'─' * 42}")
+        print(f"  Format:       YOLOv8")
+        print(f"  Location:     {dataset_dir}")
+        print(f"  Images:       {dataset_images}")
+        print(f"  Annotations:  {total_ann} ({sat_ann} satellite, {air_ann} airplane)")
+        print(f"  Class map:    0=satellite, 1=airplane")
+        print(f"{'=' * 42}")
+    elif dataset_dir is not None:
+        print("\nNo detections found — dataset directory is empty.")
 
 
 def main():
@@ -3109,6 +3235,12 @@ Notes:
         help='Disable aspect ratio filtering (may improve performance but increase false positives)'
     )
 
+    parser.add_argument(
+        '--dataset',
+        action='store_true',
+        help='Save detections as a YOLO-format ML dataset (images + labels) alongside the output video'
+    )
+
     args = parser.parse_args()
 
     # Handle preprocessing preview if requested
@@ -3134,7 +3266,8 @@ Notes:
         debug_only=args.debug_only,
         preprocessing_params=preprocessing_params,
         skip_aspect_ratio_check=args.no_aspect_ratio_check,
-        signal_envelope=signal_envelope
+        signal_envelope=signal_envelope,
+        save_dataset=args.dataset
     )
 
 
