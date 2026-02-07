@@ -1234,6 +1234,273 @@ class SatelliteTrailDetector:
 
         return lines, edges
 
+    # ------------------------------------------------------------------
+    #  Supplementary dim-trail detection: Directional Matched Filtering
+    # ------------------------------------------------------------------
+    #
+    #  The primary pipeline (Canny → Hough) cannot detect trails whose
+    #  brightness is too low to produce edges.  The methods below implement
+    #  a *matched filter* approach — the theoretically optimal linear
+    #  detector for a known signal shape (straight line) in additive
+    #  Gaussian noise.
+    #
+    #  Pipeline:
+    #    1. Local background subtraction (large-kernel median)
+    #    2. Robust noise estimation (MAD → σ)
+    #    3. Oriented filter bank (averaging kernels at 5° steps)
+    #    4. SNR thresholding on the filter response map
+    #    5. Hough extraction of line segments from the thresholded map
+    #    6. Per-trail SNR confirmation using perpendicular flank sampling
+    #    7. Duplicate suppression vs. primary detections
+    #
+    #  This gives ~√L SNR improvement (L = kernel length), allowing
+    #  detection of trails 3–6× dimmer than the Canny threshold.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _create_matched_filter_kernel(length, angle_deg):
+        """Create an oriented averaging kernel for directional line detection.
+
+        The kernel is a normalized line of 1s at the given angle through the
+        center of a (length × length) grid.  When convolved with a
+        background-subtracted image the response equals the average brightness
+        along a line segment of that length at that orientation — the optimal
+        matched filter for a straight line in additive Gaussian noise.
+
+        Args:
+            length: Kernel side length (will be rounded up to odd)
+            angle_deg: Line orientation in degrees (0 = horizontal)
+
+        Returns:
+            Normalized float32 kernel array
+        """
+        import math
+
+        ksize = length if length % 2 == 1 else length + 1
+        kernel = np.zeros((ksize, ksize), dtype=np.float32)
+
+        center = ksize // 2
+        rad = math.radians(angle_deg)
+        cos_a = math.cos(rad)
+        sin_a = math.sin(rad)
+
+        for i in range(-center, center + 1):
+            px = int(round(center + i * cos_a))
+            py = int(round(center + i * sin_a))
+            if 0 <= px < ksize and 0 <= py < ksize:
+                kernel[py, px] = 1.0
+
+        # Normalize by the number of unique lit pixels (not loop iterations,
+        # since diagonal angles cause multiple i values to map to the same pixel)
+        kernel_sum = np.sum(kernel)
+        if kernel_sum > 0:
+            kernel /= kernel_sum
+
+        return kernel
+
+    def _detect_dim_lines_matched_filter(self, gray_frame, existing_lines=None):
+        """Supplementary line detection using directional matched filtering.
+
+        Detects dim linear features that Canny + Hough miss by directly
+        searching for oriented brightness ridges in the background-subtracted
+        image.  A bank of oriented averaging kernels at 5-degree steps is
+        applied and the maximum filter response at each pixel is compared
+        against a statistical noise threshold (SNR-based).
+
+        The matched filter is the theoretically optimal linear detector for
+        a known signal shape (straight line) in additive Gaussian noise,
+        providing SNR improvement proportional to sqrt(kernel_length).
+
+        Args:
+            gray_frame: Original grayscale frame (not CLAHE-enhanced)
+            existing_lines: Lines already found by primary Hough detection,
+                used to suppress duplicate detections.  HoughLinesP format.
+
+        Returns:
+            Additional lines in HoughLinesP format [[[x1, y1, x2, y2]], ...],
+            or None if no additional lines found.
+        """
+        import math
+
+        h, w = gray_frame.shape
+
+        # --- Downsample for performance (half resolution) ---
+        scale = 0.5
+        small_w, small_h = int(w * scale), int(h * scale)
+        small = cv2.resize(gray_frame, (small_w, small_h),
+                           interpolation=cv2.INTER_AREA)
+
+        # --- Background subtraction using large-kernel median ---
+        # Removes sky gradients, light pollution, vignetting so only
+        # local brightness deviations (trails) remain.
+        bg_kernel = 31  # Must be odd
+        bg = cv2.medianBlur(small, bg_kernel)
+        signal = small.astype(np.float32) - bg.astype(np.float32)
+        signal = np.clip(signal, 0, None)
+
+        # --- Noise estimation using Median Absolute Deviation (MAD) ---
+        # MAD is robust: signal pixels don't inflate the noise estimate
+        # the way standard deviation would.
+        flat = signal.ravel()
+        median_val = np.median(flat)
+        mad = np.median(np.abs(flat - median_val))
+        noise_std = mad * 1.4826  # Scale factor for Gaussian equivalence
+        if noise_std < 0.5:
+            noise_std = 0.5
+
+        # --- Directional matched filter bank ---
+        num_angles = 36   # 5-degree angular resolution
+        kernel_length = 31  # ~5.6× SNR improvement (sqrt(31))
+
+        best_response = np.zeros_like(signal)
+        best_angle = np.zeros_like(signal)
+
+        for i in range(num_angles):
+            angle_deg = i * 180.0 / num_angles
+            kernel = self._create_matched_filter_kernel(kernel_length, angle_deg)
+            response = cv2.filter2D(signal, cv2.CV_32F, kernel)
+
+            better = response > best_response
+            best_response[better] = response[better]
+            best_angle[better] = angle_deg
+
+        # --- SNR-based thresholding ---
+        snr_map = best_response / noise_std
+        snr_threshold = 2.5  # Detect features at SNR >= 2.5
+        significant = (snr_map > snr_threshold).astype(np.uint8) * 255
+
+        # Light morphological cleanup
+        cleanup_kernel = np.ones((3, 3), np.uint8)
+        significant = cv2.dilate(significant, cleanup_kernel, iterations=1)
+        significant = cv2.erode(significant, cleanup_kernel, iterations=1)
+
+        # --- Extract line segments via Hough on the thresholded map ---
+        min_len = max(15, int(self.params['min_line_length'] * scale * 0.6))
+        max_gap = int(self.params['max_line_gap'] * scale * 1.5)
+        hough_thresh = max(10, int(self.params['hough_threshold'] * 0.4))
+
+        lines = cv2.HoughLinesP(
+            significant,
+            rho=1,
+            theta=np.pi / 180,
+            threshold=hough_thresh,
+            minLineLength=min_len,
+            maxLineGap=max_gap
+        )
+
+        if lines is None:
+            return None
+
+        # --- Scale back to original resolution ---
+        inv_scale = 1.0 / scale
+        scaled_lines = []
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            scaled_lines.append(np.array([[
+                int(x1 * inv_scale), int(y1 * inv_scale),
+                int(x2 * inv_scale), int(y2 * inv_scale)
+            ]]))
+
+        # --- Filter duplicates vs existing primary detections ---
+        if existing_lines is not None and len(existing_lines) > 0:
+            filtered = []
+            for new_line in scaled_lines:
+                nx1, ny1, nx2, ny2 = new_line[0]
+                ncx = (nx1 + nx2) / 2.0
+                ncy = (ny1 + ny2) / 2.0
+                n_angle = math.degrees(math.atan2(abs(ny2 - ny1), abs(nx2 - nx1)))
+
+                is_dup = False
+                for existing in existing_lines:
+                    ex1, ey1, ex2, ey2 = existing[0]
+                    ecx = (ex1 + ex2) / 2.0
+                    ecy = (ey1 + ey2) / 2.0
+                    e_angle = math.degrees(math.atan2(abs(ey2 - ey1), abs(ex2 - ex1)))
+
+                    dist = math.sqrt((ncx - ecx)**2 + (ncy - ecy)**2)
+                    angle_diff = abs(n_angle - e_angle)
+                    angle_diff = min(angle_diff, 180 - angle_diff)
+
+                    if dist < 80 and angle_diff < 15:
+                        is_dup = True
+                        break
+
+                if not is_dup:
+                    filtered.append(new_line)
+
+            if not filtered:
+                return None
+            scaled_lines = filtered
+
+        return np.array(scaled_lines) if scaled_lines else None
+
+    def _compute_trail_snr(self, gray_frame, line):
+        """Compute signal-to-noise ratio of a candidate trail vs local background.
+
+        Measures brightness along the trail and in flanking regions
+        perpendicular to the trail direction.
+
+            SNR = (trail_mean − background_mean) / background_std
+
+        A positive SNR indicates the trail is brighter than its surroundings.
+        SNR >= 2 is a marginal detection; SNR >= 3 is reliable.
+
+        Args:
+            gray_frame: Grayscale frame
+            line: Line in HoughLinesP format [[x1, y1, x2, y2]]
+
+        Returns:
+            SNR value (float).  Returns 0.0 if the trail is too short or
+            has insufficient samples.
+        """
+        x1, y1, x2, y2 = line[0]
+        length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+
+        if length < 10:
+            return 0.0
+
+        n_samples = max(20, int(length / 3))
+        n_samples = min(n_samples, 200)
+
+        h, w = gray_frame.shape
+        dx = (x2 - x1) / length
+        dy = (y2 - y1) / length
+        perp_dx = -dy   # Perpendicular direction
+        perp_dy = dx
+
+        trail_values = []
+        flank_values = []
+        flank_dist = 8  # Pixels from trail center to flank sample
+
+        for i in range(n_samples):
+            t = i / (n_samples - 1) if n_samples > 1 else 0
+            cx = x1 + t * (x2 - x1)
+            cy = y1 + t * (y2 - y1)
+
+            # Trail pixel
+            tx, ty = int(round(cx)), int(round(cy))
+            if 0 <= tx < w and 0 <= ty < h:
+                trail_values.append(float(gray_frame[ty, tx]))
+
+            # Flank pixels (both sides of the trail)
+            for sign in (-1, 1):
+                fx = int(round(cx + sign * flank_dist * perp_dx))
+                fy = int(round(cy + sign * flank_dist * perp_dy))
+                if 0 <= fx < w and 0 <= fy < h:
+                    flank_values.append(float(gray_frame[fy, fx]))
+
+        if len(trail_values) < 5 or len(flank_values) < 5:
+            return 0.0
+
+        trail_mean = np.mean(trail_values)
+        bg_mean = np.mean(flank_values)
+        bg_std = np.std(flank_values)
+
+        if bg_std < 0.5:
+            bg_std = 0.5
+
+        return (trail_mean - bg_mean) / bg_std
+
     def detect_point_features(self, line, gray_frame, return_debug_info=False):
         """
         Detect point-like features (bright spots) along a trail using spatial analysis.
@@ -1334,7 +1601,7 @@ class SatelliteTrailDetector:
 
         return num_peaks
 
-    def classify_trail(self, line, gray_frame, color_frame, hsv_frame=None, reusable_mask=None):
+    def classify_trail(self, line, gray_frame, color_frame, hsv_frame=None, reusable_mask=None, supplementary=False):
         """
         Classify a detected line as either a satellite or airplane trail.
 
@@ -1350,6 +1617,9 @@ class SatelliteTrailDetector:
             color_frame: BGR color frame
             hsv_frame: Pre-computed HSV frame (optional, for performance)
             reusable_mask: Pre-allocated mask array (optional, for performance)
+            supplementary: If True, this candidate came from the matched-filter
+                stage and has already passed an SNR gate.  Contrast thresholds
+                are relaxed and an additional SNR-based detection path is enabled.
 
         Returns:
             trail_type: 'satellite', 'airplane', or None
@@ -1412,6 +1682,11 @@ class SatelliteTrailDetector:
             background_brightness = np.median(background_region)
             contrast_ratio = avg_brightness / (background_brightness + 1e-5)
             min_contrast = self.params.get('satellite_contrast_min', 1.08)
+            # Supplementary candidates already passed the matched-filter SNR
+            # gate, so the contrast criterion can be relaxed to avoid rejecting
+            # dim trails that the primary pipeline would never have seen.
+            if supplementary:
+                min_contrast = max(1.02, min_contrast * 0.7)
             if contrast_ratio < min_contrast:
                 return None, None
 
@@ -1665,6 +1940,18 @@ class SatelliteTrailDetector:
         if is_smooth and avg_brightness <= self.params['brightness_threshold'] and not has_dotted_pattern and length >= self.params['satellite_min_length']:
             return 'satellite', _make_detection_info()
 
+        # --- SNR-based path for matched-filter candidates ---
+        # Trails found by the supplementary matched filter have already
+        # passed a global SNR gate, but may fail the absolute-brightness or
+        # contrast thresholds used above.  Compute a per-trail SNR using
+        # perpendicular flank sampling — a statistically rigorous measure
+        # that is independent of absolute brightness.  This rescues very dim
+        # trails that are clearly above the local noise floor.
+        if supplementary and not has_dotted_pattern and length >= self.params['satellite_min_length']:
+            trail_snr = self._compute_trail_snr(gray_frame, line)
+            if trail_snr >= 2.5 and is_smooth:
+                return 'satellite', _make_detection_info()
+
         return None, None
     
     def merge_overlapping_boxes(self, boxes, overlap_threshold=0.3):
@@ -1841,6 +2128,11 @@ class SatelliteTrailDetector:
         detections use angle-aware merging so that two airplanes with
         crossing or nearby paths are kept as separate detections.
 
+        Uses a two-stage pipeline:
+          1. Primary detection via Canny edge detection + Hough line transform.
+          2. Supplementary detection via directional matched filtering for very
+             dim trails that fall below the Canny edge threshold.
+
         Args:
             frame: Input frame
             debug_info: Optional dict to collect debug information
@@ -1859,14 +2151,6 @@ class SatelliteTrailDetector:
         gray, preprocessed = self.preprocess_frame(frame)
         lines, edges = self.detect_lines(preprocessed)
 
-        if lines is None:
-            if debug_info is not None:
-                debug_info['all_lines'] = []
-                debug_info['all_classifications'] = []
-                debug_info['edges'] = edges
-                debug_info['gray_frame'] = gray
-            return []
-
         # Pre-compute HSV frame once for all line classifications (performance optimization)
         hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
@@ -1876,25 +2160,55 @@ class SatelliteTrailDetector:
         classified_trails = []
         all_classifications = []  # For debug: store all attempted classifications
 
-        for line in lines:
-            trail_type, detection_info = self.classify_trail(line, gray, frame, hsv_frame, reusable_mask)
+        # --- Stage 1: Primary detection (Canny + Hough) ---
+        if lines is not None:
+            for line in lines:
+                trail_type, detection_info = self.classify_trail(
+                    line, gray, frame, hsv_frame, reusable_mask)
 
-            # Store for debug (even if filtered out)
-            if debug_info is not None:
-                all_classifications.append({
-                    'line': line,
-                    'type': trail_type,
-                    'detection_info': detection_info,
-                    # Keep 'bbox' for backward compat with debug panel lookup
-                    'bbox': detection_info['bbox'] if detection_info else None,
-                })
+                # Store for debug (even if filtered out)
+                if debug_info is not None:
+                    all_classifications.append({
+                        'line': line,
+                        'type': trail_type,
+                        'detection_info': detection_info,
+                        # Keep 'bbox' for backward compat with debug panel lookup
+                        'bbox': detection_info['bbox'] if detection_info else None,
+                    })
 
-            if trail_type and detection_info:
-                classified_trails.append((trail_type, detection_info))
+                if trail_type and detection_info:
+                    classified_trails.append((trail_type, detection_info))
+
+        # --- Stage 2: Supplementary dim-trail detection (Matched Filter) ---
+        # Directional matched filtering catches dim linear features that fall
+        # below Canny's edge threshold.  Only new (non-duplicate) candidates
+        # are returned, so existing primary detections are not affected.
+        supplementary_lines = self._detect_dim_lines_matched_filter(gray, lines)
+        if supplementary_lines is not None:
+            for line in supplementary_lines:
+                trail_type, detection_info = self.classify_trail(
+                    line, gray, frame, hsv_frame, reusable_mask,
+                    supplementary=True)
+
+                if debug_info is not None:
+                    all_classifications.append({
+                        'line': line,
+                        'type': trail_type,
+                        'detection_info': detection_info,
+                        'bbox': detection_info['bbox'] if detection_info else None,
+                    })
+
+                if trail_type and detection_info:
+                    classified_trails.append((trail_type, detection_info))
 
         # Store debug info
         if debug_info is not None:
-            debug_info['all_lines'] = lines
+            all_lines_combined = []
+            if lines is not None:
+                all_lines_combined.extend(lines)
+            if supplementary_lines is not None:
+                all_lines_combined.extend(supplementary_lines)
+            debug_info['all_lines'] = all_lines_combined if all_lines_combined else []
             debug_info['all_classifications'] = all_classifications
             debug_info['edges'] = edges
             debug_info['gray_frame'] = gray
@@ -1935,7 +2249,7 @@ class SatelliteTrailDetector:
         results.extend([('airplane', info) for info in merged_airplane_infos])
 
         return results
-    
+
     def draw_dotted_line(self, frame, pt1, pt2, color, thickness):
         """Draw a dotted line between two points."""
         x1, y1 = pt1
