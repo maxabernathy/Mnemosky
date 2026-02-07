@@ -1,2 +1,1 @@
-# Mnemosky
-mnemosky project
+CLAUDE.md
