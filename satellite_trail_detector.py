@@ -48,12 +48,13 @@ def show_preprocessing_preview(video_path, initial_params=None):
     right, and a status bar at the bottom.
 
     Controls:
+    - Use Frame slider to select exact frame containing trail signal
     - Click and drag sliders in the sidebar to adjust parameters
     - Press SPACE or ENTER to accept current settings
     - Press ESC to cancel and use default settings
     - Press 'R' to reset to default values
-    - Press 'N' to load next frame from video
-    - Press 'P' to load previous frame
+    - Press 'N' to jump forward 1 second
+    - Press 'P' to jump back 1 second
 
     Args:
         video_path: Path to the input video file
@@ -123,6 +124,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
     # ── Slider definitions ───────────────────────────────────────────
     # Each slider: (param_key, label, display_fmt, min_val, max_val)
     slider_defs = [
+        ('frame_idx',        'Frame',       lambda v: f"{v}",        0, max(1, total_frames - 1)),
         ('clahe_clip_limit', 'CLAHE Clip',  lambda v: f"{v/10:.1f}", 0, 100),
         ('clahe_tile_size',  'CLAHE Tile',  lambda v: f"{v}",        2, 16),
         ('blur_kernel_size', 'Blur Kernel', lambda v: f"{v if v%2==1 else v+1}", 1, 15),
@@ -132,6 +134,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
     ]
 
     params = defaults.copy()
+    params['frame_idx'] = current_frame_idx
 
     # ── Layout constants ─────────────────────────────────────────────
     sidebar_w = 280
@@ -364,21 +367,30 @@ def show_preprocessing_preview(video_path, initial_params=None):
     print("\n" + "=" * 60)
     print("PREPROCESSING PREVIEW")
     print("=" * 60)
-    print("Adjust the sliders to tune preprocessing parameters.")
+    print("Use the Frame slider to find a frame with satellite trail signal.")
+    print("Then adjust other sliders to tune preprocessing parameters.")
     print("The goal is to preserve dim satellite trails while reducing noise.")
     print("\nControls:")
-    print("  Click+drag  - Adjust sliders in the sidebar")
-    print("  SPACE/ENTER - Accept current settings and continue")
-    print("  ESC         - Cancel and use default settings")
-    print("  R           - Reset to default values")
-    print("  N           - Load next frame")
-    print("  P           - Load previous frame")
+    print("  Click+drag   - Adjust sliders in the sidebar")
+    print("  SPACE/ENTER  - Accept current settings and continue")
+    print("  ESC          - Cancel and use default settings")
+    print("  R            - Reset to default values")
+    print("  N            - Jump forward 1 second")
+    print("  P            - Jump back 1 second")
     print("=" * 60 + "\n")
 
     first_render = True
 
     # ── Main loop ────────────────────────────────────────────────────
     while True:
+        # Check if Frame slider was dragged to a new position
+        if params['frame_idx'] != current_frame_idx:
+            current_frame_idx = params['frame_idx']
+            cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_idx)
+            ret, new_frame = cap.read()
+            if ret:
+                frame = new_frame
+
         gray, enhanced, blurred, edges = apply_preprocessing(frame, params)
         display = create_display(frame, gray, enhanced, blurred, edges, params)
         canvas_size[0] = display.shape[1]
@@ -420,26 +432,30 @@ def show_preprocessing_preview(video_path, initial_params=None):
             return final_params
 
         elif key == ord('r') or key == ord('R'):  # Reset
+            saved_frame_idx = params['frame_idx']
             params = defaults.copy()
+            params['frame_idx'] = saved_frame_idx
             print("Parameters reset to defaults.")
 
-        elif key == ord('n') or key == ord('N'):  # Next frame
+        elif key == ord('n') or key == ord('N'):  # Next frame (jump 1 second)
             current_frame_idx = min(total_frames - 1, current_frame_idx + int(fps))
             cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_idx)
-            ret, frame = cap.read()
+            ret, new_frame = cap.read()
             if not ret:
                 current_frame_idx = 0
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ret, frame = cap.read()
+                ret, new_frame = cap.read()
             if ret:
-                original_frame = frame.copy()
+                frame = new_frame
+                params['frame_idx'] = current_frame_idx
 
-        elif key == ord('p') or key == ord('P'):  # Previous frame
+        elif key == ord('p') or key == ord('P'):  # Previous frame (jump 1 second)
             current_frame_idx = max(0, current_frame_idx - int(fps))
             cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_idx)
-            ret, frame = cap.read()
+            ret, new_frame = cap.read()
             if ret:
-                original_frame = frame.copy()
+                frame = new_frame
+                params['frame_idx'] = current_frame_idx
 
         # Check if window was closed
         if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
