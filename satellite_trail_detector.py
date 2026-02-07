@@ -136,14 +136,45 @@ def show_preprocessing_preview(video_path, initial_params=None):
     params = defaults.copy()
     params['frame_idx'] = current_frame_idx
 
-    # ── Layout constants ─────────────────────────────────────────────
-    sidebar_w = 280
-    status_bar_h = 32
-    slider_row_h = 44           # Height per slider row
-    slider_pad_x = 16           # Horizontal padding inside sidebar
-    slider_track_h = 4          # Track bar height
-    slider_thumb_r = 6          # Thumb radius
-    slider_section_top = 62     # Y offset where sliders begin (below title)
+    # ── Detect screen size ───────────────────────────────────────────
+    _screen_w, _screen_h = 1920, 1080
+    try:
+        import subprocess as _sp
+        _xdpy = _sp.run(['xdpyinfo'], capture_output=True, text=True, timeout=2)
+        for _line in _xdpy.stdout.split('\n'):
+            if 'dimensions:' in _line:
+                _sw, _sh = _line.split()[1].split('x')
+                _screen_w, _screen_h = int(_sw), int(_sh)
+                break
+    except Exception:
+        try:
+            import subprocess as _sp
+            _xr = _sp.run(['xrandr', '--current'], capture_output=True, text=True, timeout=2)
+            for _line in _xr.stdout.split('\n'):
+                if ' connected ' in _line and 'x' in _line:
+                    import re as _re
+                    _m = _re.search(r'(\d{3,5})x(\d{3,5})', _line)
+                    if _m:
+                        _screen_w, _screen_h = int(_m.group(1)), int(_m.group(2))
+                        break
+        except Exception:
+            pass
+
+    # ── Layout constants (derived from screen size) ──────────────────
+    target_win_w = int(_screen_w * 0.92)
+    target_win_h = int(_screen_h * 0.88)
+    sidebar_w = max(280, min(380, int(target_win_w * 0.18)))
+    status_bar_h = 36
+    gap = 2
+    panel_w = (target_win_w - sidebar_w - gap) // 2
+    panel_h = (target_win_h - status_bar_h - gap) // 2
+    canvas_w = panel_w * 2 + gap + sidebar_w
+    canvas_h = panel_h * 2 + gap + status_bar_h
+    slider_row_h = 52           # Height per slider row
+    slider_pad_x = 20           # Horizontal padding inside sidebar
+    slider_track_h = 5          # Track bar height
+    slider_thumb_r = 8          # Thumb radius
+    slider_section_top = 72     # Y offset where sliders begin (below title)
 
     # Mutable state for mouse interaction
     # These will be set once we know the canvas geometry in the first frame.
@@ -199,14 +230,6 @@ def show_preprocessing_preview(video_path, initial_params=None):
 
     def create_display(frm, gray, enhanced, blurred, edges, p):
         nonlocal slider_regions
-        h, w = frm.shape[:2]
-
-        gap = 2
-        panel_w = (w - gap) // 2
-        panel_h = (h - gap) // 2
-
-        canvas_w = panel_w * 2 + gap + sidebar_w
-        canvas_h = panel_h * 2 + gap + status_bar_h
 
         canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
         canvas[:] = BG_DARK
@@ -318,27 +341,14 @@ def show_preprocessing_preview(video_path, initial_params=None):
         return canvas
 
     # ── Mouse callback for slider interaction ────────────────────────
-
-    # The display is shown via WINDOW_NORMAL which may be scaled.  We need
-    # to map mouse coords (which are in *displayed* pixel space) back to
-    # canvas coords.  We track the canvas size so we can compute the ratio.
-    canvas_size = [1, 1]  # [w, h] — will be set on first render
+    # Canvas is built at the exact target window size, so mouse
+    # coordinates map 1:1 to canvas pixels — no scaling needed.
 
     def _update_slider_from_x(mouse_x, mouse_y):
         """Find which slider the mouse is on and update its value."""
-        # Convert displayed coords to canvas coords
-        win_rect = cv2.getWindowImageRect(window_name)
-        if win_rect[2] > 0 and win_rect[3] > 0:
-            sx = canvas_size[0] / win_rect[2]
-            sy = canvas_size[1] / win_rect[3]
-        else:
-            sx, sy = 1.0, 1.0
-        cx = int(mouse_x * sx)
-        cy = int(mouse_y * sy)
-
         for i, (x_start, x_end, y_center, v_min, v_max, key) in enumerate(slider_regions):
-            if abs(cy - y_center) < slider_row_h // 2 and x_start - 4 <= cx <= x_end + 4:
-                ratio = max(0.0, min(1.0, (cx - x_start) / max(1, x_end - x_start)))
+            if abs(mouse_y - y_center) < slider_row_h // 2 and x_start - 4 <= mouse_x <= x_end + 4:
+                ratio = max(0.0, min(1.0, (mouse_x - x_start) / max(1, x_end - x_start)))
                 params[key] = int(round(v_min + ratio * (v_max - v_min)))
                 dragging['idx'] = i
                 return
@@ -349,15 +359,8 @@ def show_preprocessing_preview(video_path, initial_params=None):
             _update_slider_from_x(x, y)
         elif event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON):
             if dragging['idx'] >= 0:
-                # Continue dragging the same slider
-                win_rect = cv2.getWindowImageRect(window_name)
-                if win_rect[2] > 0 and win_rect[3] > 0:
-                    sx = canvas_size[0] / win_rect[2]
-                else:
-                    sx = 1.0
-                cx = int(x * sx)
                 x_start, x_end, _, v_min, v_max, key = slider_regions[dragging['idx']]
-                ratio = max(0.0, min(1.0, (cx - x_start) / max(1, x_end - x_start)))
+                ratio = max(0.0, min(1.0, (x - x_start) / max(1, x_end - x_start)))
                 params[key] = int(round(v_min + ratio * (v_max - v_min)))
         elif event == cv2.EVENT_LBUTTONUP:
             dragging['idx'] = -1
@@ -393,15 +396,11 @@ def show_preprocessing_preview(video_path, initial_params=None):
 
         gray, enhanced, blurred, edges = apply_preprocessing(frame, params)
         display = create_display(frame, gray, enhanced, blurred, edges, params)
-        canvas_size[0] = display.shape[1]
-        canvas_size[1] = display.shape[0]
 
         cv2.imshow(window_name, display)
 
         if first_render:
-            dh, dw = display.shape[:2]
-            screen_scale = min(1.0, 1600 / dw, 950 / dh)
-            cv2.resizeWindow(window_name, int(dw * screen_scale), int(dh * screen_scale))
+            cv2.resizeWindow(window_name, canvas_w, canvas_h)
             first_render = False
 
         key = cv2.waitKey(30) & 0xFF
