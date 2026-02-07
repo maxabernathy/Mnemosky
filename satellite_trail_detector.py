@@ -83,10 +83,10 @@ def show_preprocessing_preview(video_path, initial_params=None):
     defaults = {
         'clahe_clip_limit': 60,      # Stored as int, divide by 10 for actual value (6.0)
         'clahe_tile_size': 6,
-        'blur_kernel_size': 3,       # Must be odd
-        'blur_sigma': 3,             # Stored as int, divide by 10 for actual value
+        'blur_kernel_size': 5,       # Must be odd
+        'blur_sigma': 18,            # Stored as int, divide by 10 for actual value (1.8)
         'canny_low': 4,
-        'canny_high': 45,
+        'canny_high': 100,
     }
 
     # Use initial params if provided
