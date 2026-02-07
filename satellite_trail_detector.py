@@ -380,18 +380,12 @@ def show_preprocessing_preview(video_path, initial_params=None):
             canvas[py:py + ph, px:px + pw] = panel
             _draw_border(canvas, px, py, pw, ph, BORDER)
 
-        # ── Draw marked trails on the Original panel ──────────────────
+        # ── Pending trail interaction on Original panel ─────────────
         scale_x = orig_w / src_w
         scale_y = orig_h / src_h
 
-        for tr in marked_trails:
-            t_sx, t_sy = tr['start']
-            t_ex, t_ey = tr['end']
-            p1 = (int(t_sx * scale_x), int(t_sy * scale_y))
-            p2 = (int(t_ex * scale_x), int(t_ey * scale_y))
-            cv2.line(canvas, p1, p2, TRAIL_MARK, 2, cv2.LINE_AA)
-            cv2.circle(canvas, p1, 4, TRAIL_MARK, -1, cv2.LINE_AA)
-            cv2.circle(canvas, p2, 4, TRAIL_MARK, -1, cv2.LINE_AA)
+        # Completed trails are shown as thumbnails in the sidebar instead
+        # of being drawn on the Original panel (keeps it clean).
 
         # Pending start point (first click placed, waiting for end)
         if pending_click[0] is not None:
@@ -479,11 +473,46 @@ def show_preprocessing_preview(video_path, initial_params=None):
         elif pending_click[0] is not None:
             _put_text(canvas, "Click trail END point ...", sb_x + 14, trail_y, TRAIL_PENDING, 0.30)
             trail_y += 14
+
+        thumb_pad_x = 10  # horizontal padding inside sidebar for thumbnails
+        thumb_w = sidebar_w - 2 * thumb_pad_x
+        crop_pad = 40  # padding around trail bbox in source pixels
         for ti, tr in enumerate(marked_trails):
-            _put_text(canvas, f"#{ti+1}", sb_x + 14, trail_y + 2, TRAIL_MARK, 0.30, 1)
-            info_str = f"L={tr['length']:.0f}  br={tr['avg_brightness']:.1f}  c={tr['contrast_ratio']:.2f}"
-            _put_text(canvas, info_str, sb_x + 38, trail_y + 2, TEXT_DIM, 0.26)
-            trail_y += 14
+            # Compute padded crop region in source coordinates
+            t_x0 = min(tr['start'][0], tr['end'][0]) - crop_pad
+            t_y0 = min(tr['start'][1], tr['end'][1]) - crop_pad
+            t_x1 = max(tr['start'][0], tr['end'][0]) + crop_pad
+            t_y1 = max(tr['start'][1], tr['end'][1]) + crop_pad
+            t_x0 = max(0, t_x0)
+            t_y0 = max(0, t_y0)
+            t_x1 = min(src_w, t_x1)
+            t_y1 = min(src_h, t_y1)
+            crop_w = t_x1 - t_x0
+            crop_h = t_y1 - t_y0
+            if crop_w > 0 and crop_h > 0:
+                crop = frm[t_y0:t_y1, t_x0:t_x1]
+                # Scale to sidebar width, preserving aspect ratio
+                thumb_h = max(1, int(thumb_w * crop_h / crop_w))
+                thumb_h = min(thumb_h, 120)  # cap height
+                thumb = cv2.resize(crop, (thumb_w, thumb_h))
+
+                # Draw trail line on thumbnail
+                ts_x = int((tr['start'][0] - t_x0) / crop_w * thumb_w)
+                ts_y = int((tr['start'][1] - t_y0) / crop_h * thumb_h)
+                te_x = int((tr['end'][0] - t_x0) / crop_w * thumb_w)
+                te_y = int((tr['end'][1] - t_y0) / crop_h * thumb_h)
+                cv2.line(thumb, (ts_x, ts_y), (te_x, te_y), TRAIL_MARK, 1, cv2.LINE_AA)
+
+                # Place thumbnail on canvas
+                tx = sb_x + thumb_pad_x
+                if trail_y + thumb_h + 18 < canvas_h - status_bar_h:
+                    # Label above thumbnail
+                    info_str = f"#{ti+1}  L={tr['length']:.0f}  br={tr['avg_brightness']:.1f}  c={tr['contrast_ratio']:.2f}"
+                    _put_text(canvas, info_str, tx, trail_y + 10, TRAIL_MARK, 0.26)
+                    trail_y += 14
+                    canvas[trail_y:trail_y + thumb_h, tx:tx + thumb_w] = thumb
+                    _draw_border(canvas, tx, trail_y, thumb_w, thumb_h, TRAIL_MARK)
+                    trail_y += thumb_h + 6
         trail_y += 6
 
         # ── Controls help ─────────────────────────────────────────
