@@ -221,6 +221,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
     # Matched-filter cache — the SNR map only depends on the frame, not on
     # the threshold slider, so we recompute it only when the frame changes.
     mf_cache = {'frame_idx': -1, 'snr_map': None}
+    mf_lines_cache = {'frame_idx': -1, 'snr_thresh': -1, 'lines': []}
 
     # Temporal reference cache — built from surrounding frames when the user
     # navigates to a new frame.  Much slower to compute than the MF cache
@@ -228,6 +229,36 @@ def show_preprocessing_preview(video_path, initial_params=None):
     # when the frame changes.
     _TEMPORAL_N = 15  # Frames to each side for temporal median (total = 2N+1)
     temporal_ref_cache = {'frame_idx': -1, 'diff_image': None, 'noise_map': None}
+
+    # ── Pre-computed MF kernel bank ──────────────────────────────────
+    # 72 angles × 3 kernel lengths = 216 kernels.  Pure geometry that
+    # never changes, so we build them once at startup instead of on
+    # every frame.
+    import math as _math_kb
+    _mf_kernel_bank = []
+    for _klen in [15, 31, 51]:
+        for _i in range(72):
+            _angle_deg = _i * 180.0 / 72
+            _ksize = _klen if _klen % 2 == 1 else _klen + 1
+            _center = _ksize // 2
+            _rad = _math_kb.radians(_angle_deg)
+            _cos_a, _sin_a = _math_kb.cos(_rad), _math_kb.sin(_rad)
+
+            _yc, _xc = np.mgrid[:_ksize, :_ksize]
+            _dx = (_xc - _center).astype(np.float32)
+            _dy = (_yc - _center).astype(np.float32)
+            _perp = np.abs(-_sin_a * _dx + _cos_a * _dy)
+            _along = np.abs(_cos_a * _dx + _sin_a * _dy)
+
+            _kern = np.exp(-0.5 * _perp ** 2).astype(np.float32)
+            _kern[_along > _center] = 0
+            _ksum = np.sum(_kern)
+            if _ksum > 0:
+                _kern /= _ksum
+
+            _noise_factor = float(np.sqrt(np.sum(_kern ** 2)))
+            _mf_kernel_bank.append((_kern, _noise_factor))
+    _mf_kernel_bank = tuple(_mf_kernel_bank)  # freeze
 
     # ── Window setup ─────────────────────────────────────────────────
     window_name = "Mnemosky  -  Preprocessing Preview"
@@ -333,8 +364,6 @@ def show_preprocessing_preview(video_path, initial_params=None):
         Returns:
             snr_map at full resolution (float32 array, same size as gray_frm)
         """
-        import math as _math
-
         h, w = gray_frm.shape
 
         # Downsample at 2/3 resolution (matches detector, good detail)
@@ -368,47 +397,20 @@ def show_preprocessing_preview(video_path, initial_params=None):
             noise_map_small = None
             use_noise_map = False
 
-        # Multi-scale directional filter bank
-        # 72 angles (2.5° steps), 3 kernel lengths, Gaussian cross-section.
-        # Scale-corrected SNR: noise_factor = sqrt(sum(kernel²)) accounts
-        # for the per-kernel noise reduction so SNR values are comparable
-        # across scales.
-        num_angles = 72
-        kernel_lengths = [15, 31, 51]
+        # Multi-scale directional filter bank — uses pre-computed kernel bank
+        # (216 kernels built once at startup).
         best_snr = np.zeros_like(signal)
 
-        for klen in kernel_lengths:
-            for i in range(num_angles):
-                angle_deg = i * 180.0 / num_angles
+        for kern, noise_factor in _mf_kernel_bank:
+            response = cv2.filter2D(signal, cv2.CV_32F, kern)
 
-                # Gaussian-profile kernel (vectorised, no raster aliasing)
-                ksize = klen if klen % 2 == 1 else klen + 1
-                center = ksize // 2
-                rad = _math.radians(angle_deg)
-                cos_a, sin_a = _math.cos(rad), _math.sin(rad)
+            if use_noise_map:
+                snr = response / (noise_map_small * noise_factor + 1e-10)
+            else:
+                snr = response / (noise_std * noise_factor + 1e-10)
 
-                yc, xc = np.mgrid[:ksize, :ksize]
-                dx = (xc - center).astype(np.float32)
-                dy = (yc - center).astype(np.float32)
-                perp = np.abs(-sin_a * dx + cos_a * dy)
-                along = np.abs(cos_a * dx + sin_a * dy)
-
-                kern = np.exp(-0.5 * perp ** 2).astype(np.float32)  # sigma_perp=1.0
-                kern[along > center] = 0
-                ksum = np.sum(kern)
-                if ksum > 0:
-                    kern /= ksum
-
-                noise_factor = np.sqrt(np.sum(kern ** 2))
-                response = cv2.filter2D(signal, cv2.CV_32F, kern)
-
-                if use_noise_map:
-                    snr = response / (noise_map_small * noise_factor + 1e-10)
-                else:
-                    snr = response / (noise_std * noise_factor + 1e-10)
-
-                better = snr > best_snr
-                best_snr[better] = snr[better]
+            better = snr > best_snr
+            best_snr[better] = snr[better]
 
         # Scale back to full resolution
         return cv2.resize(best_snr, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -421,7 +423,15 @@ def show_preprocessing_preview(video_path, initial_params=None):
         return mf_cache['snr_map']
 
     def extract_mf_lines(snr_map, snr_thresh):
-        """Threshold the SNR map and extract candidate line segments."""
+        """Threshold the SNR map and extract candidate line segments.
+
+        Results are cached by (frame_idx, snr_thresh) — the Hough transform
+        and morphology only re-run when either value changes.
+        """
+        if (mf_lines_cache['frame_idx'] == current_frame_idx and
+                mf_lines_cache['snr_thresh'] == snr_thresh):
+            return mf_lines_cache['lines']
+
         h, w = snr_map.shape
         # Work at half resolution for Hough (matches detector behaviour)
         scale = 0.5
@@ -441,6 +451,10 @@ def show_preprocessing_preview(video_path, initial_params=None):
                 x1, y1, x2, y2 = ln[0]
                 scaled.append((int(x1 * inv), int(y1 * inv),
                                int(x2 * inv), int(y2 * inv)))
+
+        mf_lines_cache['frame_idx'] = current_frame_idx
+        mf_lines_cache['snr_thresh'] = snr_thresh
+        mf_lines_cache['lines'] = scaled
         return scaled
 
     # ── Trail analysis helper ─────────────────────────────────────────
@@ -556,25 +570,20 @@ def show_preprocessing_preview(video_path, initial_params=None):
         below_thresh = has_signal & (snr_resized < snr_thresh)
         above_thresh = snr_resized >= snr_thresh
 
-        # Intensity ramp for sub-threshold pixels
-        if np.any(below_thresh):
-            intensity_below = np.clip(snr_resized / snr_thresh, 0, 1)
-            for c in range(3):
-                channel = mf_bgr[:, :, c].astype(np.float32)
-                channel[below_thresh] = (
-                    BG_PANEL[c] + (ACCENT_MF_DIM[c] - BG_PANEL[c]) * intensity_below[below_thresh]
-                )
-                mf_bgr[:, :, c] = np.clip(channel, 0, 255).astype(np.uint8)
+        # Vectorized heatmap rendering (no per-channel Python loops)
+        _bg = np.array(BG_PANEL, dtype=np.float32)
+        _dim = np.array(ACCENT_MF_DIM, dtype=np.float32)
+        _bright = np.array(ACCENT_MF, dtype=np.float32)
 
-        # Bright above-threshold pixels
+        if np.any(below_thresh):
+            intensity_below = np.clip(snr_resized[below_thresh] / snr_thresh, 0, 1)
+            blend = _bg + (_dim - _bg) * intensity_below[:, np.newaxis]
+            mf_bgr[below_thresh] = np.clip(blend, 0, 255).astype(np.uint8)
+
         if np.any(above_thresh):
-            intensity_above = np.clip(snr_resized / (snr_thresh * 3), 0.25, 1)
-            for c in range(3):
-                channel = mf_bgr[:, :, c].astype(np.float32)
-                channel[above_thresh] = (
-                    ACCENT_MF_DIM[c] + (ACCENT_MF[c] - ACCENT_MF_DIM[c]) * intensity_above[above_thresh]
-                )
-                mf_bgr[:, :, c] = np.clip(channel, 0, 255).astype(np.uint8)
+            intensity_above = np.clip(snr_resized[above_thresh] / (snr_thresh * 3), 0.25, 1)
+            blend = _dim + (_bright - _dim) * intensity_above[:, np.newaxis]
+            mf_bgr[above_thresh] = np.clip(blend, 0, 255).astype(np.uint8)
 
         # Overlay detected line segments from the matched filter
         mf_lines = extract_mf_lines(snr_map, snr_thresh)
@@ -868,6 +877,14 @@ def show_preprocessing_preview(video_path, initial_params=None):
 
     first_render = True
 
+    # ── Dirty-flag state tracking ────────────────────────────────────
+    # Only recompute expensive operations when inputs actually change.
+    # Near-zero CPU when the user is idle (just cv2.waitKey).
+    _prev_preproc_key = None   # (clahe_clip, clahe_tile, blur_k, blur_sigma, canny_low, canny_high, frame_idx)
+    _prev_display_key = None   # (preproc_key, mf_snr, pending_click_state, mouse_if_pending, num_trails)
+    _cached_gray = _cached_enhanced = _cached_blurred = _cached_edges = None
+    _cached_display = None
+
     # ── Main loop ────────────────────────────────────────────────────
     while True:
         # Check if Frame slider was dragged to a new position
@@ -878,14 +895,46 @@ def show_preprocessing_preview(video_path, initial_params=None):
             if ret:
                 frame = new_frame
 
-        gray, enhanced, blurred, edges = apply_preprocessing(frame, params)
-        display = create_display(frame, gray, enhanced, blurred, edges, params)
+        # Build dirty-flag keys
+        preproc_key = (
+            params['clahe_clip_limit'], params['clahe_tile_size'],
+            params['blur_kernel_size'], params['blur_sigma'],
+            params['canny_low'], params['canny_high'],
+            current_frame_idx,
+        )
 
-        cv2.imshow(window_name, display)
+        # Include mouse position only when rubber-band is active
+        _pending_state = pending_click[0]
+        _mouse_for_key = (mouse_pos[0], mouse_pos[1]) if _pending_state is not None else None
+        display_key = (
+            preproc_key,
+            params['mf_snr_threshold'],
+            _pending_state,
+            _mouse_for_key,
+            len(marked_trails),
+        )
 
-        if first_render:
-            cv2.resizeWindow(window_name, canvas_w, canvas_h)
-            first_render = False
+        needs_preproc = (preproc_key != _prev_preproc_key)
+        needs_display = (display_key != _prev_display_key)
+
+        if needs_preproc:
+            _cached_gray, _cached_enhanced, _cached_blurred, _cached_edges = (
+                apply_preprocessing(frame, params)
+            )
+            _prev_preproc_key = preproc_key
+
+        if needs_display or first_render:
+            _cached_display = create_display(
+                frame, _cached_gray, _cached_enhanced,
+                _cached_blurred, _cached_edges, params
+            )
+            _prev_display_key = display_key
+
+            cv2.imshow(window_name, _cached_display)
+
+            if first_render:
+                cv2.resizeWindow(window_name, canvas_w, canvas_h)
+                first_render = False
 
         key = cv2.waitKey(30) & 0xFF
 
@@ -936,7 +985,10 @@ def show_preprocessing_preview(video_path, initial_params=None):
             marked_trails.clear()
             pending_click[0] = None
             mf_cache['frame_idx'] = -1  # Invalidate MF cache
+            mf_lines_cache['frame_idx'] = -1  # Invalidate MF lines cache
             temporal_ref_cache['frame_idx'] = -1  # Invalidate temporal cache
+            _prev_preproc_key = None  # Force full recompute
+            _prev_display_key = None
             print("Parameters reset to defaults. Trail marks cleared.")
 
         elif key == ord('u') or key == ord('U'):  # Undo last trail / cancel pending
