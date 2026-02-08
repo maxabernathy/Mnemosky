@@ -44,9 +44,10 @@ def show_preprocessing_preview(video_path, initial_params=None):
 
     Uses a sleek dark-grey GUI with minimal fluorescent accent highlights.
     All controls — including custom-drawn sliders — live inside the single
-    main window.  The layout is a 2x2 panel grid (Original, CLAHE,
-    MF Response, Edges) with a parameter sidebar containing interactive
-    sliders on the right, and a status bar at the bottom.
+    main window.  Two-row layout: top row has Original at native video
+    resolution (or scaled to fit) with a parameter sidebar on the right;
+    bottom row has CLAHE, MF Response, and Edges panels side-by-side.
+    Status bar with frame slider at the bottom.
 
     The MF Response panel shows the directional matched-filter SNR heatmap
     — a warm-toned intensity map revealing dim linear features that Canny
@@ -180,22 +181,28 @@ def show_preprocessing_preview(video_path, initial_params=None):
         except Exception:
             pass
 
-    # ── Layout constants (derived from screen size) ──────────────────
-    target_win_w = int(_screen_w * 0.92)
-    target_win_h = int(_screen_h * 0.88)
-    sidebar_w = max(280, min(380, int(target_win_w * 0.18)))
+    # ── Layout constants (two-row design) ────────────────────────────
+    sidebar_w = max(280, min(380, int(_screen_w * 0.18)))
     status_bar_h = 56               # Taller to hold the wide frame slider
     gap = 2
-    content_w = target_win_w - sidebar_w
-    content_h = target_win_h - status_bar_h
-    # Original panel: large, full left column
-    orig_w = int(content_w * 0.58)
-    orig_h = content_h
-    # Processing panels: stacked vertically in the right column
-    small_w = content_w - orig_w - gap
-    small_h = (content_h - 2 * gap) // 3
-    canvas_w = orig_w + gap + small_w + sidebar_w
-    canvas_h = content_h + status_bar_h
+    # Top row: Original at native video resolution + sidebar
+    orig_w = src_w
+    orig_h = src_h
+    # Scale Original down if it would exceed available screen space
+    _max_orig_w = _screen_w - sidebar_w - 40  # horizontal margin
+    # Vertical budget: screen height minus bottom row (30% of orig_h),
+    # status bar, gap, and 60px for title bar + taskbar
+    _max_orig_h = int((_screen_h - status_bar_h - gap - 60) / 1.3)
+    _fit_scale = min(1.0, _max_orig_w / orig_w, _max_orig_h / orig_h)
+    if _fit_scale < 1.0:
+        orig_w = int(orig_w * _fit_scale)
+        orig_h = int(orig_h * _fit_scale)
+    # Bottom row: 3 panels side-by-side (CLAHE, MF Response, Edges)
+    bottom_h = int(orig_h * 0.3)    # 30% of Original panel height
+    small_w = (orig_w - 2 * gap) // 3
+    small_h = bottom_h
+    canvas_w = orig_w + sidebar_w
+    canvas_h = orig_h + gap + bottom_h + status_bar_h
     slider_row_h = 52           # Height per slider row
     slider_pad_x = 20           # Horizontal padding inside sidebar
     slider_track_h = 5          # Track bar height
@@ -228,7 +235,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
     # navigates to a new frame.  Much slower to compute than the MF cache
     # (requires reading N frames from disk), so it's done lazily and only
     # when the frame changes.
-    _TEMPORAL_N = 15  # Frames to each side for temporal median (total = 2N+1)
+    _TEMPORAL_N = 5   # Frames to each side for temporal median (total = 2N+1)
     temporal_ref_cache = {'frame_idx': -1, 'diff_image': None, 'noise_map': None}
 
     # ── Pre-computed MF kernel bank ──────────────────────────────────
@@ -367,8 +374,8 @@ def show_preprocessing_preview(video_path, initial_params=None):
         """
         h, w = gray_frm.shape
 
-        # Downsample at 2/3 resolution (matches detector, good detail)
-        scale = 2.0 / 3.0
+        # Downsample at 1/2 resolution for faster filter2D calls
+        scale = 0.5
         sm_w, sm_h = int(w * scale), int(h * scale)
 
         # Try temporal reference first (strictly superior to spatial median)
@@ -382,8 +389,8 @@ def show_preprocessing_preview(video_path, initial_params=None):
             noise_std = float(np.median(noise_map_small))
             if noise_std < 0.5:
                 noise_std = 0.5
-            # Suppress faint noise — only meaningful signal survives
-            min_signal = 2.0 * noise_map_small
+            # Suppress faint noise — 3σ floor (standard detection threshold)
+            min_signal = 3.0 * noise_map_small
             signal[signal < min_signal] = 0
             use_noise_map = True
         else:
@@ -398,8 +405,8 @@ def show_preprocessing_preview(video_path, initial_params=None):
             median_val = np.median(flat)
             mad = np.median(np.abs(flat - median_val))
             noise_std = max(0.5, mad * 1.4826)
-            # Suppress faint noise — only meaningful signal survives
-            min_signal = 2.0 * noise_std
+            # Suppress faint noise — 3σ floor (standard detection threshold)
+            min_signal = 3.0 * noise_std
             signal[signal < min_signal] = 0
             noise_map_small = None
             use_noise_map = False
@@ -590,13 +597,14 @@ def show_preprocessing_preview(video_path, initial_params=None):
         canvas[:] = BG_DARK
 
         # ── Panels ───────────────────────────────────────────────────
-        # Original: large left column.  Processing panels: stacked right.
-        orig_small = cv2.resize(frm, (orig_w, orig_h))
+        # Top row: Original at native (or fitted) resolution
+        # Bottom row: CLAHE, MF Response, Edges side-by-side
+        orig_panel = cv2.resize(frm, (orig_w, orig_h))
 
         enh_resized = cv2.resize(enhanced, (small_w, small_h))
         enh_bgr = cv2.cvtColor(enh_resized, cv2.COLOR_GRAY2BGR)
 
-        # ── Matched-filter response heatmap (replaces old Blur panel) ──
+        # ── Matched-filter response heatmap ─────────────────────────
         snr_thresh = p['mf_snr_threshold'] / 10.0
         snr_map = get_mf_snr_map(gray, current_frame_idx)
         snr_resized = cv2.resize(snr_map, (small_w, small_h),
@@ -607,7 +615,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
         mf_bgr[:] = BG_PANEL
 
         # Dim sub-threshold signal (subtle visibility so user sees the landscape)
-        has_signal = snr_resized > 1.5
+        has_signal = snr_resized > 2.0
         below_thresh = has_signal & (snr_resized < snr_thresh)
         above_thresh = snr_resized >= snr_thresh
 
@@ -641,12 +649,13 @@ def show_preprocessing_preview(video_path, initial_params=None):
         edge_bgr[:] = BG_PANEL
         edge_bgr[edge_gray_r > 0] = ACCENT_CYAN
 
-        sx = orig_w + gap  # x-offset for right column
+        # Place panels — top row: Original; bottom row: 3 panels side-by-side
+        bot_y = orig_h + gap
         for px, py, pw, ph, panel in [
-            (0,  0,                          orig_w,  orig_h,  orig_small),
-            (sx, 0,                          small_w, small_h, enh_bgr),
-            (sx, small_h + gap,              small_w, small_h, mf_bgr),
-            (sx, 2 * (small_h + gap),        small_w, small_h, edge_bgr),
+            (0,  0,                              orig_w,  orig_h,  orig_panel),
+            (0,  bot_y,                          small_w, small_h, enh_bgr),
+            (small_w + gap, bot_y,               small_w, small_h, mf_bgr),
+            (2 * (small_w + gap), bot_y,         small_w, small_h, edge_bgr),
         ]:
             canvas[py:py + ph, px:px + pw] = panel
             _draw_border(canvas, px, py, pw, ph, BORDER)
@@ -675,7 +684,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
         _draw_tag(canvas, "ORIGINAL" + trail_count_str, tag_x, tag_y, BG_DARK, TEXT_DIM if not trail_count_str else TRAIL_MARK)
         clip_val = p['clahe_clip_limit'] / 10.0
         _draw_tag(canvas, f"CLAHE  clip {clip_val:.1f}  tile {p['clahe_tile_size']}",
-                  sx + tag_x, tag_y, BG_DARK, ACCENT)
+                  tag_x, bot_y + tag_y, BG_DARK, ACCENT)
         mf_snr_val = p['mf_snr_threshold'] / 10.0
         mf_line_count = len(mf_lines)
         is_temporal = temporal_ref_cache['diff_image'] is not None
@@ -684,12 +693,12 @@ def show_preprocessing_preview(video_path, initial_params=None):
         if mf_line_count > 0:
             mf_tag += f"  [{mf_line_count}]"
         _draw_tag(canvas, mf_tag,
-                  sx + tag_x, small_h + gap + tag_y, BG_DARK, ACCENT_MF)
+                  small_w + gap + tag_x, bot_y + tag_y, BG_DARK, ACCENT_MF)
         _draw_tag(canvas, f"EDGES  {p['canny_low']}-{p['canny_high']}",
-                  sx + tag_x, 2 * (small_h + gap) + tag_y, BG_DARK, ACCENT_CYAN)
+                  2 * (small_w + gap) + tag_x, bot_y + tag_y, BG_DARK, ACCENT_CYAN)
 
         # ── Sidebar ──────────────────────────────────────────────────
-        sb_x = orig_w + gap + small_w
+        sb_x = orig_w
         _fill_rect(canvas, sb_x, 0, sidebar_w, canvas_h - status_bar_h, BG_SIDEBAR)
         _draw_border(canvas, sb_x, 0, sidebar_w, canvas_h - status_bar_h, BORDER)
 
@@ -899,7 +908,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
     print("Use the Frame slider to find a frame with satellite trail signal.")
     print("Then adjust other sliders to tune preprocessing parameters.")
     print("The goal is to preserve dim satellite trails while reducing noise.")
-    print("The MF RESPONSE panel (bottom-left) shows the directional matched")
+    print("The MF RESPONSE panel (bottom-centre) shows the directional matched")
     print("filter heatmap — tune MF SNR to control dim-trail sensitivity.")
     print("\nTrail marking  (up to 3 examples):")
     print("  Click on the ORIGINAL panel to set the START of a trail,")
