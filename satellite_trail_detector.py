@@ -552,7 +552,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
         mf_bgr[:] = BG_PANEL
 
         # Dim sub-threshold signal (subtle visibility so user sees the landscape)
-        has_signal = snr_resized > 0.5
+        has_signal = snr_resized > 1.5
         below_thresh = has_signal & (snr_resized < snr_thresh)
         above_thresh = snr_resized >= snr_thresh
 
@@ -568,7 +568,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
 
         # Bright above-threshold pixels
         if np.any(above_thresh):
-            intensity_above = np.clip(snr_resized / (snr_thresh * 3), 0.5, 1)
+            intensity_above = np.clip(snr_resized / (snr_thresh * 3), 0.25, 1)
             for c in range(3):
                 channel = mf_bgr[:, :, c].astype(np.float32)
                 channel[above_thresh] = (
