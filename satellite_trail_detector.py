@@ -222,6 +222,13 @@ def show_preprocessing_preview(video_path, initial_params=None):
     # the threshold slider, so we recompute it only when the frame changes.
     mf_cache = {'frame_idx': -1, 'snr_map': None}
 
+    # Temporal reference cache — built from surrounding frames when the user
+    # navigates to a new frame.  Much slower to compute than the MF cache
+    # (requires reading N frames from disk), so it's done lazily and only
+    # when the frame changes.
+    _TEMPORAL_N = 15  # Frames to each side for temporal median (total = 2N+1)
+    temporal_ref_cache = {'frame_idx': -1, 'diff_image': None, 'noise_map': None}
+
     # ── Window setup ─────────────────────────────────────────────────
     window_name = "Mnemosky  -  Preprocessing Preview"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -266,14 +273,62 @@ def show_preprocessing_preview(video_path, initial_params=None):
         edges = cv2.Canny(blurred, canny_low, canny_high)
         return gray, enhanced, blurred, edges
 
+    # ── Temporal reference computation ──────────────────────────────────
+
+    def build_temporal_reference(target_idx, gray_target):
+        """Load surrounding frames and build temporal median reference.
+
+        Reads up to 2×_TEMPORAL_N frames around target_idx from the video,
+        computes per-pixel temporal median, and returns the difference image
+        (target − reference) plus a per-pixel noise map.  Stars and fixed
+        pattern noise are removed from the difference image.
+
+        The result is cached so repeated calls for the same frame are free.
+        """
+        if temporal_ref_cache['frame_idx'] == target_idx:
+            return temporal_ref_cache['diff_image'], temporal_ref_cache['noise_map']
+
+        buf = TemporalFrameBuffer(capacity=2 * _TEMPORAL_N + 1)
+
+        # Determine range of frames to read
+        lo = max(0, target_idx - _TEMPORAL_N)
+        hi = min(total_frames - 1, target_idx + _TEMPORAL_N)
+
+        saved_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, lo)
+
+        for idx in range(lo, hi + 1):
+            ok, frm = cap.read()
+            if not ok:
+                break
+            buf.add(cv2.cvtColor(frm, cv2.COLOR_BGR2GRAY))
+
+        # Restore video position
+        cap.set(cv2.CAP_PROP_POS_FRAMES, saved_pos)
+
+        if buf.is_ready():
+            ctx = buf.get_temporal_context(gray_target)
+            temporal_ref_cache['diff_image'] = ctx['diff_image']
+            temporal_ref_cache['noise_map'] = ctx['noise_map']
+        else:
+            temporal_ref_cache['diff_image'] = None
+            temporal_ref_cache['noise_map'] = None
+
+        temporal_ref_cache['frame_idx'] = target_idx
+        return temporal_ref_cache['diff_image'], temporal_ref_cache['noise_map']
+
     # ── Matched-filter response computation ────────────────────────────
 
     def compute_mf_response(gray_frm):
-        """Compute the directional matched-filter SNR map for a grayscale frame.
+        """Compute the multi-scale directional matched-filter SNR map.
 
-        Runs the same pipeline as _detect_dim_lines_matched_filter in the
-        detector class: background subtraction → directional filter bank →
-        MAD noise estimation → SNR map.  The result is cached per frame.
+        When temporal reference is available (built from surrounding frames),
+        uses the temporal difference image instead of spatial median — stars,
+        sky gradients, and vignetting are removed perfectly, and the per-pixel
+        noise map gives spatially adaptive thresholding.
+
+        Falls back to spatial median background subtraction when temporal
+        reference is not yet available (e.g. first frame or too few frames).
 
         Returns:
             snr_map at full resolution (float32 array, same size as gray_frm)
@@ -282,53 +337,81 @@ def show_preprocessing_preview(video_path, initial_params=None):
 
         h, w = gray_frm.shape
 
-        # Downsample for performance
-        scale = 0.5
-        small = cv2.resize(gray_frm, (int(w * scale), int(h * scale)),
-                           interpolation=cv2.INTER_AREA)
+        # Downsample at 2/3 resolution (matches detector, good detail)
+        scale = 2.0 / 3.0
+        sm_w, sm_h = int(w * scale), int(h * scale)
 
-        # Background subtraction
-        bg = cv2.medianBlur(small, 31)
-        signal = small.astype(np.float32) - bg.astype(np.float32)
-        signal = np.clip(signal, 0, None)
+        # Try temporal reference first (strictly superior to spatial median)
+        diff_img, noise_map = build_temporal_reference(current_frame_idx, gray_frm)
 
-        # MAD noise estimation
-        flat = signal.ravel()
-        median_val = np.median(flat)
-        mad = np.median(np.abs(flat - median_val))
-        noise_std = max(0.5, mad * 1.4826)
+        if diff_img is not None and noise_map is not None:
+            signal = cv2.resize(diff_img, (sm_w, sm_h),
+                                interpolation=cv2.INTER_AREA)
+            noise_map_small = cv2.resize(noise_map, (sm_w, sm_h),
+                                         interpolation=cv2.INTER_LINEAR)
+            noise_std = float(np.median(noise_map_small))
+            if noise_std < 0.5:
+                noise_std = 0.5
+            use_noise_map = True
+        else:
+            # Fallback: spatial median background subtraction
+            small = cv2.resize(gray_frm, (sm_w, sm_h),
+                               interpolation=cv2.INTER_AREA)
+            bg = cv2.medianBlur(small, 31)
+            signal = small.astype(np.float32) - bg.astype(np.float32)
+            signal = np.clip(signal, 0, None)
 
-        # Directional filter bank (36 angles, 5° steps)
-        num_angles = 36
-        kernel_length = 31
-        best_response = np.zeros_like(signal)
+            flat = signal.ravel()
+            median_val = np.median(flat)
+            mad = np.median(np.abs(flat - median_val))
+            noise_std = max(0.5, mad * 1.4826)
+            noise_map_small = None
+            use_noise_map = False
 
-        for i in range(num_angles):
-            angle_deg = i * 180.0 / num_angles
-            # Build oriented averaging kernel (same logic as the detector)
-            ksize = kernel_length  # already odd
-            kern = np.zeros((ksize, ksize), dtype=np.float32)
-            center = ksize // 2
-            rad = _math.radians(angle_deg)
-            cos_a, sin_a = _math.cos(rad), _math.sin(rad)
-            for j in range(-center, center + 1):
-                px = int(round(center + j * cos_a))
-                py = int(round(center + j * sin_a))
-                if 0 <= px < ksize and 0 <= py < ksize:
-                    kern[py, px] = 1.0
-            ksum = np.sum(kern)
-            if ksum > 0:
-                kern /= ksum
+        # Multi-scale directional filter bank
+        # 72 angles (2.5° steps), 3 kernel lengths, Gaussian cross-section.
+        # Scale-corrected SNR: noise_factor = sqrt(sum(kernel²)) accounts
+        # for the per-kernel noise reduction so SNR values are comparable
+        # across scales.
+        num_angles = 72
+        kernel_lengths = [15, 31, 51]
+        best_snr = np.zeros_like(signal)
 
-            response = cv2.filter2D(signal, cv2.CV_32F, kern)
-            better = response > best_response
-            best_response[better] = response[better]
+        for klen in kernel_lengths:
+            for i in range(num_angles):
+                angle_deg = i * 180.0 / num_angles
 
-        # SNR map
-        snr_map = best_response / noise_std
+                # Gaussian-profile kernel (vectorised, no raster aliasing)
+                ksize = klen if klen % 2 == 1 else klen + 1
+                center = ksize // 2
+                rad = _math.radians(angle_deg)
+                cos_a, sin_a = _math.cos(rad), _math.sin(rad)
+
+                yc, xc = np.mgrid[:ksize, :ksize]
+                dx = (xc - center).astype(np.float32)
+                dy = (yc - center).astype(np.float32)
+                perp = np.abs(-sin_a * dx + cos_a * dy)
+                along = np.abs(cos_a * dx + sin_a * dy)
+
+                kern = np.exp(-0.5 * perp ** 2).astype(np.float32)  # sigma_perp=1.0
+                kern[along > center] = 0
+                ksum = np.sum(kern)
+                if ksum > 0:
+                    kern /= ksum
+
+                noise_factor = np.sqrt(np.sum(kern ** 2))
+                response = cv2.filter2D(signal, cv2.CV_32F, kern)
+
+                if use_noise_map:
+                    snr = response / (noise_map_small * noise_factor + 1e-10)
+                else:
+                    snr = response / (noise_std * noise_factor + 1e-10)
+
+                better = snr > best_snr
+                best_snr[better] = snr[better]
 
         # Scale back to full resolution
-        return cv2.resize(snr_map, (w, h), interpolation=cv2.INTER_LINEAR)
+        return cv2.resize(best_snr, (w, h), interpolation=cv2.INTER_LINEAR)
 
     def get_mf_snr_map(gray_frm, frame_idx):
         """Return the cached MF SNR map, recomputing only when frame changes."""
@@ -545,7 +628,9 @@ def show_preprocessing_preview(video_path, initial_params=None):
                   sx + tag_x, tag_y, BG_DARK, ACCENT)
         mf_snr_val = p['mf_snr_threshold'] / 10.0
         mf_line_count = len(mf_lines)
-        mf_tag = f"MF RESPONSE  SNR>={mf_snr_val:.1f}"
+        is_temporal = temporal_ref_cache['diff_image'] is not None
+        mf_mode = "TEMPORAL" if is_temporal else "SPATIAL"
+        mf_tag = f"MF {mf_mode}  SNR>={mf_snr_val:.1f}"
         if mf_line_count > 0:
             mf_tag += f"  [{mf_line_count}]"
         _draw_tag(canvas, mf_tag,
@@ -851,6 +936,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
             marked_trails.clear()
             pending_click[0] = None
             mf_cache['frame_idx'] = -1  # Invalidate MF cache
+            temporal_ref_cache['frame_idx'] = -1  # Invalidate temporal cache
             print("Parameters reset to defaults. Trail marks cleared.")
 
         elif key == ord('u') or key == ord('U'):  # Undo last trail / cancel pending
@@ -891,6 +977,109 @@ def show_preprocessing_preview(video_path, initial_params=None):
 
     cap.release()
     return None
+
+
+class TemporalFrameBuffer:
+    """Rolling buffer of grayscale frames for temporal background estimation.
+
+    With long-exposure astrophotography (e.g. 13 s per frame), persistent
+    objects (stars, sky glow, vignetting, hot pixels) appear in every frame
+    while transient events (satellite/airplane trails, meteors, cosmic rays)
+    appear in only one or two.  The per-pixel *temporal median* of N
+    surrounding frames is a near-perfect background model that removes all
+    persistent structure, leaving only transients in the difference image.
+
+    This is the same principle used by professional sky surveys (ZTF, LSST)
+    for transient detection, adapted here for video.
+
+    Usage::
+
+        buf = TemporalFrameBuffer(capacity=21)
+        for frame in frames:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            buf.add(gray)
+            if buf.is_ready():
+                ctx = buf.get_temporal_context(gray)
+                # ctx['diff_image'], ctx['noise_map'], ctx['reference']
+    """
+
+    def __init__(self, capacity=21):
+        """
+        Args:
+            capacity: Number of frames to keep in the buffer.  Should be odd
+                so the current frame sits at the centre.  Larger values give
+                cleaner backgrounds but use more RAM (~4 MB per 1080p frame).
+                21 frames ≈ 84 MB for 1080p — a reasonable default.
+        """
+        self.capacity = capacity
+        self._frames = []           # List of uint8 grayscale arrays
+        self._reference = None      # Cached temporal median (uint8)
+        self._noise_map = None      # Cached per-pixel MAD noise (float32)
+        self._dirty = True          # True if buffer changed since last compute
+
+    def add(self, gray_frame):
+        """Add a grayscale frame to the buffer, evicting the oldest if full."""
+        self._frames.append(gray_frame)
+        if len(self._frames) > self.capacity:
+            self._frames.pop(0)
+        self._dirty = True
+
+    def is_ready(self):
+        """True once the buffer has at least 5 frames for a meaningful median."""
+        return len(self._frames) >= 5
+
+    @property
+    def count(self):
+        return len(self._frames)
+
+    def _compute(self):
+        """Compute temporal median and noise map from the current buffer."""
+        if not self._dirty:
+            return
+
+        # Stack frames into a 3D array: (N, H, W)
+        stack = np.stack(self._frames, axis=0).astype(np.float32)
+
+        # Per-pixel temporal median — stars and fixed pattern noise vanish
+        self._reference = np.median(stack, axis=0)
+
+        # Per-pixel MAD (Median Absolute Deviation) → robust noise estimate
+        # MAD is unaffected by the transient trail pixels (outliers)
+        abs_dev = np.abs(stack - self._reference[np.newaxis, :, :])
+        mad = np.median(abs_dev, axis=0)
+        self._noise_map = (mad * 1.4826).astype(np.float32)  # Gaussian σ equiv
+        # Floor at 0.5 to avoid division by zero in SNR calculations
+        self._noise_map = np.maximum(self._noise_map, 0.5)
+
+        self._dirty = False
+
+    def get_temporal_context(self, current_gray):
+        """Build a temporal context dict for the current frame.
+
+        Args:
+            current_gray: The grayscale frame to subtract from the reference.
+
+        Returns:
+            Dict with keys:
+                'diff_image': float32 background-subtracted image (≥ 0).
+                    Stars, sky gradients, vignetting removed.  Only transient
+                    features (trails, cosmic rays) remain.
+                'noise_map':  float32 per-pixel noise σ (spatially varying).
+                    Brighter sky regions have higher noise; dark zenith lower.
+                'reference':  float32 temporal median reference frame.
+                'buffer_depth': int, how many frames contributed.
+        """
+        self._compute()
+
+        diff = current_gray.astype(np.float32) - self._reference
+        diff = np.clip(diff, 0, None)
+
+        return {
+            'diff_image': diff,
+            'noise_map': self._noise_map,
+            'reference': self._reference,
+            'buffer_depth': len(self._frames),
+        }
 
 
 class BaseDetectionAlgorithm(ABC):
@@ -1470,18 +1659,22 @@ class SatelliteTrailDetector:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _create_matched_filter_kernel(length, angle_deg):
-        """Create an oriented averaging kernel for directional line detection.
+    def _create_matched_filter_kernel(length, angle_deg, sigma_perp=1.0):
+        """Create a Gaussian-profile oriented line kernel.
 
-        The kernel is a normalized line of 1s at the given angle through the
-        center of a (length × length) grid.  When convolved with a
-        background-subtracted image the response equals the average brightness
-        along a line segment of that length at that orientation — the optimal
-        matched filter for a straight line in additive Gaussian noise.
+        Uses an analytic Gaussian cross-section perpendicular to the line
+        direction — no integer-rasterisation artifacts, consistent effective
+        width at every orientation.  The along-line weight is uniform.
+
+        This matches real trail PSFs better than a 1-pixel-wide rasterised
+        line and produces orientation-independent filter responses.
 
         Args:
             length: Kernel side length (will be rounded up to odd)
             angle_deg: Line orientation in degrees (0 = horizontal)
+            sigma_perp: Gaussian width (std dev) perpendicular to the line.
+                Controls the effective trail width sensitivity.
+                1.0 ≈ 2.4 px FWHM (good for typical satellite trails).
 
         Returns:
             Normalized float32 kernel array
@@ -1489,28 +1682,34 @@ class SatelliteTrailDetector:
         import math
 
         ksize = length if length % 2 == 1 else length + 1
-        kernel = np.zeros((ksize, ksize), dtype=np.float32)
-
         center = ksize // 2
         rad = math.radians(angle_deg)
         cos_a = math.cos(rad)
         sin_a = math.sin(rad)
 
-        for i in range(-center, center + 1):
-            px = int(round(center + i * cos_a))
-            py = int(round(center + i * sin_a))
-            if 0 <= px < ksize and 0 <= py < ksize:
-                kernel[py, px] = 1.0
+        # Vectorised computation — no per-pixel loop
+        y_coords, x_coords = np.mgrid[:ksize, :ksize]
+        dx = (x_coords - center).astype(np.float32)
+        dy = (y_coords - center).astype(np.float32)
 
-        # Normalize by the number of unique lit pixels (not loop iterations,
-        # since diagonal angles cause multiple i values to map to the same pixel)
+        # Perpendicular distance to the line through the centre
+        perp_dist = np.abs(-sin_a * dx + cos_a * dy)
+        # Distance along the line from the centre
+        along_dist = np.abs(cos_a * dx + sin_a * dy)
+
+        # Gaussian profile perpendicular, uniform along the line
+        kernel = np.exp(-0.5 * (perp_dist / sigma_perp) ** 2).astype(np.float32)
+        # Zero out beyond the half-length
+        kernel[along_dist > center] = 0
+
         kernel_sum = np.sum(kernel)
         if kernel_sum > 0:
             kernel /= kernel_sum
 
         return kernel
 
-    def _detect_dim_lines_matched_filter(self, gray_frame, existing_lines=None):
+    def _detect_dim_lines_matched_filter(self, gray_frame, existing_lines=None,
+                                         temporal_context=None):
         """Supplementary line detection using directional matched filtering.
 
         Detects dim linear features that Canny + Hough miss by directly
@@ -1518,6 +1717,12 @@ class SatelliteTrailDetector:
         image.  A bank of oriented averaging kernels at 5-degree steps is
         applied and the maximum filter response at each pixel is compared
         against a statistical noise threshold (SNR-based).
+
+        When a temporal_context is provided (from TemporalFrameBuffer), it
+        replaces the spatial median background subtraction with the far
+        superior temporal median difference image.  Stars, vignetting, and
+        sky gradients are removed perfectly, and the per-pixel noise map
+        gives spatially adaptive thresholding for free.
 
         The matched filter is the theoretically optimal linear detector for
         a known signal shape (straight line) in additive Gaussian noise,
@@ -1527,6 +1732,11 @@ class SatelliteTrailDetector:
             gray_frame: Original grayscale frame (not CLAHE-enhanced)
             existing_lines: Lines already found by primary Hough detection,
                 used to suppress duplicate detections.  HoughLinesP format.
+            temporal_context: Optional dict from TemporalFrameBuffer with keys
+                'diff_image' (float32), 'noise_map' (float32).  When provided,
+                the spatial median background subtraction and MAD noise
+                estimation are skipped — the temporal versions are strictly
+                superior.
 
         Returns:
             Additional lines in HoughLinesP format [[[x1, y1, x2, y2]], ...],
@@ -1536,50 +1746,86 @@ class SatelliteTrailDetector:
 
         h, w = gray_frame.shape
 
-        # --- Downsample for performance (half resolution) ---
-        scale = 0.5
+        # --- Downsample for performance (2/3 resolution) ---
+        scale = 2.0 / 3.0
         small_w, small_h = int(w * scale), int(h * scale)
-        small = cv2.resize(gray_frame, (small_w, small_h),
-                           interpolation=cv2.INTER_AREA)
 
-        # --- Background subtraction using large-kernel median ---
-        # Removes sky gradients, light pollution, vignetting so only
-        # local brightness deviations (trails) remain.
-        bg_kernel = 31  # Must be odd
-        bg = cv2.medianBlur(small, bg_kernel)
-        signal = small.astype(np.float32) - bg.astype(np.float32)
-        signal = np.clip(signal, 0, None)
+        if temporal_context is not None:
+            # ── Temporal mode: use pre-computed difference image + noise map
+            # The temporal median has already removed stars, sky gradients,
+            # vignetting, and consistent hot pixels.  The difference image
+            # contains only transient features (trails, cosmic rays, noise).
+            diff_full = temporal_context['diff_image']
+            noise_full = temporal_context['noise_map']
+            signal = cv2.resize(diff_full, (small_w, small_h),
+                                interpolation=cv2.INTER_AREA)
+            noise_map_small = cv2.resize(noise_full, (small_w, small_h),
+                                         interpolation=cv2.INTER_LINEAR)
+            # For the scalar noise path below, use median of the noise map
+            noise_std = float(np.median(noise_map_small))
+            if noise_std < 0.5:
+                noise_std = 0.5
+            use_noise_map = True
+        else:
+            # ── Spatial mode: original single-frame background subtraction
+            small = cv2.resize(gray_frame, (small_w, small_h),
+                               interpolation=cv2.INTER_AREA)
 
-        # --- Noise estimation using Median Absolute Deviation (MAD) ---
-        # MAD is robust: signal pixels don't inflate the noise estimate
-        # the way standard deviation would.
-        flat = signal.ravel()
-        median_val = np.median(flat)
-        mad = np.median(np.abs(flat - median_val))
-        noise_std = mad * 1.4826  # Scale factor for Gaussian equivalence
-        if noise_std < 0.5:
-            noise_std = 0.5
+            # Background subtraction using large-kernel median
+            bg_kernel = 31  # Must be odd
+            bg = cv2.medianBlur(small, bg_kernel)
+            signal = small.astype(np.float32) - bg.astype(np.float32)
+            signal = np.clip(signal, 0, None)
 
-        # --- Directional matched filter bank ---
-        num_angles = 36   # 5-degree angular resolution
-        kernel_length = 31  # ~5.6× SNR improvement (sqrt(31))
+            # MAD noise estimation (single value for entire frame)
+            flat = signal.ravel()
+            median_val = np.median(flat)
+            mad = np.median(np.abs(flat - median_val))
+            noise_std = mad * 1.4826
+            if noise_std < 0.5:
+                noise_std = 0.5
+            noise_map_small = None
+            use_noise_map = False
 
-        best_response = np.zeros_like(signal)
+        # --- Multi-scale directional matched filter bank ---
+        # Multiple kernel lengths catch both short bright fragments and
+        # long dim trails.  72 angles (2.5° steps) for fine angular
+        # resolution.  Gaussian-profile kernels avoid rasterisation
+        # aliasing.  Scale-corrected SNR ensures consistent thresholding
+        # across kernel sizes.
+        num_angles = 72   # 2.5-degree angular resolution
+        kernel_lengths = [21, 41, 61]  # Multi-scale: ~4.6×, 6.4×, 7.8× SNR
+
+        best_snr = np.zeros_like(signal)
         best_angle = np.zeros_like(signal)
 
-        for i in range(num_angles):
-            angle_deg = i * 180.0 / num_angles
-            kernel = self._create_matched_filter_kernel(kernel_length, angle_deg)
-            response = cv2.filter2D(signal, cv2.CV_32F, kernel)
+        for klen in kernel_lengths:
+            for i in range(num_angles):
+                angle_deg = i * 180.0 / num_angles
+                kernel = self._create_matched_filter_kernel(klen, angle_deg)
 
-            better = response > best_response
-            best_response[better] = response[better]
-            best_angle[better] = angle_deg
+                # Noise factor for this kernel: filtered noise std =
+                # noise_std * sqrt(sum(kernel²)).  Pre-compute once.
+                noise_factor = np.sqrt(np.sum(kernel ** 2))
+
+                response = cv2.filter2D(signal, cv2.CV_32F, kernel)
+
+                if use_noise_map:
+                    # Per-pixel SNR: filter the noise map through the same
+                    # kernel to get the local filtered noise std at each pixel.
+                    # For a mean-normalised kernel, σ_out² = σ_in² · Σ(k²).
+                    snr = response / (noise_map_small * noise_factor + 1e-10)
+                else:
+                    # Scalar noise: same SNR formula as before
+                    snr = response / (noise_std * noise_factor + 1e-10)
+
+                better = snr > best_snr
+                best_snr[better] = snr[better]
+                best_angle[better] = angle_deg
 
         # --- SNR-based thresholding ---
-        snr_map = best_response / noise_std
         snr_threshold = self.params.get('mf_snr_threshold', 2.5)
-        significant = (snr_map > snr_threshold).astype(np.uint8) * 255
+        significant = (best_snr > snr_threshold).astype(np.uint8) * 255
 
         # Light morphological cleanup
         cleanup_kernel = np.ones((3, 3), np.uint8)
@@ -1712,6 +1958,331 @@ class SatelliteTrailDetector:
             bg_std = 0.5
 
         return (trail_mean - bg_mean) / bg_std
+
+    # ------------------------------------------------------------------
+    #  Post-detection enrichment: Streak photometry, curvature, velocity
+    # ------------------------------------------------------------------
+
+    def _analyze_streak_photometry(self, gray_frame, line):
+        """Extract the brightness profile along a trail and classify its lightcurve.
+
+        With 13-second exposures, the brightness along a satellite trail encodes
+        the object's lightcurve during the pass:
+
+        - **Steady brightness** → stabilised satellite or debris
+        - **Periodic sinusoidal modulation** → tumbling object
+          (period_pixels / trail_length × exposure_time = tumble period)
+        - **Discrete bright/dark segments** → specular flash (Iridium-like)
+        - **Sharp ~1 Hz pulses** → airplane strobe lights
+
+        The analysis uses FFT to find the dominant periodicity and its strength
+        relative to the DC component (the mean brightness).
+
+        Args:
+            gray_frame: Grayscale frame
+            line: Line in HoughLinesP format [[x1, y1, x2, y2]]
+
+        Returns:
+            Dict with photometry results, or None if trail too short::
+
+                {
+                    'profile': np.array,       # raw brightness samples
+                    'profile_detrended': np.array,  # mean-subtracted
+                    'mean_brightness': float,
+                    'std_brightness': float,
+                    'dominant_period_px': float or None,  # pixels per cycle
+                    'periodicity_strength': float,  # 0-1, ratio of peak FFT power to total
+                    'num_cycles': float,       # how many full cycles fit in the trail
+                    'classification': str,     # 'steady', 'tumbling', 'flashing', 'strobing'
+                }
+        """
+        x1, y1, x2, y2 = line[0]
+        length = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        if length < 30:
+            return None
+
+        # Dense sampling: every 2 pixels along the trail
+        n_samples = max(20, int(length / 2))
+        n_samples = min(n_samples, 500)
+
+        h, w = gray_frame.shape
+        samples = []
+        for i in range(n_samples):
+            t = i / (n_samples - 1) if n_samples > 1 else 0
+            px = int(round(x1 + t * (x2 - x1)))
+            py = int(round(y1 + t * (y2 - y1)))
+            if 0 <= px < w and 0 <= py < h:
+                # Average 3×3 neighbourhood to reduce single-pixel noise
+                y_lo = max(0, py - 1)
+                y_hi = min(h, py + 2)
+                x_lo = max(0, px - 1)
+                x_hi = min(w, px + 2)
+                samples.append(float(np.mean(gray_frame[y_lo:y_hi, x_lo:x_hi])))
+
+        if len(samples) < 20:
+            return None
+
+        profile = np.array(samples, dtype=np.float64)
+        mean_br = np.mean(profile)
+        std_br = np.std(profile)
+
+        # Detrend: subtract the mean so FFT focuses on oscillation
+        detrended = profile - mean_br
+
+        # FFT analysis for periodicity
+        n = len(detrended)
+        fft_vals = np.fft.rfft(detrended)
+        power = np.abs(fft_vals) ** 2
+        # Ignore DC (index 0) and very low frequencies (index 1)
+        if len(power) > 2:
+            power_no_dc = power[2:]
+            total_power = np.sum(power_no_dc)
+            if total_power > 0:
+                peak_idx = np.argmax(power_no_dc) + 2  # offset by 2 for skipped bins
+                peak_power = power[peak_idx]
+                periodicity_strength = peak_power / (total_power + 1e-10)
+                # Period in pixels: n_samples / frequency_index
+                # Frequency index maps to (peak_idx / n) cycles per sample
+                # Period in samples = n / peak_idx
+                period_samples = n / peak_idx if peak_idx > 0 else None
+                # Convert from samples to pixels
+                px_per_sample = length / n_samples
+                dominant_period_px = period_samples * px_per_sample if period_samples else None
+                num_cycles = length / dominant_period_px if dominant_period_px and dominant_period_px > 0 else 0
+            else:
+                periodicity_strength = 0.0
+                dominant_period_px = None
+                num_cycles = 0
+        else:
+            periodicity_strength = 0.0
+            dominant_period_px = None
+            num_cycles = 0
+
+        # Classify the lightcurve pattern
+        variation_coeff = std_br / (mean_br + 1e-5)
+
+        if variation_coeff < 0.10:
+            classification = 'steady'
+        elif periodicity_strength > 0.25 and num_cycles >= 2:
+            # Check if the modulation is smooth (tumbling) or sharp (strobing)
+            # Sharp strobe pulses produce many harmonics; smooth sinusoidal
+            # concentrates power in one frequency.
+            if periodicity_strength > 0.5:
+                classification = 'tumbling'   # strong single frequency → sinusoidal
+            else:
+                classification = 'strobing'   # weaker peak → sharp pulses with harmonics
+        elif variation_coeff > 0.30 and periodicity_strength < 0.15:
+            classification = 'flashing'   # irregular brightness changes (specular flash)
+        elif periodicity_strength > 0.15 and num_cycles >= 1.5:
+            classification = 'tumbling'
+        else:
+            classification = 'steady'
+
+        return {
+            'profile': profile,
+            'profile_detrended': detrended,
+            'mean_brightness': mean_br,
+            'std_brightness': std_br,
+            'dominant_period_px': dominant_period_px,
+            'periodicity_strength': periodicity_strength,
+            'num_cycles': num_cycles,
+            'classification': classification,
+        }
+
+    def _fit_trail_curvature(self, gray_frame, line, diff_image=None):
+        """Fit a quadratic to the trail and measure curvature.
+
+        In a long exposure, LEO satellites trace a measurable arc due to
+        Earth's curvature and orbital mechanics.  Fitting y = ax² + bx + c
+        (in the trail's local coordinate system) gives a curvature value |a|
+        that is proportional to 1/altitude.
+
+        - High curvature → low orbit (LEO)
+        - Low curvature  → high orbit (MEO/GEO) or airplane (straight-line
+          motion at the scale of the frame)
+
+        The fit is performed on the brightness-weighted ridge of the trail,
+        not just the endpoint geometry, so sub-pixel accuracy is achievable.
+
+        Args:
+            gray_frame: Grayscale frame (or diff_image if available)
+            line: Line in HoughLinesP format [[x1, y1, x2, y2]]
+            diff_image: Optional background-subtracted image (preferred if
+                available, as stars are removed)
+
+        Returns:
+            Dict with curvature results, or None if trail too short::
+
+                {
+                    'curvature': float,       # |a| coefficient of x² term
+                    'residual_rms': float,    # RMS of fit residuals (pixels)
+                    'is_curved': bool,        # True if curvature is significant
+                    'fit_coeffs': (a, b, c),  # quadratic coefficients
+                }
+        """
+        x1, y1, x2, y2 = line[0]
+        length = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        if length < 60:
+            return None
+
+        img = diff_image if diff_image is not None else gray_frame.astype(np.float32)
+        h, w = img.shape[:2]
+
+        # Sample perpendicular brightness profiles to find the ridge
+        # (sub-pixel trail center at each position along the line)
+        n_slices = max(20, int(length / 4))
+        n_slices = min(n_slices, 200)
+
+        dx = (x2 - x1) / length
+        dy = (y2 - y1) / length
+        perp_dx = -dy
+        perp_dy = dx
+        perp_half = 6  # pixels to each side of the trail
+
+        along_coords = []   # t parameter (0 to length)
+        perp_offsets = []    # sub-pixel perpendicular offset from nominal line
+
+        for i in range(n_slices):
+            t = i / (n_slices - 1) if n_slices > 1 else 0
+            cx = x1 + t * (x2 - x1)
+            cy = y1 + t * (y2 - y1)
+
+            # Sample perpendicular profile
+            profile = []
+            offsets = []
+            for j in range(-perp_half, perp_half + 1):
+                sx = int(round(cx + j * perp_dx))
+                sy = int(round(cy + j * perp_dy))
+                if 0 <= sx < w and 0 <= sy < h:
+                    profile.append(img[sy, sx])
+                    offsets.append(j)
+
+            if len(profile) < 5:
+                continue
+
+            profile = np.array(profile, dtype=np.float64)
+            offsets = np.array(offsets, dtype=np.float64)
+
+            # Brightness-weighted centroid gives sub-pixel ridge position
+            profile_shifted = profile - np.min(profile)
+            total = np.sum(profile_shifted)
+            if total > 0:
+                centroid = np.sum(offsets * profile_shifted) / total
+            else:
+                centroid = 0.0
+
+            along_coords.append(t * length)
+            perp_offsets.append(centroid)
+
+        if len(along_coords) < 10:
+            return None
+
+        along = np.array(along_coords)
+        perp = np.array(perp_offsets)
+
+        # Fit quadratic: perp_offset = a*along² + b*along + c
+        # where a is the curvature coefficient
+        coeffs = np.polyfit(along, perp, 2)
+        a, b, c = coeffs
+
+        # Compute residuals
+        fitted = np.polyval(coeffs, along)
+        residuals = perp - fitted
+        residual_rms = np.sqrt(np.mean(residuals ** 2))
+
+        curvature = abs(a)
+
+        # Is the curvature statistically significant?
+        # Compare quadratic fit residuals to linear fit residuals
+        linear_coeffs = np.polyfit(along, perp, 1)
+        linear_fitted = np.polyval(linear_coeffs, along)
+        linear_residual_rms = np.sqrt(np.mean((perp - linear_fitted) ** 2))
+
+        # Curvature is significant if the quadratic fit reduces residuals
+        # by at least 20% compared to the linear fit, and the curvature
+        # causes at least 0.5 pixel deflection over the trail length
+        max_deflection = curvature * (length ** 2) / 4  # peak deflection at midpoint
+        is_curved = (
+            linear_residual_rms > 0.3 and
+            residual_rms < linear_residual_rms * 0.8 and
+            max_deflection > 0.5
+        )
+
+        return {
+            'curvature': curvature,
+            'residual_rms': residual_rms,
+            'is_curved': is_curved,
+            'fit_coeffs': (a, b, c),
+        }
+
+    @staticmethod
+    def _estimate_angular_velocity(trail_length_px, frame_width_px,
+                                   exposure_time=13.0, fov_degrees=None):
+        """Estimate angular velocity from trail length and exposure time.
+
+        If the field of view (FOV) is known, returns degrees/second.
+        Otherwise returns pixels/second (still useful for relative comparison
+        and orbit-class discrimination).
+
+        Typical angular velocities (degrees/second):
+
+        =====================  ==================  ========================
+        Object                 Angular velocity    Trail in 13 s (60° FOV)
+        =====================  ==================  ========================
+        LEO satellite          0.3 – 1.5 °/s       200 – 1000+ px
+        MEO satellite          0.01 – 0.1 °/s      6 – 65 px
+        GEO satellite          ~0 °/s               ~0 px (point)
+        Airplane (high alt)    0.05 – 0.5 °/s       32 – 320 px
+        Meteor                 5 – 70 °/s            full frame+
+        =====================  ==================  ========================
+
+        Args:
+            trail_length_px: Trail length in pixels
+            frame_width_px: Frame width in pixels (for plate scale)
+            exposure_time: Exposure time in seconds (default: 13.0)
+            fov_degrees: Horizontal field of view in degrees (optional).
+                If None, returns velocity in px/s only.
+
+        Returns:
+            Dict with velocity estimates::
+
+                {
+                    'px_per_sec': float,           # pixels / second
+                    'deg_per_sec': float or None,  # degrees / second (if FOV known)
+                    'orbit_class': str,            # 'LEO', 'MEO', 'GEO', 'meteor', 'unknown'
+                }
+        """
+        if exposure_time <= 0:
+            exposure_time = 13.0
+
+        px_per_sec = trail_length_px / exposure_time
+
+        deg_per_sec = None
+        if fov_degrees is not None and frame_width_px > 0:
+            plate_scale = fov_degrees / frame_width_px  # degrees per pixel
+            deg_per_sec = px_per_sec * plate_scale
+
+        # Classify orbit based on angular velocity
+        # Use pixel velocity normalised to 1080p-equivalent for classification
+        # (assumes ~60° FOV for a typical wide-angle setup)
+        norm_px_per_sec = px_per_sec * (1920.0 / max(1, frame_width_px))
+
+        if norm_px_per_sec > 250:
+            orbit_class = 'meteor'      # extremely fast
+        elif norm_px_per_sec > 15:
+            orbit_class = 'LEO'         # fast movers
+        elif norm_px_per_sec > 2:
+            orbit_class = 'MEO'         # slow but visible trail
+        elif norm_px_per_sec > 0.3:
+            orbit_class = 'GEO'         # nearly stationary
+        else:
+            orbit_class = 'unknown'
+
+        return {
+            'px_per_sec': px_per_sec,
+            'deg_per_sec': deg_per_sec,
+            'orbit_class': orbit_class,
+        }
 
     def detect_point_features(self, line, gray_frame, return_debug_info=False):
         """
@@ -2332,7 +2903,8 @@ class SatelliteTrailDetector:
             })
         return results
 
-    def detect_trails(self, frame, debug_info=None):
+    def detect_trails(self, frame, debug_info=None, temporal_context=None,
+                       exposure_time=13.0, fov_degrees=None):
         """
         Detect and classify trails in a frame as satellites or airplanes.
 
@@ -2345,9 +2917,24 @@ class SatelliteTrailDetector:
           2. Supplementary detection via directional matched filtering for very
              dim trails that fall below the Canny edge threshold.
 
+        When a temporal_context is provided (from TemporalFrameBuffer), the
+        supplementary stage uses the temporal difference image instead of
+        spatial median subtraction — dramatically improving SNR for dim trails.
+
+        After detection and merging, each trail is enriched with:
+          - Streak photometry (lightcurve classification)
+          - Trail curvature (orbit altitude proxy)
+          - Angular velocity estimate (orbit class)
+
         Args:
             frame: Input frame
             debug_info: Optional dict to collect debug information
+            temporal_context: Optional dict from TemporalFrameBuffer with
+                'diff_image', 'noise_map', 'reference', 'buffer_depth'.
+            exposure_time: Exposure time per frame in seconds (default 13.0).
+                Used for angular velocity estimation.
+            fov_degrees: Horizontal field of view in degrees (optional).
+                Enables angular velocity in degrees/second.
 
         Returns:
             List of tuples: [('satellite', detection_info), ('airplane', detection_info), ...]
@@ -2359,6 +2946,9 @@ class SatelliteTrailDetector:
                 'avg_brightness': mean brightness along trail
                 'max_brightness': peak brightness along trail
                 'line': (x1, y1, x2, y2) original line endpoints
+                'photometry': dict or None (streak photometry analysis)
+                'curvature': dict or None (trail curvature fit)
+                'velocity': dict or None (angular velocity estimate)
         """
         gray, preprocessed = self.preprocess_frame(frame)
         lines, edges = self.detect_lines(preprocessed)
@@ -2395,7 +2985,10 @@ class SatelliteTrailDetector:
         # Directional matched filtering catches dim linear features that fall
         # below Canny's edge threshold.  Only new (non-duplicate) candidates
         # are returned, so existing primary detections are not affected.
-        supplementary_lines = self._detect_dim_lines_matched_filter(gray, lines)
+        # When temporal_context is available, the matched filter uses the
+        # temporal difference image for dramatically improved SNR.
+        supplementary_lines = self._detect_dim_lines_matched_filter(
+            gray, lines, temporal_context=temporal_context)
         if supplementary_lines is not None:
             for line in supplementary_lines:
                 trail_type, detection_info = self.classify_trail(
@@ -2424,6 +3017,8 @@ class SatelliteTrailDetector:
             debug_info['all_classifications'] = all_classifications
             debug_info['edges'] = edges
             debug_info['gray_frame'] = gray
+            if temporal_context is not None:
+                debug_info['temporal_context'] = temporal_context
 
         # Separate by type for merging
         satellite_infos = [info for t, info in classified_trails if t == 'satellite']
@@ -2456,11 +3051,32 @@ class SatelliteTrailDetector:
         # Merge airplane detections with angle awareness (keeps distinct airplanes separate)
         merged_airplane_infos = self.merge_airplane_detections(airplane_infos)
 
-        # Combine results with type labels
-        results = [('satellite', info) for info in merged_satellite_infos]
-        results.extend([('airplane', info) for info in merged_airplane_infos])
+        # --- Enrich detections with photometry, curvature, velocity ---
+        frame_width = frame.shape[1]
+        diff_img = temporal_context['diff_image'] if temporal_context else None
 
-        return results
+        all_merged = (
+            [('satellite', info) for info in merged_satellite_infos] +
+            [('airplane', info) for info in merged_airplane_infos]
+        )
+        for trail_type, info in all_merged:
+            line_arr = np.array([[info['line'][0], info['line'][1],
+                                  info['line'][2], info['line'][3]]])
+
+            # Streak photometry
+            info['photometry'] = self._analyze_streak_photometry(gray, line_arr)
+
+            # Trail curvature
+            info['curvature'] = self._fit_trail_curvature(
+                gray, line_arr, diff_image=diff_img)
+
+            # Angular velocity
+            info['velocity'] = self._estimate_angular_velocity(
+                info['length'], frame_width,
+                exposure_time=exposure_time,
+                fov_degrees=fov_degrees)
+
+        return all_merged
 
     def draw_dotted_line(self, frame, pt1, pt2, color, thickness):
         """Draw a dotted line between two points."""
@@ -2777,7 +3393,7 @@ class SatelliteTrailDetector:
         return panel
 
 
-def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False):
+def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=21):
     """
     Process video to detect and highlight satellite and airplane trails.
 
@@ -2799,6 +3415,15 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         signal_envelope: Optional dict with signal characteristics from user-marked trail
             examples. Used to dynamically adapt detection thresholds.
         save_dataset: If True, save detections as a YOLO-format ML dataset (default: False)
+        exposure_time: Exposure time per frame in seconds (default: 13.0).
+            Used for angular velocity estimation and streak photometry.
+        fov_degrees: Horizontal field of view in degrees (optional).
+            Enables angular velocity output in degrees/second.
+        temporal_buffer_size: Number of frames in the temporal rolling buffer
+            (default: 21).  The temporal median of this many surrounding frames
+            is used as a reference background — stars, vignetting, and sky
+            gradients are removed perfectly, leaving only transient trails.
+            Set to 0 to disable temporal integration.
     """
     # Validate input
     input_path = Path(input_path)
@@ -2891,6 +3516,20 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     # Initialize detector
     detector = SatelliteTrailDetector(sensitivity, preprocessing_params=preprocessing_params, skip_aspect_ratio_check=skip_aspect_ratio_check, signal_envelope=signal_envelope)
 
+    # ── Temporal frame buffer for background subtraction ──────────
+    # The temporal median of N surrounding frames removes stars, sky
+    # gradients, vignetting, and hot pixels — leaving only transient
+    # features (trails).  This is the single biggest SNR improvement.
+    temporal_buffer = None
+    if temporal_buffer_size >= 5:
+        temporal_buffer = TemporalFrameBuffer(capacity=temporal_buffer_size)
+        print(f"Temporal integration: {temporal_buffer_size}-frame rolling buffer")
+    else:
+        print("Temporal integration: disabled")
+    print(f"Exposure time: {exposure_time}s")
+    if fov_degrees:
+        print(f"Field of view: {fov_degrees}°")
+
     frame_count = 0
     satellites_detected = 0
     airplanes_detected = 0
@@ -2937,9 +3576,22 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         # Start with current frame
         output_frame = frame.copy()
 
+        # ── Feed temporal buffer and build context ────────────────
+        temporal_context = None
+        if temporal_buffer is not None:
+            gray_for_buffer = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            temporal_buffer.add(gray_for_buffer)
+            if temporal_buffer.is_ready():
+                temporal_context = temporal_buffer.get_temporal_context(
+                    gray_for_buffer)
+
         # Detect and classify trails (with debug info if needed)
         debug_info = {} if debug_mode else None
-        detected_trails = detector.detect_trails(frame, debug_info=debug_info)
+        detected_trails = detector.detect_trails(
+            frame, debug_info=debug_info,
+            temporal_context=temporal_context,
+            exposure_time=exposure_time,
+            fov_degrees=fov_degrees)
 
         # Filter trails based on detect_type parameter
         if detect_type == 'satellites':
@@ -2957,6 +3609,22 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
                     satellites_detected += 1
                 elif trail_type == 'airplane':
                     airplanes_detected += 1
+
+                # Log enrichment metadata for this detection
+                _meta_parts = [f"f{frame_count}",
+                               f"{trail_type}",
+                               f"L={detection_info['length']:.0f}px"]
+                vel = detection_info.get('velocity')
+                if vel:
+                    _meta_parts.append(f"{vel['px_per_sec']:.1f}px/s")
+                    _meta_parts.append(vel['orbit_class'])
+                phot = detection_info.get('photometry')
+                if phot:
+                    _meta_parts.append(f"lc={phot['classification']}")
+                curv = detection_info.get('curvature')
+                if curv and curv['is_curved']:
+                    _meta_parts.append(f"curved({curv['curvature']:.2e})")
+                print(f"\r  [{' | '.join(_meta_parts)}]" + " " * 20)
 
                 # Extract the region to freeze (with highlights)
                 x_min, y_min, x_max, y_max = bbox
@@ -3241,6 +3909,29 @@ Notes:
         help='Save detections as a YOLO-format ML dataset (images + labels) alongside the output video'
     )
 
+    parser.add_argument(
+        '--exposure-time',
+        type=float,
+        default=13.0,
+        help='Exposure time per frame in seconds (default: 13.0). Used for angular velocity estimation and streak photometry.'
+    )
+
+    parser.add_argument(
+        '--fov',
+        type=float,
+        default=None,
+        help='Horizontal field of view in degrees (optional). Enables angular velocity in degrees/second.'
+    )
+
+    parser.add_argument(
+        '--temporal-buffer',
+        type=int,
+        default=21,
+        help='Size of the temporal rolling buffer for background subtraction (default: 21). '
+             'The per-pixel temporal median removes stars, sky gradients, and vignetting. '
+             'Set to 0 to disable temporal integration.'
+    )
+
     args = parser.parse_args()
 
     # Handle preprocessing preview if requested
@@ -3267,7 +3958,10 @@ Notes:
         preprocessing_params=preprocessing_params,
         skip_aspect_ratio_check=args.no_aspect_ratio_check,
         signal_envelope=signal_envelope,
-        save_dataset=args.dataset
+        save_dataset=args.dataset,
+        exposure_time=args.exposure_time,
+        fov_degrees=args.fov,
+        temporal_buffer_size=args.temporal_buffer,
     )
 
 
