@@ -33,6 +33,7 @@ import cv2
 import numpy as np
 import argparse
 import sys
+import time
 from pathlib import Path
 from abc import ABC, abstractmethod
 
@@ -231,14 +232,14 @@ def show_preprocessing_preview(video_path, initial_params=None):
     temporal_ref_cache = {'frame_idx': -1, 'diff_image': None, 'noise_map': None}
 
     # ── Pre-computed MF kernel bank ──────────────────────────────────
-    # 72 angles × 3 kernel lengths = 216 kernels.  Pure geometry that
-    # never changes, so we build them once at startup instead of on
-    # every frame.
+    # 36 angles (5-deg steps) × 2 kernel lengths = 72 kernels.
+    # Sufficient angular resolution for the preview heatmap; the actual
+    # detector uses its own 72-angle × 3-scale bank at processing time.
     import math as _math_kb
     _mf_kernel_bank = []
-    for _klen in [15, 31, 51]:
-        for _i in range(72):
-            _angle_deg = _i * 180.0 / 72
+    for _klen in [15, 31]:
+        for _i in range(36):
+            _angle_deg = _i * 180.0 / 36
             _ksize = _klen if _klen % 2 == 1 else _klen + 1
             _center = _ksize // 2
             _rad = _math_kb.radians(_angle_deg)
@@ -381,6 +382,9 @@ def show_preprocessing_preview(video_path, initial_params=None):
             noise_std = float(np.median(noise_map_small))
             if noise_std < 0.5:
                 noise_std = 0.5
+            # Suppress faint noise — only meaningful signal survives
+            min_signal = 2.0 * noise_map_small
+            signal[signal < min_signal] = 0
             use_noise_map = True
         else:
             # Fallback: spatial median background subtraction
@@ -394,13 +398,17 @@ def show_preprocessing_preview(video_path, initial_params=None):
             median_val = np.median(flat)
             mad = np.median(np.abs(flat - median_val))
             noise_std = max(0.5, mad * 1.4826)
+            # Suppress faint noise — only meaningful signal survives
+            min_signal = 2.0 * noise_std
+            signal[signal < min_signal] = 0
             noise_map_small = None
             use_noise_map = False
 
         # Multi-scale directional filter bank — uses pre-computed kernel bank
-        # (216 kernels built once at startup).
+        # (72 kernels: 36 angles × 2 scales, built once at startup).
         best_snr = np.zeros_like(signal)
 
+        t0 = time.perf_counter()
         for kern, noise_factor in _mf_kernel_bank:
             response = cv2.filter2D(signal, cv2.CV_32F, kern)
 
@@ -411,6 +419,8 @@ def show_preprocessing_preview(video_path, initial_params=None):
 
             better = snr > best_snr
             best_snr[better] = snr[better]
+        elapsed = time.perf_counter() - t0
+        print(f"  MF response: {elapsed:.3f}s ({len(_mf_kernel_bank)} kernels)")
 
         # Scale back to full resolution
         return cv2.resize(best_snr, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -427,6 +437,9 @@ def show_preprocessing_preview(video_path, initial_params=None):
 
         Results are cached by (frame_idx, snr_thresh) — the Hough transform
         and morphology only re-run when either value changes.
+
+        Post-filtering: duplicate suppression (distance < 60px AND angle < 15deg)
+        and minimum full-resolution length (60px) to cut false positives.
         """
         if (mf_lines_cache['frame_idx'] == current_frame_idx and
                 mf_lines_cache['snr_thresh'] == snr_thresh):
@@ -442,15 +455,43 @@ def show_preprocessing_preview(video_path, initial_params=None):
         significant = cv2.dilate(significant, cleanup, iterations=1)
         significant = cv2.erode(significant, cleanup, iterations=1)
 
-        lines = cv2.HoughLinesP(significant, 1, np.pi / 180, 10,
-                                minLineLength=15, maxLineGap=30)
+        lines = cv2.HoughLinesP(significant, 1, np.pi / 180, 20,
+                                minLineLength=25, maxLineGap=15)
         inv = 1.0 / scale
-        scaled = []
+        min_full_length = 60  # minimum length at full resolution
+        candidates = []
         if lines is not None:
             for ln in lines:
                 x1, y1, x2, y2 = ln[0]
-                scaled.append((int(x1 * inv), int(y1 * inv),
-                               int(x2 * inv), int(y2 * inv)))
+                fx1, fy1 = int(x1 * inv), int(y1 * inv)
+                fx2, fy2 = int(x2 * inv), int(y2 * inv)
+                length = np.sqrt((fx2 - fx1) ** 2 + (fy2 - fy1) ** 2)
+                if length < min_full_length:
+                    continue
+                angle = np.degrees(np.arctan2(abs(fy2 - fy1), abs(fx2 - fx1)))
+                cx, cy = (fx1 + fx2) / 2.0, (fy1 + fy2) / 2.0
+                candidates.append((fx1, fy1, fx2, fy2, length, angle, cx, cy))
+
+        # Duplicate suppression — merge lines with centers < 60px apart
+        # and angles within 15 degrees, keeping only the longest.
+        candidates.sort(key=lambda c: c[4], reverse=True)  # longest first
+        keep = []
+        for cand in candidates:
+            _, _, _, _, c_len, c_ang, c_cx, c_cy = cand
+            is_dup = False
+            for kept in keep:
+                _, _, _, _, _, k_ang, k_cx, k_cy = kept
+                dist = np.sqrt((c_cx - k_cx) ** 2 + (c_cy - k_cy) ** 2)
+                ang_diff = abs(c_ang - k_ang)
+                if ang_diff > 90:
+                    ang_diff = 180 - ang_diff
+                if dist < 60 and ang_diff < 15:
+                    is_dup = True
+                    break
+            if not is_dup:
+                keep.append(cand)
+
+        scaled = [(c[0], c[1], c[2], c[3]) for c in keep]
 
         mf_lines_cache['frame_idx'] = current_frame_idx
         mf_lines_cache['snr_thresh'] = snr_thresh
