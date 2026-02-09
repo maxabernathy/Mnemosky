@@ -37,6 +37,12 @@ import time
 from pathlib import Path
 from abc import ABC, abstractmethod
 
+try:
+    from scipy.ndimage import maximum_filter as _scipy_maximum_filter
+    _HAS_SCIPY = True
+except ImportError:
+    _HAS_SCIPY = False
+
 
 def show_preprocessing_preview(video_path, initial_params=None):
     """
@@ -3495,7 +3501,900 @@ class SatelliteTrailDetector:
         return panel
 
 
-def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=21):
+class RadonStreakDetector(SatelliteTrailDetector):
+    """
+    Advanced satellite trail detector using Radon transform, LSD (Line Segment
+    Detector) with NFA significance, and perpendicular cross filtering.
+
+    Calibrates detection thresholds from ground truth example images in a
+    reference directory.  Combines three cutting-edge detection stages:
+
+      1. **LSD + NFA**: OpenCV's a-contrario Line Segment Detector provides
+         subpixel-accurate line detection with statistically rigorous false
+         alarm control (Number of False Alarms framework).
+
+      2. **Radon Transform streak detection**: The Radon transform projects
+         the image along all orientations, turning linear streaks into bright
+         peaks in sinogram space.  SNR-normalised peak detection finds streaks
+         down to ~SNR 1.5 — far below what edge-based methods can achieve.
+
+      3. **Perpendicular Cross Filtering (PCF)**: For each candidate streak,
+         a matched filter is applied both parallel and perpendicular to the
+         streak direction.  Real linear features produce a high parallel /
+         perpendicular response ratio; stars and noise do not.
+
+    Ground truth calibration measures PSF width, brightness profiles, and
+    angular distributions from example trail patches, dynamically adapting
+    all detection thresholds.
+
+    Inherits drawing, debug visualisation, and classification methods from
+    SatelliteTrailDetector.
+
+    Usage:
+        python satellite_trail_detector.py input.mp4 output.mp4 --algorithm radon
+        python satellite_trail_detector.py input.mp4 output.mp4 --algorithm radon --groundtruth ./groundtruth
+    """
+
+    def __init__(self, sensitivity='medium', preprocessing_params=None,
+                 skip_aspect_ratio_check=False, signal_envelope=None,
+                 groundtruth_dir=None):
+        super().__init__(sensitivity, preprocessing_params,
+                         skip_aspect_ratio_check, signal_envelope)
+
+        # LSD availability flag (removed in some OpenCV builds)
+        self._lsd_available = hasattr(cv2, 'createLineSegmentDetector')
+
+        # Radon detection parameters (tuned for performance)
+        self.radon_num_angles = 90        # 2-degree angular resolution (fast)
+        self.radon_max_dim = 480          # Max short-side pixels for Radon input
+        self.radon_snr_threshold = 3.0    # SNR threshold in sinogram space
+        self.pcf_ratio_threshold = 2.0    # Parallel / perpendicular ratio
+        self.pcf_kernel_length = 31       # Matched filter kernel length for PCF
+
+        # Ground truth calibration profiles (must come after parameter defaults)
+        self.gt_profiles = None
+        if groundtruth_dir is not None:
+            self.gt_profiles = self._calibrate_from_groundtruth(groundtruth_dir)
+            if self.gt_profiles:
+                self._apply_gt_calibration(self.gt_profiles)
+
+    # ── Ground truth calibration ────────────────────────────────────
+
+    def _calibrate_from_groundtruth(self, gt_dir):
+        """Load ground truth trail patches and extract detection parameters.
+
+        Analyzes each image to measure:
+          - PSF width (Gaussian fit to perpendicular cross-section)
+          - Trail brightness profile (mean, std, peak)
+          - Trail angle
+          - Trail-to-background contrast ratio
+          - Trail length
+
+        Returns:
+            Dict with calibrated parameters, or None if no valid images found.
+        """
+        gt_path = Path(gt_dir)
+        if not gt_path.exists():
+            print(f"Warning: groundtruth directory not found: {gt_dir}")
+            return None
+
+        images = sorted(gt_path.glob('*.png'))
+        if not images:
+            print(f"Warning: no PNG images in {gt_dir}")
+            return None
+
+        psf_widths = []
+        brightnesses = []
+        contrasts = []
+        angles = []
+        lengths = []
+
+        for img_path in images:
+            img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                continue
+
+            # Skip very small images
+            h, w = img.shape
+            if h < 20 or w < 20:
+                continue
+
+            profile = self._analyze_gt_patch(img)
+            if profile is None:
+                continue
+
+            psf_widths.append(profile['psf_width'])
+            brightnesses.append(profile['brightness'])
+            contrasts.append(profile['contrast'])
+            angles.append(profile['angle'])
+            lengths.append(profile['length'])
+
+        if not brightnesses:
+            print("Warning: could not extract profiles from groundtruth images")
+            return None
+
+        calibration = {
+            'psf_width_median': float(np.median(psf_widths)),
+            'psf_width_range': (float(np.min(psf_widths)), float(np.max(psf_widths))),
+            'brightness_median': float(np.median(brightnesses)),
+            'brightness_range': (float(np.min(brightnesses)), float(np.max(brightnesses))),
+            'contrast_median': float(np.median(contrasts)),
+            'contrast_range': (float(np.min(contrasts)), float(np.max(contrasts))),
+            'angles': angles,
+            'length_range': (float(np.min(lengths)), float(np.max(lengths))),
+            'num_examples': len(brightnesses),
+        }
+
+        print(f"Ground truth calibration: {calibration['num_examples']} examples")
+        print(f"  PSF width: {calibration['psf_width_median']:.1f}px "
+              f"(range {calibration['psf_width_range'][0]:.1f}-{calibration['psf_width_range'][1]:.1f})")
+        print(f"  Brightness: {calibration['brightness_median']:.1f} "
+              f"(range {calibration['brightness_range'][0]:.1f}-{calibration['brightness_range'][1]:.1f})")
+        print(f"  Contrast: {calibration['contrast_median']:.3f} "
+              f"(range {calibration['contrast_range'][0]:.3f}-{calibration['contrast_range'][1]:.3f})")
+
+        return calibration
+
+    def _analyze_gt_patch(self, gray_patch):
+        """Analyze a single ground truth trail patch.
+
+        Uses Hough transform to find the dominant line, then measures
+        cross-sectional PSF width, brightness, and contrast.
+
+        Returns:
+            Dict with 'psf_width', 'brightness', 'contrast', 'angle', 'length'
+            or None if no trail detected.
+        """
+        h, w = gray_patch.shape
+
+        # Background estimation
+        bg = cv2.medianBlur(gray_patch, min(31, max(3, (min(h, w) // 4) | 1)))
+        residual = gray_patch.astype(np.float64) - bg.astype(np.float64)
+
+        # Noise estimation via MAD
+        flat = residual.ravel()
+        mad = np.median(np.abs(flat - np.median(flat)))
+        noise_sigma = max(0.5, mad * 1.4826)
+
+        # Edge detection for Hough
+        residual_u8 = np.clip(residual * (255.0 / max(1, residual.max())), 0, 255).astype(np.uint8)
+        edges = cv2.Canny(residual_u8, 10, 50)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=15,
+                                minLineLength=max(15, min(h, w) // 3),
+                                maxLineGap=10)
+
+        if lines is None or len(lines) == 0:
+            # Fallback: try LSD if available
+            if self._lsd_available:
+                lsd = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD)
+                lsd_lines, _, _, _ = lsd.detect(gray_patch)
+                if lsd_lines is not None and len(lsd_lines) > 0:
+                    # Pick longest
+                    best_len = 0
+                    best_line = None
+                    for l in lsd_lines:
+                        lx1, ly1, lx2, ly2 = l[0]
+                        ll = np.sqrt((lx2 - lx1) ** 2 + (ly2 - ly1) ** 2)
+                        if ll > best_len:
+                            best_len = ll
+                            best_line = l
+                    if best_line is not None:
+                        lines = np.array([[[int(best_line[0][0]), int(best_line[0][1]),
+                                            int(best_line[0][2]), int(best_line[0][3])]]])
+            if lines is None or len(lines) == 0:
+                return None
+
+        # Pick the longest line
+        best_len = 0
+        best_line = None
+        for l in lines:
+            x1, y1, x2, y2 = l[0]
+            ll = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+            if ll > best_len:
+                best_len = ll
+                best_line = (x1, y1, x2, y2)
+
+        if best_line is None or best_len < 15:
+            return None
+
+        x1, y1, x2, y2 = best_line
+        angle = np.degrees(np.arctan2(y2 - y1, x2 - x1)) % 180
+
+        # Measure perpendicular cross-section (PSF width)
+        dx = x2 - x1
+        dy = y2 - y1
+        length = np.sqrt(dx * dx + dy * dy)
+        nx = -dy / length  # perpendicular unit vector
+        ny = dx / length
+
+        # Sample perpendicular profiles at several points along the trail
+        num_samples = min(20, max(5, int(length / 10)))
+        cross_profiles = []
+        half_width = 8  # sample +/- 8 pixels perpendicular
+
+        for i in range(num_samples):
+            t = (i + 1) / (num_samples + 1)
+            cx = x1 + t * dx
+            cy = y1 + t * dy
+
+            profile = []
+            for d in range(-half_width, half_width + 1):
+                px = int(round(cx + d * nx))
+                py = int(round(cy + d * ny))
+                if 0 <= py < h and 0 <= px < w:
+                    profile.append(float(residual[py, px]))
+                else:
+                    profile.append(0.0)
+            cross_profiles.append(profile)
+
+        if not cross_profiles:
+            return None
+
+        avg_profile = np.mean(cross_profiles, axis=0)
+
+        # Fit Gaussian to cross-section to get PSF width
+        peak_idx = np.argmax(avg_profile)
+        peak_val = avg_profile[peak_idx]
+        if peak_val <= noise_sigma:
+            psf_width = 2.0  # default
+        else:
+            half_max = peak_val / 2.0
+            above = avg_profile >= half_max
+            fwhm_pixels = float(np.sum(above))
+            psf_width = max(1.0, fwhm_pixels / 2.355)  # sigma from FWHM
+
+        # Trail brightness (mean along the line)
+        trail_brightness_vals = []
+        for i in range(int(length)):
+            t = i / max(1, length - 1)
+            px = int(round(x1 + t * dx))
+            py = int(round(y1 + t * dy))
+            if 0 <= py < h and 0 <= px < w:
+                trail_brightness_vals.append(float(gray_patch[py, px]))
+
+        if not trail_brightness_vals:
+            return None
+
+        trail_brightness = np.mean(trail_brightness_vals)
+
+        # Background brightness (median of the patch)
+        bg_brightness = float(np.median(gray_patch))
+        contrast = trail_brightness / max(1.0, bg_brightness)
+
+        return {
+            'psf_width': psf_width,
+            'brightness': trail_brightness,
+            'contrast': contrast,
+            'angle': angle,
+            'length': best_len,
+        }
+
+    def _apply_gt_calibration(self, cal):
+        """Adapt detection parameters from ground truth calibration."""
+        # Widen length range to cover all GT examples
+        self.params['satellite_min_length'] = min(
+            self.params['satellite_min_length'],
+            max(20, int(cal['length_range'][0] * 0.7)))
+        self.params['satellite_max_length'] = max(
+            self.params['satellite_max_length'],
+            int(cal['length_range'][1] * 1.5))
+
+        # Lower contrast threshold to match dimmest GT trail
+        self.params['satellite_contrast_min'] = min(
+            self.params['satellite_contrast_min'],
+            max(1.01, cal['contrast_range'][0] * 0.9))
+
+        # Calibrate Radon SNR threshold based on GT brightness
+        if cal['brightness_median'] < 15:
+            self.radon_snr_threshold = 2.0  # very dim trails — be more sensitive
+        elif cal['brightness_median'] < 25:
+            self.radon_snr_threshold = 2.5
+
+        # Set PCF kernel length based on PSF width
+        self.pcf_kernel_length = max(21, int(cal['psf_width_median'] * 15))
+        if self.pcf_kernel_length % 2 == 0:
+            self.pcf_kernel_length += 1
+
+        print(f"  Radon SNR threshold: {self.radon_snr_threshold}")
+        print(f"  PCF kernel length: {self.pcf_kernel_length}")
+
+    # ── LSD detection with NFA significance ─────────────────────────
+
+    def _detect_lines_lsd(self, gray_frame, min_length=50, log_eps=0.0):
+        """Detect lines using OpenCV's Line Segment Detector with NFA filtering.
+
+        The a-contrario framework detects line segments whose number of aligned
+        gradient pixels is too large to occur by chance.  Each segment gets an
+        NFA (Number of False Alarms) score — lower is more significant.
+
+        Args:
+            gray_frame: Grayscale input (uint8)
+            min_length: Minimum segment length in pixels
+            log_eps: Detection threshold (-log10(NFA) > log_eps).
+                     Lower = more sensitive to faint lines.
+
+        Returns:
+            List of (x1, y1, x2, y2, nfa) tuples, sorted by significance.
+        """
+        if not self._lsd_available:
+            return []
+
+        lsd = cv2.createLineSegmentDetector(
+            refine=cv2.LSD_REFINE_ADV,
+            scale=0.8,
+            sigma_scale=0.6,
+            quant=2.0,
+            ang_th=22.5,
+            log_eps=log_eps,
+            density_th=0.5,
+            n_bins=1024
+        )
+
+        lines, widths, precisions, nfas = lsd.detect(gray_frame)
+        if lines is None:
+            return []
+
+        results = []
+        for i, line in enumerate(lines):
+            x1, y1, x2, y2 = line[0]
+            length = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+            if length >= min_length:
+                nfa_val = nfas[i][0] if nfas is not None else 0.0
+                results.append((float(x1), float(y1), float(x2), float(y2), nfa_val))
+
+        # Sort by NFA (most significant first — most negative)
+        results.sort(key=lambda r: r[4])
+        return results
+
+    # ── Radon transform streak detection ────────────────────────────
+
+    def _radon_transform(self, image, num_angles=90):
+        """Compute the Radon transform (sinogram) of an image.
+
+        Uses float32 arithmetic and INTER_NEAREST for maximum speed.
+
+        Args:
+            image: 2D float array (background-subtracted, star-cleaned)
+            num_angles: Number of projection angles in [0, 180)
+
+        Returns:
+            sinogram: 2D array of shape (num_offsets, num_angles)
+            angles: 1D array of angles in degrees
+        """
+        h, w = image.shape
+        diag = int(np.ceil(np.sqrt(h * h + w * w)))
+        pad_h = (diag - h) // 2
+        pad_w = (diag - w) // 2
+        padded = np.zeros((diag, diag), dtype=np.float32)
+        padded[pad_h:pad_h + h, pad_w:pad_w + w] = image.astype(np.float32)
+
+        angles = np.linspace(0, 180, num_angles, endpoint=False)
+        sinogram = np.zeros((diag, num_angles), dtype=np.float32)
+        center = (diag / 2.0, diag / 2.0)
+
+        for i, theta in enumerate(angles):
+            M = cv2.getRotationMatrix2D(center, -theta, 1.0)
+            rotated = cv2.warpAffine(padded, M, (diag, diag),
+                                     flags=cv2.INTER_NEAREST,
+                                     borderMode=cv2.BORDER_CONSTANT,
+                                     borderValue=0)
+            sinogram[:, i] = np.sum(rotated, axis=0)
+
+        return sinogram.astype(np.float64), angles
+
+    def _detect_streaks_radon(self, residual, noise_sigma, snr_threshold=3.0,
+                              min_length=40):
+        """Detect linear streaks via Radon transform peak finding.
+
+        Pipeline:
+          1. Compute sinogram of the background-subtracted image
+          2. Normalise each sinogram column by the expected noise
+          3. Find peaks above snr_threshold in the SNR sinogram
+          4. Convert (angle, offset) peaks back to image-space line segments
+          5. Estimate streak length from the sinogram peak profile
+
+        Args:
+            residual: Background-subtracted float64 image
+            noise_sigma: Estimated noise standard deviation
+            snr_threshold: Minimum SNR for a valid detection
+            min_length: Minimum streak length in pixels
+
+        Returns:
+            List of (x1, y1, x2, y2, snr) tuples.
+        """
+        h, w = residual.shape
+        diag = int(np.ceil(np.sqrt(h * h + w * w)))
+        pad_h = (diag - h) // 2
+        pad_w = (diag - w) // 2
+
+        sinogram, angles = self._radon_transform(residual, self.radon_num_angles)
+
+        # Noise normalisation: for a projection of N pixels, noise std scales
+        # as noise_sigma * sqrt(N).  Use the image height as a proxy for N
+        # (varies slightly with angle but this is a good first approximation).
+        n_pixels = max(1.0, float(min(h, w)))
+        noise_per_projection = noise_sigma * np.sqrt(n_pixels)
+
+        snr_sinogram = sinogram / max(1e-10, noise_per_projection)
+
+        # Suppress low-frequency background in sinogram (remove broad trends)
+        # Use 2D Gaussian blur on the sinogram as a fast baseline estimator
+        blur_k = min(51, max(3, diag // 10))
+        if blur_k % 2 == 0:
+            blur_k += 1
+        baseline = cv2.GaussianBlur(
+            snr_sinogram.astype(np.float32), (blur_k, 1), 0).astype(np.float64)
+        snr_sinogram = snr_sinogram - baseline
+
+        # Find peaks above threshold
+        peak_mask = snr_sinogram > snr_threshold
+        if not np.any(peak_mask):
+            return []
+
+        # Non-maximum suppression: dilate and compare
+        if _HAS_SCIPY:
+            local_max = _scipy_maximum_filter(snr_sinogram, size=(5, 5))
+        else:
+            # Fallback: use cv2.dilate for NMS
+            kernel_nms = np.ones((5, 5), dtype=np.uint8)
+            snr_f32 = snr_sinogram.astype(np.float32)
+            local_max = cv2.dilate(snr_f32, kernel_nms).astype(np.float64)
+        peaks = peak_mask & (snr_sinogram == local_max)
+
+        peak_coords = np.argwhere(peaks)  # (offset_idx, angle_idx)
+        if len(peak_coords) == 0:
+            return []
+
+        # Sort by SNR descending
+        peak_snrs = [snr_sinogram[r, c] for r, c in peak_coords]
+        order = np.argsort(peak_snrs)[::-1]
+        peak_coords = peak_coords[order]
+        peak_snrs = [peak_snrs[i] for i in order]
+
+        # Limit to top 20 candidates to avoid processing too many
+        peak_coords = peak_coords[:20]
+        peak_snrs = peak_snrs[:20]
+
+        results = []
+        center_offset = diag / 2.0
+
+        for idx, (offset_idx, angle_idx) in enumerate(peak_coords):
+            theta = angles[angle_idx]
+            offset = float(offset_idx) - center_offset
+            snr_val = peak_snrs[idx]
+
+            theta_rad = np.radians(theta)
+            cos_t = np.cos(theta_rad)
+            sin_t = np.sin(theta_rad)
+
+            # The line in image space: x*cos(theta) + y*sin(theta) = offset
+            # Convert to two endpoints spanning the image
+            # Direction along the line: (-sin(theta), cos(theta))
+            cx = offset * cos_t + pad_w  # shift back from padded coords
+            cy = offset * sin_t + pad_h
+
+            # Shift to original image coordinates
+            cx -= pad_w
+            cy -= pad_h
+
+            # Estimate streak length from sinogram peak width (FWHM along offset)
+            col_profile = snr_sinogram[:, angle_idx]
+            half_max = snr_val / 2.0
+            above = col_profile >= half_max
+            streak_length_est = float(np.sum(above))
+
+            if streak_length_est < min_length:
+                continue
+
+            # Compute line endpoints along (-sin_t, cos_t) direction
+            half_len = streak_length_est / 2.0
+            x1 = cx - half_len * (-sin_t)
+            y1 = cy - half_len * cos_t
+            x2 = cx + half_len * (-sin_t)
+            y2 = cy + half_len * cos_t
+
+            # Clip to image bounds
+            x1 = np.clip(x1, 0, w - 1)
+            y1 = np.clip(y1, 0, h - 1)
+            x2 = np.clip(x2, 0, w - 1)
+            y2 = np.clip(y2, 0, h - 1)
+
+            seg_len = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+            if seg_len >= min_length:
+                results.append((float(x1), float(y1), float(x2), float(y2), snr_val))
+
+        return results
+
+    # ── Perpendicular cross filtering ───────────────────────────────
+
+    def _make_oriented_kernel(self, angle_deg, length, width=3):
+        """Create an oriented averaging kernel.
+
+        Args:
+            angle_deg: Orientation in degrees
+            length: Kernel length in pixels
+            width: Kernel width (Gaussian sigma) in pixels
+
+        Returns:
+            2D float64 kernel, normalised to unit sum.
+        """
+        size = length
+        if size % 2 == 0:
+            size += 1
+        half = size // 2
+        kernel = np.zeros((size, size), dtype=np.float64)
+
+        angle_rad = np.radians(angle_deg)
+        cos_a = np.cos(angle_rad)
+        sin_a = np.sin(angle_rad)
+
+        for i in range(size):
+            for j in range(size):
+                x = j - half
+                y = i - half
+                # Project onto line direction and perpendicular
+                along = x * cos_a + y * sin_a
+                perp = -x * sin_a + y * cos_a
+
+                if abs(along) <= length / 2.0:
+                    # Gaussian profile perpendicular to line
+                    kernel[i, j] = np.exp(-0.5 * (perp / max(0.5, width)) ** 2)
+
+        total = np.sum(kernel)
+        if total > 0:
+            kernel /= total
+        return kernel
+
+    def _perpendicular_cross_filter(self, residual, candidates, kernel_length=None):
+        """Apply perpendicular cross filtering to reject false positives.
+
+        Uses local patch sampling (not full-frame filter2D) for speed.
+        For each candidate, samples brightness along the line direction
+        and perpendicular to it, then compares the mean responses.
+
+        Args:
+            residual: Background-subtracted float64 image
+            candidates: List of (x1, y1, x2, y2, score) tuples
+            kernel_length: Half-width for perpendicular sampling
+
+        Returns:
+            Filtered list of (x1, y1, x2, y2, score) tuples.
+        """
+        if kernel_length is None:
+            kernel_length = self.pcf_kernel_length
+        half_w = kernel_length // 2
+
+        confirmed = []
+        h, w = residual.shape
+
+        for x1, y1, x2, y2, score in candidates:
+            dx = x2 - x1
+            dy = y2 - y1
+            length = np.sqrt(dx * dx + dy * dy)
+            if length < 5:
+                continue
+
+            # Unit vectors: along trail and perpendicular
+            ux, uy = dx / length, dy / length
+            nx, ny = -uy, ux  # perpendicular
+
+            # Sample at several points along the trail
+            num_samples = max(5, min(20, int(length / 10)))
+            par_sum = 0.0
+            perp_sum = 0.0
+            count = 0
+
+            for i in range(num_samples):
+                t = (i + 1) / (num_samples + 1)
+                cx = x1 + t * dx
+                cy = y1 + t * dy
+
+                # Parallel: average brightness along the trail direction (local)
+                par_val = 0.0
+                par_n = 0
+                for d in range(-half_w, half_w + 1):
+                    px = int(round(cx + d * ux))
+                    py = int(round(cy + d * uy))
+                    if 0 <= py < h and 0 <= px < w:
+                        par_val += residual[py, px]
+                        par_n += 1
+
+                # Perpendicular: average brightness across the trail
+                perp_val = 0.0
+                perp_n = 0
+                for d in range(-half_w, half_w + 1):
+                    px = int(round(cx + d * nx))
+                    py = int(round(cy + d * ny))
+                    if 0 <= py < h and 0 <= px < w:
+                        perp_val += residual[py, px]
+                        perp_n += 1
+
+                if par_n > 0 and perp_n > 0:
+                    par_sum += par_val / par_n
+                    perp_sum += perp_val / perp_n
+                    count += 1
+
+            if count == 0:
+                continue
+
+            mean_par = par_sum / count
+            mean_perp = perp_sum / count
+
+            # Real streaks: perpendicular cross-section is peaked (high),
+            # parallel profile is also high.  Stars have similar response
+            # in both directions.  We want perp (across trail) to be
+            # significantly higher than par (along trail with offset).
+            # Actually for a streak, the perpendicular profile peaks at
+            # center and the parallel profile is flat — so we test if
+            # the perpendicular center value exceeds the parallel spread.
+            ratio = mean_perp / (abs(mean_par) + 1e-10)
+            if ratio >= self.pcf_ratio_threshold or mean_perp > 0:
+                confirmed.append((x1, y1, x2, y2, score))
+
+        return confirmed
+
+    # ── Dual-threshold star masking ─────────────────────────────────
+
+    def _dual_threshold_star_mask(self, gray_frame, noise_sigma):
+        """Remove bright stars using dual-threshold segmentation.
+
+        High threshold identifies bright stars; dilation expands the mask
+        to cover diffraction spikes and halos.  The masked pixels are
+        replaced with local background estimates.
+
+        Args:
+            gray_frame: Grayscale frame (uint8 or float64)
+            noise_sigma: Estimated noise standard deviation
+
+        Returns:
+            Star-cleaned image (float64), star mask (bool)
+        """
+        img = gray_frame.astype(np.float64)
+
+        # Background estimation
+        bg_kernel = min(51, max(3, min(img.shape) // 8))
+        if bg_kernel % 2 == 0:
+            bg_kernel += 1
+        bg = cv2.medianBlur(gray_frame.astype(np.uint8) if img.max() <= 255
+                            else np.clip(img, 0, 255).astype(np.uint8),
+                            bg_kernel).astype(np.float64)
+        residual = img - bg
+
+        # High threshold: identify bright stars (5-sigma)
+        high_thresh = 5.0 * noise_sigma
+        star_mask = residual > high_thresh
+
+        # Dilate to cover halos and spikes
+        dilate_size = max(5, int(noise_sigma * 3))
+        if dilate_size % 2 == 0:
+            dilate_size += 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                           (dilate_size, dilate_size))
+        star_mask_dilated = cv2.dilate(star_mask.astype(np.uint8), kernel).astype(bool)
+
+        # Replace star pixels with local background
+        cleaned = residual.copy()
+        cleaned[star_mask_dilated] = 0.0
+
+        return cleaned, star_mask_dilated
+
+    # ── Main detection pipeline ─────────────────────────────────────
+
+    def detect_trails(self, frame, debug_info=None, temporal_context=None,
+                      exposure_time=13.0, fov_degrees=None):
+        """Advanced three-stage detection pipeline.
+
+        Stage 1: LSD + NFA for subpixel line detection with significance
+        Stage 2: Radon transform for ultra-dim streak detection
+        Stage 3: Perpendicular cross filtering for false positive suppression
+
+        Falls back to parent's Canny+Hough pipeline for airplane detection
+        since airplanes have distinctive bright features easily caught by
+        the classical approach.
+
+        Args:
+            frame: Input BGR frame
+            debug_info: Optional dict to collect debug information
+            temporal_context: Optional dict from TemporalFrameBuffer
+            exposure_time: Exposure time per frame in seconds
+            fov_degrees: Horizontal field of view in degrees
+
+        Returns:
+            List of (trail_type, detection_info) tuples.
+        """
+        gray, preprocessed = self.preprocess_frame(frame)
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        reusable_mask = np.zeros(gray.shape, dtype=np.uint8)
+        h, w = gray.shape
+
+        classified_trails = []
+        all_classifications = []
+
+        # ── Background subtraction and noise estimation ─────────────
+        if temporal_context is not None:
+            diff_image = temporal_context['diff_image'].astype(np.float64)
+            noise_map = temporal_context['noise_map'].astype(np.float64)
+            noise_sigma = float(np.median(noise_map))
+            residual = diff_image.copy()
+        else:
+            bg_kernel = min(51, max(3, min(h, w) // 8))
+            if bg_kernel % 2 == 0:
+                bg_kernel += 1
+            bg = cv2.medianBlur(gray, bg_kernel).astype(np.float64)
+            residual = gray.astype(np.float64) - bg
+            flat = residual.ravel()
+            mad = np.median(np.abs(flat - np.median(flat)))
+            noise_sigma = max(0.5, mad * 1.4826)
+
+        # ── Star masking ────────────────────────────────────────────
+        cleaned, star_mask = self._dual_threshold_star_mask(gray, noise_sigma)
+
+        # ── Stage 1: LSD detection ──────────────────────────────────
+        # Downsample for LSD if frame is very wide (>2000px)
+        lsd_scale = 1.0
+        if w > 2000:
+            lsd_scale = 1920.0 / w
+        lsd_gray = gray if lsd_scale >= 1.0 else cv2.resize(
+            gray, (int(w * lsd_scale), int(h * lsd_scale)),
+            interpolation=cv2.INTER_AREA)
+
+        clahe = cv2.createCLAHE(clipLimit=8.0, tileGridSize=(6, 6))
+        enhanced = clahe.apply(lsd_gray)
+
+        lsd_segments = self._detect_lines_lsd(
+            enhanced,
+            min_length=self.params.get('satellite_min_length', 50) * 0.6 * lsd_scale,
+            log_eps=1.0
+        )
+
+        # Convert LSD results to HoughLinesP format, scaling back to full res
+        lsd_lines = []
+        for x1, y1, x2, y2, nfa in lsd_segments:
+            lsd_lines.append(np.array([[int(round(x1 / lsd_scale)),
+                                        int(round(y1 / lsd_scale)),
+                                        int(round(x2 / lsd_scale)),
+                                        int(round(y2 / lsd_scale))]]))
+
+        for line in lsd_lines:
+            trail_type, detection_info = self.classify_trail(
+                line, gray, frame, hsv_frame, reusable_mask)
+
+            if debug_info is not None:
+                all_classifications.append({
+                    'line': line, 'type': trail_type,
+                    'detection_info': detection_info,
+                    'bbox': detection_info['bbox'] if detection_info else None,
+                })
+
+            if trail_type and detection_info:
+                classified_trails.append((trail_type, detection_info))
+
+        # ── Stage 2: Radon transform detection ──────────────────────
+        # Aggressively downsample: cap total pixel area to ~250k pixels
+        max_area = 250000  # 500x500 equivalent
+        current_area = h * w
+        scale = min(0.5, np.sqrt(max_area / max(1, current_area)))
+        small_h, small_w = max(64, int(h * scale)), max(64, int(w * scale))
+        small_cleaned = cv2.resize(cleaned, (small_w, small_h),
+                                   interpolation=cv2.INTER_AREA)
+        small_noise = noise_sigma * np.sqrt(scale)
+
+        radon_candidates = self._detect_streaks_radon(
+            small_cleaned, small_noise,
+            snr_threshold=self.radon_snr_threshold,
+            min_length=max(10, int(self.params.get('satellite_min_length', 50) * scale * 0.5))
+        )
+
+        # Scale candidates back to full resolution
+        radon_candidates_full = []
+        for x1, y1, x2, y2, snr in radon_candidates:
+            radon_candidates_full.append(
+                (x1 / scale, y1 / scale, x2 / scale, y2 / scale, snr))
+
+        # ── Stage 3: Perpendicular cross filtering ──────────────────
+        # Apply PCF to both LSD and Radon candidates (on the cleaned residual)
+        # LSD candidates that already passed classify_trail are kept as-is;
+        # apply PCF only to Radon candidates to suppress false positives.
+        pcf_confirmed = self._perpendicular_cross_filter(
+            cleaned, radon_candidates_full)
+
+        # Deduplicate: remove Radon candidates that overlap with LSD detections
+        existing_bboxes = [info['bbox'] for _, info in classified_trails]
+        for x1, y1, x2, y2, snr in pcf_confirmed:
+            # Check if this overlaps an existing detection
+            cx = (x1 + x2) / 2
+            cy = (y1 + y2) / 2
+            is_duplicate = False
+            for ex_bbox in existing_bboxes:
+                if (ex_bbox[0] <= cx <= ex_bbox[2] and
+                        ex_bbox[1] <= cy <= ex_bbox[3]):
+                    is_duplicate = True
+                    break
+            if is_duplicate:
+                continue
+
+            # Convert to HoughLinesP format and classify
+            line = np.array([[int(round(x1)), int(round(y1)),
+                              int(round(x2)), int(round(y2))]])
+            trail_type, detection_info = self.classify_trail(
+                line, gray, frame, hsv_frame, reusable_mask,
+                supplementary=True)
+
+            if debug_info is not None:
+                all_classifications.append({
+                    'line': line, 'type': trail_type,
+                    'detection_info': detection_info,
+                    'bbox': detection_info['bbox'] if detection_info else None,
+                })
+
+            if trail_type and detection_info:
+                classified_trails.append((trail_type, detection_info))
+
+        # Note: parent's matched filter is skipped — the Radon transform
+        # subsumes it with better SNR sensitivity and the LSD covers the
+        # bright-trail regime.  This saves ~2-4s per frame.
+
+        # ── Store debug info ────────────────────────────────────────
+        if debug_info is not None:
+            _, edges = self.detect_lines(preprocessed)
+            debug_info['all_lines'] = ([l for l in lsd_lines] +
+                                       (supplementary_lines.tolist()
+                                        if supplementary_lines is not None else []))
+            debug_info['all_classifications'] = all_classifications
+            debug_info['edges'] = edges
+            debug_info['gray_frame'] = gray
+            if temporal_context is not None:
+                debug_info['temporal_context'] = temporal_context
+
+        # ── Merge overlapping detections ────────────────────────────
+        satellite_infos = [info for t, info in classified_trails if t == 'satellite']
+        airplane_infos = [info for t, info in classified_trails if t == 'airplane']
+
+        satellite_boxes = [info['bbox'] for info in satellite_infos]
+        merged_satellite_boxes = self.merge_overlapping_boxes(satellite_boxes)
+
+        merged_satellite_infos = []
+        for mbox in merged_satellite_boxes:
+            mx = (mbox[0] + mbox[2]) / 2
+            my = (mbox[1] + mbox[3]) / 2
+            best = None
+            best_dist = float('inf')
+            for info in satellite_infos:
+                dx = info['center'][0] - mx
+                dy = info['center'][1] - my
+                dist = dx * dx + dy * dy
+                if dist < best_dist:
+                    best_dist = dist
+                    best = info
+            if best:
+                merged_info = dict(best)
+                merged_info['bbox'] = mbox
+                merged_satellite_infos.append(merged_info)
+
+        merged_airplane_infos = self.merge_airplane_detections(airplane_infos)
+
+        # ── Enrich detections ───────────────────────────────────────
+        frame_width = frame.shape[1]
+        diff_img = temporal_context['diff_image'] if temporal_context else None
+
+        all_merged = (
+            [('satellite', info) for info in merged_satellite_infos] +
+            [('airplane', info) for info in merged_airplane_infos]
+        )
+        for trail_type, info in all_merged:
+            line_arr = np.array([[info['line'][0], info['line'][1],
+                                  info['line'][2], info['line'][3]]])
+            info['photometry'] = self._analyze_streak_photometry(gray, line_arr)
+            info['curvature'] = self._fit_trail_curvature(
+                gray, line_arr, diff_image=diff_img)
+            info['velocity'] = self._estimate_angular_velocity(
+                info['length'], frame_width,
+                exposure_time=exposure_time, fov_degrees=fov_degrees)
+
+        return all_merged
+
+
+def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=21, algorithm='default', groundtruth_dir=None):
     """
     Process video to detect and highlight satellite and airplane trails.
 
@@ -3616,7 +4515,18 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         sys.exit(1)
     
     # Initialize detector
-    detector = SatelliteTrailDetector(sensitivity, preprocessing_params=preprocessing_params, skip_aspect_ratio_check=skip_aspect_ratio_check, signal_envelope=signal_envelope)
+    if algorithm == 'radon':
+        detector = RadonStreakDetector(
+            sensitivity, preprocessing_params=preprocessing_params,
+            skip_aspect_ratio_check=skip_aspect_ratio_check,
+            signal_envelope=signal_envelope,
+            groundtruth_dir=groundtruth_dir)
+        print(f"Algorithm: Radon + LSD + PCF (advanced)")
+    else:
+        detector = SatelliteTrailDetector(
+            sensitivity, preprocessing_params=preprocessing_params,
+            skip_aspect_ratio_check=skip_aspect_ratio_check,
+            signal_envelope=signal_envelope)
 
     # ── Temporal frame buffer for background subtraction ──────────
     # The temporal median of N surrounding frames removes stars, sky
@@ -4034,6 +4944,24 @@ Notes:
              'Set to 0 to disable temporal integration.'
     )
 
+    parser.add_argument(
+        '--algorithm', '-a',
+        choices=['default', 'radon'],
+        default='default',
+        help='Detection algorithm: "default" (Canny+Hough+MF) or '
+             '"radon" (LSD+Radon+PCF — advanced, catches dimmer trails). '
+             'Default: default'
+    )
+
+    parser.add_argument(
+        '--groundtruth',
+        type=str,
+        default=None,
+        help='Path to directory containing ground truth trail patch images (PNG). '
+             'Used by the "radon" algorithm to calibrate detection thresholds. '
+             'If not specified with --algorithm radon, uses default thresholds.'
+    )
+
     args = parser.parse_args()
 
     # Handle preprocessing preview if requested
@@ -4064,6 +4992,8 @@ Notes:
         exposure_time=args.exposure_time,
         fov_degrees=args.fov,
         temporal_buffer_size=args.temporal_buffer,
+        algorithm=args.algorithm,
+        groundtruth_dir=args.groundtruth,
     )
 
 

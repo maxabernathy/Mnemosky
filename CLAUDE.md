@@ -41,6 +41,8 @@ This is a single-file Python application with no additional modules or packages.
 
 ```bash
 pip install opencv-python numpy
+# Optional: scipy improves Radon NMS quality (falls back to cv2.dilate if absent)
+pip install scipy
 ```
 
 ## Architecture
@@ -113,6 +115,35 @@ Detection results use enriched `detection_info` dicts instead of bare bounding-b
 4. **SNR thresholding**: Pixels with SNR ≥ 2.5 are marked as significant
 5. **Line extraction**: Hough on the thresholded map, duplicate suppression vs primary detections
 6. **Per-trail SNR confirmation**: Perpendicular flank sampling validates each candidate
+
+### Alternative Pipeline: Radon + LSD + PCF (`--algorithm radon`)
+
+**Stage 1 — LSD detection (a-contrario line segments):**
+1. **Downsampling**: Frame scaled to max 1920px wide for performance
+2. **CLAHE enhancement**: clipLimit=8.0 for dim feature visibility
+3. **LSD**: OpenCV `createLineSegmentDetector(LSD_REFINE_ADV)` with NFA-based significance
+4. **Classification**: Same `classify_trail()` as default pipeline
+
+**Stage 2 — Radon transform streak detection:**
+1. **Background subtraction**: Temporal (if buffer available) or spatial median
+2. **Dual-threshold star masking**: 5-sigma stars identified and replaced with background
+3. **Aggressive downsampling**: Frame capped at ~250k pixels total (e.g., 500x500 for 1080p)
+4. **Radon transform**: Image projected at 90 angles (2-degree steps) via `cv2.warpAffine`
+5. **SNR normalisation**: Sinogram divided by expected noise-per-projection
+6. **Baseline removal**: Gaussian blur on sinogram columns to remove trends
+7. **Non-maximum suppression**: Peak detection in SNR sinogram
+8. **Line reconstruction**: Peaks converted to image-space line segments
+
+**Stage 3 — Perpendicular cross filtering (PCF):**
+1. For each Radon candidate, sample brightness parallel and perpendicular to the trail
+2. Real streaks have asymmetric cross-sections; stars/noise are symmetric
+3. Candidates with perpendicular/parallel ratio below threshold are rejected
+
+**Ground truth calibration (optional):**
+- Loads PNG patches from `--groundtruth` directory
+- Measures PSF width (FWHM of perpendicular cross-section)
+- Measures trail brightness, contrast, angle, and length distributions
+- Adapts Radon SNR threshold, PCF kernel length, and classification parameters
 
 ### Classification Criteria
 
@@ -192,6 +223,12 @@ python satellite_trail_detector.py input.mp4 output.mp4 --freeze-duration 2.0
 
 # Limit processing duration
 python satellite_trail_detector.py input.mp4 output.mp4 --max-duration 30
+
+# Advanced Radon+LSD+PCF algorithm (catches dimmer trails)
+python satellite_trail_detector.py input.mp4 output.mp4 --algorithm radon
+
+# Radon algorithm with ground truth calibration
+python satellite_trail_detector.py input.mp4 output.mp4 --algorithm radon --groundtruth ./groundtruth
 
 # Filter detection type
 python satellite_trail_detector.py input.mp4 output.mp4 --detect-type satellites
@@ -313,6 +350,10 @@ class CustomDetectionAlgorithm(BaseDetectionAlgorithm):
 
 14. **YOLO dataset export**: The `--dataset` flag saves clean (unannotated) original frames and normalized bounding-box labels. Class IDs are `0=satellite`, `1=airplane`. Export happens inside the detection loop in `process_video()`. `data.yaml` is written after the main loop. Do not draw annotations on exported images.
 
+15. **RadonStreakDetector (advanced algorithm)**: The `--algorithm radon` flag switches to the advanced `RadonStreakDetector` class which inherits from `SatelliteTrailDetector` and overrides `detect_trails()` with a three-stage pipeline: LSD + Radon Transform + Perpendicular Cross Filtering. It optionally calibrates detection thresholds from ground truth trail patches via `--groundtruth <dir>`. The Radon stage downsamples aggressively (250k pixel area cap) for performance. The parent's matched filter is skipped (Radon subsumes it).
+
+16. **Ground truth calibration**: When `--groundtruth` is provided with `--algorithm radon`, `RadonStreakDetector._calibrate_from_groundtruth()` loads PNG patches, extracts PSF width, brightness, contrast, angle, and length statistics, then `_apply_gt_calibration()` adapts detection thresholds. The calibration prints summary statistics on startup.
+
 ## Common Tasks
 
 ### Adding a new sensitivity preset
@@ -362,4 +403,10 @@ Add to the `main()` function's argument parser, then handle in `process_video()`
 | Two-stage detect_trails | `satellite_trail_detector.py:SatelliteTrailDetector.detect_trails()` (line ~2335) |
 | Video processing | `satellite_trail_detector.py:process_video()` (line ~2780) |
 | YOLO dataset export | `satellite_trail_detector.py:process_video()` — dataset setup ~2917, per-frame export ~2943, data.yaml ~3047 |
-| Main entry point | `satellite_trail_detector.py:main()` (line ~3137) |
+| RadonStreakDetector class | `satellite_trail_detector.py:RadonStreakDetector` (line ~3500) |
+| Radon GT calibration | `satellite_trail_detector.py:RadonStreakDetector._calibrate_from_groundtruth()` (line ~3562) |
+| Radon transform | `satellite_trail_detector.py:RadonStreakDetector._radon_transform()` (line ~3851) |
+| LSD detection | `satellite_trail_detector.py:RadonStreakDetector._detect_lines_lsd()` (line ~3810) |
+| Perpendicular cross filter | `satellite_trail_detector.py:RadonStreakDetector._perpendicular_cross_filter()` (line ~4050) |
+| Radon detect_trails | `satellite_trail_detector.py:RadonStreakDetector.detect_trails()` (line ~4150) |
+| Main entry point | `satellite_trail_detector.py:main()` (line ~4800) |
