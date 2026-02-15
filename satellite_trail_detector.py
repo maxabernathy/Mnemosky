@@ -1977,11 +1977,39 @@ class ReviewUI:
 
         # Session stats
         self.stats = {'reviewed': 0, 'accepted': 0, 'rejected': 0,
-                      'reclassified': 0, 'missed': 0}
+                      'reclassified': 0, 'missed': 0,
+                      'param_adjustments': 0, 'learn_runs': 0,
+                      'params_optimized': 0}
+
+        # Toast notification queue: [(text, color, expire_tick)]
+        self._toasts = []
+        self._tick = 0
+
+        # Total pending count for progress tracking
+        self._total_detections = sum(len(dets) for dets in self.detections_by_frame.values())
+        self._frames_with_detections = len(self.detections_by_frame)
+
+        # Frame loading state
+        self._loading_frame = False
 
         self.running = True
         self.help_visible = False
         self.full_frame_mode = False
+
+    def _toast(self, text, color=None, duration=60):
+        """Show a transient notification overlay (duration in ticks, ~30fps)."""
+        if color is None:
+            color = self.ACCENT
+        self._toasts.append((text, color, self._tick + duration))
+
+    def _count_reviewed_frames(self):
+        """Count frames where all detections have been reviewed."""
+        reviewed = 0
+        for im in self.ann_db.data['images']:
+            pending = self.ann_db.get_pending_annotations(im['id'])
+            if not pending:
+                reviewed += 1
+        return reviewed
 
     def _build_review_queue(self):
         """Build frame review queue sorted by minimum confidence."""
@@ -2019,6 +2047,9 @@ class ReviewUI:
             self._navigate_to_frame(0)
 
         while self.running:
+            self._tick += 1
+            # Expire old toasts
+            self._toasts = [(t, c, e) for t, c, e in self._toasts if e > self._tick]
             canvas = self._render()
             cv2.imshow(self.WINDOW_NAME, canvas)
             key = cv2.waitKey(30) & 0xFF
@@ -2033,9 +2064,19 @@ class ReviewUI:
         frame_idx = max(0, min(frame_idx, self.total_frames - 1))
         if frame_idx == self.current_frame_idx and self.current_frame is not None:
             return
+
+        # Show loading indicator
+        self._loading_frame = True
+        if self.current_frame is not None:
+            canvas = self._render()
+            cv2.imshow(self.WINDOW_NAME, canvas)
+            cv2.waitKey(1)
+
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = self.cap.read()
+        self._loading_frame = False
         if not ret:
+            self._toast("Failed to read frame", self.REJECTED_COLOR)
             return
         self.current_frame_idx = frame_idx
         self.current_frame = frame
@@ -2077,6 +2118,24 @@ class ReviewUI:
 
         if self.help_visible:
             self._render_help(canvas)
+
+        # Draw toast notifications (bottom-left, stacked upward)
+        if self._toasts:
+            toast_y = self.vid_h - 15
+            for text, color, expire in reversed(self._toasts):
+                # Fade out in last 15 ticks
+                remaining = expire - self._tick
+                alpha = min(1.0, remaining / 15.0)
+                faded = tuple(int(c * alpha) for c in color)
+                # Background pill
+                (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                cv2.rectangle(canvas, (8, toast_y - th - 6), (tw + 20, toast_y + 6),
+                              self.BG_COLOR, -1)
+                cv2.rectangle(canvas, (8, toast_y - th - 6), (tw + 20, toast_y + 6),
+                              faded, 1)
+                cv2.putText(canvas, text, (14, toast_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, faded, 1, cv2.LINE_AA)
+                toast_y -= th + 18
 
         return canvas
 
@@ -2144,7 +2203,7 @@ class ReviewUI:
 
         y = sy + 45
         for i, ann in enumerate(self.current_annotations):
-            if y + 70 > sy + sh - 180:
+            if y + 70 > sy + sh - 280:
                 cv2.putText(canvas, f"... +{len(self.current_annotations) - i} more",
                             (sx + 10, y + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
                             self.DIM_TEXT, 1, cv2.LINE_AA)
@@ -2188,48 +2247,116 @@ class ReviewUI:
 
             y += 72
 
-        # Session stats
-        stats_y = sy + sh - 170
+        # --- Review progress bar ---
+        prog_y = sy + sh - 270
+        cv2.line(canvas, (sx + 10, prog_y), (sx + sw - 10, prog_y), self.DIM_TEXT, 1)
+        prog_y += 20
+        cv2.putText(canvas, "PROGRESS", (sx + 10, prog_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.ACCENT, 1, cv2.LINE_AA)
+        prog_y += 18
+        reviewed_frames = self._count_reviewed_frames()
+        total_frames = max(1, self._frames_with_detections)
+        pct = int(100 * reviewed_frames / total_frames)
+        bar_x1, bar_x2 = sx + 10, sx + sw - 10
+        bar_w_total = bar_x2 - bar_x1
+        cv2.rectangle(canvas, (bar_x1, prog_y), (bar_x2, prog_y + 12), self.BG_COLOR, -1)
+        fill_w = int(bar_w_total * reviewed_frames / total_frames)
+        if fill_w > 0:
+            cv2.rectangle(canvas, (bar_x1, prog_y), (bar_x1 + fill_w, prog_y + 12),
+                          self.CONFIRMED_COLOR, -1)
+        cv2.rectangle(canvas, (bar_x1, prog_y), (bar_x2, prog_y + 12), self.DIM_TEXT, 1)
+        cv2.putText(canvas, f"{pct}%", (bar_x1 + bar_w_total // 2 - 10, prog_y + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, self.TEXT_COLOR, 1, cv2.LINE_AA)
+        prog_y += 20
+        cv2.putText(canvas, f"  Frames: {reviewed_frames}/{total_frames}",
+                    (sx + 10, prog_y), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                    self.TEXT_COLOR, 1, cv2.LINE_AA)
+        prog_y += 17
+        cv2.putText(canvas, f"  Detections: {self.stats['reviewed']}/{self._total_detections}",
+                    (sx + 10, prog_y), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                    self.TEXT_COLOR, 1, cv2.LINE_AA)
+
+        # --- Session stats ---
+        stats_y = prog_y + 20
         cv2.line(canvas, (sx + 10, stats_y), (sx + sw - 10, stats_y), self.DIM_TEXT, 1)
         stats_y += 20
         cv2.putText(canvas, "SESSION STATS", (sx + 10, stats_y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.ACCENT, 1, cv2.LINE_AA)
-        for label, key in [("Reviewed", "reviewed"), ("Accepted", "accepted"),
-                           ("Rejected", "rejected"), ("Reclassed", "reclassified"),
-                           ("Missed", "missed")]:
-            stats_y += 20
+        for label, key, color in [
+            ("Accepted", "accepted", self.CONFIRMED_COLOR),
+            ("Rejected", "rejected", self.REJECTED_COLOR),
+            ("Reclassed", "reclassified", self.AMBER),
+            ("Missed added", "missed", self.MISSED_COLOR),
+        ]:
+            stats_y += 18
             cv2.putText(canvas, f"  {label}: {self.stats[key]}", (sx + 10, stats_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, self.TEXT_COLOR, 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA)
+
+        # --- Improvements ---
+        stats_y += 22
+        cv2.line(canvas, (sx + 10, stats_y), (sx + sw - 10, stats_y), self.DIM_TEXT, 1)
+        stats_y += 20
+        cv2.putText(canvas, "IMPROVEMENTS", (sx + 10, stats_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.ACCENT, 1, cv2.LINE_AA)
+        stats_y += 18
+        cv2.putText(canvas, f"  Param tweaks: {self.stats['param_adjustments']}",
+                    (sx + 10, stats_y), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                    self.TEXT_COLOR, 1, cv2.LINE_AA)
+        stats_y += 18
+        cv2.putText(canvas, f"  Learn runs: {self.stats['learn_runs']}",
+                    (sx + 10, stats_y), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                    self.TEXT_COLOR, 1, cv2.LINE_AA)
+        stats_y += 18
+        cv2.putText(canvas, f"  Params optimized: {self.stats['params_optimized']}",
+                    (sx + 10, stats_y), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                    self.TEXT_COLOR, 1, cv2.LINE_AA)
 
         # Controls hint
-        stats_y += 25
+        stats_y += 22
         cv2.putText(canvas, "[H] Help  [Q] Quit", (sx + 10, stats_y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, self.DIM_TEXT, 1, cv2.LINE_AA)
 
     def _render_status_bar(self, canvas):
-        """Draw bottom bar with frame slider."""
+        """Draw bottom bar with frame slider and progress."""
         bar_y = self.vid_h
         bar_w = canvas.shape[1]
         canvas[bar_y:bar_y + self.STATUS_H, :] = self.BG_COLOR
 
-        # Frame info
-        mode_text = "MARK MISSED" if self.mark_mode else "REVIEW"
+        # Frame info + loading indicator
+        if self._loading_frame:
+            mode_text = "LOADING..."
+            mode_color = self.AMBER
+        elif self.mark_mode:
+            mode_text = "MARK MISSED"
+            mode_color = self.MISSED_COLOR
+        else:
+            mode_text = "REVIEW"
+            mode_color = self.ACCENT
         cv2.putText(canvas, f"  {mode_text}", (10, bar_y + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                    self.MISSED_COLOR if self.mark_mode else self.ACCENT,
-                    1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, mode_color, 1, cv2.LINE_AA)
 
+        # Frame counter + pending on this frame
+        pending_here = sum(1 for a in self.current_annotations
+                           if a['mnemosky_ext']['status'] == 'pending')
         frame_text = f"frame {self.current_frame_idx + 1}/{self.total_frames}"
+        if pending_here > 0:
+            frame_text += f"  ({pending_here} pending)"
         cv2.putText(canvas, frame_text, (10, bar_y + 42),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, self.DIM_TEXT, 1, cv2.LINE_AA)
 
-        # Frame slider
+        # Frame slider with detection markers
         slider_x = 200
         slider_w = bar_w - 400
         slider_y = bar_y + 28
         if slider_w > 100 and self.total_frames > 0:
             cv2.line(canvas, (slider_x, slider_y), (slider_x + slider_w, slider_y),
                      self.DIM_TEXT, 2)
+            # Draw tick marks for frames with detections
+            for fi in self.detections_by_frame:
+                tick_x = int(slider_x + (fi / max(1, self.total_frames - 1)) * slider_w)
+                cv2.line(canvas, (tick_x, slider_y - 4), (tick_x, slider_y + 4),
+                         self.DIM_TEXT, 1)
+            # Current position
             pos = int(slider_x + (self.current_frame_idx / max(1, self.total_frames - 1)) * slider_w)
             cv2.circle(canvas, (pos, slider_y), 8, self.ACCENT, -1)
 
@@ -2324,7 +2451,9 @@ class ReviewUI:
             self._run_learning()
         elif key == 19:  # Ctrl+S
             self.ann_db.save()
-            print("Annotations saved.")
+            if self.param_adapter:
+                self.param_adapter.save_profile()
+            self._toast("Annotations + profile saved", self.CONFIRMED_COLOR)
         elif ord('1') <= key <= ord('9'):
             idx = key - ord('1')
             if idx < len(self.current_annotations):
@@ -2378,9 +2507,11 @@ class ReviewUI:
             return
         ann = self.current_annotations[self.selected_ann_idx]
         if ann['mnemosky_ext']['status'] == 'pending':
+            cat = AnnotationDatabase.CATEGORY_MAP.get(ann['category_id'], '?')[:3].upper()
             self.ann_db.record_correction(ann['id'], 'accept')
             self.stats['accepted'] += 1
             self.stats['reviewed'] += 1
+            self._toast(f"Accepted #{self.selected_ann_idx+1} {cat}", self.CONFIRMED_COLOR)
             self._reload_current_frame_annotations()
 
     def _reject_selected(self):
@@ -2389,6 +2520,7 @@ class ReviewUI:
             return
         ann = self.current_annotations[self.selected_ann_idx]
         if ann['mnemosky_ext']['status'] == 'pending':
+            cat = AnnotationDatabase.CATEGORY_MAP.get(ann['category_id'], '?')[:3].upper()
             self.ann_db.record_correction(ann['id'], 'reject')
             self.stats['rejected'] += 1
             self.stats['reviewed'] += 1
@@ -2397,6 +2529,8 @@ class ReviewUI:
                 trail_type = AnnotationDatabase.CATEGORY_MAP.get(ann['category_id'], 'satellite')
                 meta = ann['mnemosky_ext'].get('detection_meta', {})
                 self.param_adapter.apply_correction('reject', trail_type, meta)
+                self.stats['param_adjustments'] += 1
+            self._toast(f"Rejected #{self.selected_ann_idx+1} {cat}", self.REJECTED_COLOR)
             self._reload_current_frame_annotations()
 
     def _reclassify_selected(self, new_category_id):
@@ -2416,28 +2550,39 @@ class ReviewUI:
             meta = ann['mnemosky_ext'].get('detection_meta', {})
             action = f'reclassify_to_{new_type}'
             self.param_adapter.apply_correction(action, old_type, meta)
+            self.stats['param_adjustments'] += 1
+        self._toast(f"Reclassed #{self.selected_ann_idx+1} -> {new_type}", self.AMBER)
         self._reload_current_frame_annotations()
 
     def _accept_all_on_frame(self):
         """Accept all pending detections on current frame."""
+        count = 0
         for ann in self.current_annotations:
             if ann['mnemosky_ext']['status'] == 'pending':
                 self.ann_db.record_correction(ann['id'], 'accept')
                 self.stats['accepted'] += 1
                 self.stats['reviewed'] += 1
+                count += 1
+        if count:
+            self._toast(f"Accepted all {count} detections", self.CONFIRMED_COLOR)
         self._reload_current_frame_annotations()
 
     def _reject_all_on_frame(self):
         """Reject all pending detections on current frame."""
+        count = 0
         for ann in self.current_annotations:
             if ann['mnemosky_ext']['status'] == 'pending':
                 self.ann_db.record_correction(ann['id'], 'reject')
                 self.stats['rejected'] += 1
                 self.stats['reviewed'] += 1
+                count += 1
                 if self.param_adapter:
                     trail_type = AnnotationDatabase.CATEGORY_MAP.get(ann['category_id'], 'satellite')
                     meta = ann['mnemosky_ext'].get('detection_meta', {})
                     self.param_adapter.apply_correction('reject', trail_type, meta)
+                    self.stats['param_adjustments'] += 1
+        if count:
+            self._toast(f"Rejected all {count} detections", self.REJECTED_COLOR)
         self._reload_current_frame_annotations()
 
     def _finish_mark_missed(self):
@@ -2486,6 +2631,10 @@ class ReviewUI:
         # Apply Tier 1 learning for missed trail
         if self.param_adapter:
             self.param_adapter.apply_correction('add_missed', 'satellite', estimated_meta)
+            self.stats['param_adjustments'] += 1
+
+        length = estimated_meta.get('length', 0)
+        self._toast(f"Marked missed satellite (L={length:.0f}px)", self.MISSED_COLOR)
 
         self.mark_mode = False
         self.mark_start = None
@@ -2511,11 +2660,11 @@ class ReviewUI:
         """Jump to next frame with pending detections."""
         for fi in self.review_queue:
             if fi > self.current_frame_idx:
-                # Check if it has pending annotations
                 for im in self.ann_db.data['images']:
                     if im['frame_index'] == fi:
                         pending = self.ann_db.get_pending_annotations(im['id'])
                         if pending:
+                            self._toast(f"-> frame {fi+1} ({len(pending)} pending)", self.ACCENT)
                             self._navigate_to_frame(fi)
                             return
         # Wrap around
@@ -2525,25 +2674,32 @@ class ReviewUI:
                     if im['frame_index'] == fi:
                         pending = self.ann_db.get_pending_annotations(im['id'])
                         if pending:
+                            self._toast(f"-> frame {fi+1} (wrapped, {len(pending)} pending)", self.ACCENT)
                             self._navigate_to_frame(fi)
                             return
+        self._toast("All frames reviewed!", self.CONFIRMED_COLOR, duration=90)
 
     def _run_learning(self):
         """Trigger Tier 2 batch optimization."""
         if not self.param_adapter:
-            print("Learning disabled (--no-learn).")
+            self._toast("Learning disabled (--no-learn)", self.REJECTED_COLOR)
             return
         cal_set = self.ann_db.get_calibration_set()
         if len(cal_set) < 10:
-            print(f"Need at least 10 corrections for batch optimization (have {len(cal_set)}).")
+            self._toast(f"Need 10+ corrections (have {len(cal_set)})", self.AMBER)
             return
-        print("Running batch parameter optimization...")
+        self._toast("Running batch optimization...", self.ACCENT, duration=90)
         optimized = self.param_adapter.optimize_batch(cal_set)
         # Update detector params
+        n_updated = 0
         for k, v in optimized.items():
             if k in self.detector.params:
                 self.detector.params[k] = v
-        print(f"Optimization complete. Updated {len(optimized)} parameters.")
+                n_updated += 1
+        self.stats['learn_runs'] += 1
+        self.stats['params_optimized'] += n_updated
+        self._toast(f"Optimized {n_updated} params from {len(cal_set)} corrections",
+                    self.CONFIRMED_COLOR, duration=90)
 
     def _undo(self):
         """Undo last correction."""
@@ -2551,15 +2707,20 @@ class ReviewUI:
             # Adjust stats (approximate -- just decrement reviewed)
             self.stats['reviewed'] = max(0, self.stats['reviewed'] - 1)
             self._reload_current_frame_annotations()
-            print("Undid last correction.")
+            self._toast("Undid last correction", self.AMBER)
         else:
-            print("Nothing to undo.")
+            self._toast("Nothing to undo", self.DIM_TEXT)
 
     def _prompt_save_and_quit(self):
         """Save and quit."""
         self.ann_db.save()
         if self.param_adapter:
             self.param_adapter.save_profile()
+        self._toast("Saved! Exiting...", self.CONFIRMED_COLOR, duration=30)
+        # Show one final render so user sees the toast
+        canvas = self._render()
+        cv2.imshow(self.WINDOW_NAME, canvas)
+        cv2.waitKey(500)
         print("Annotations saved. Exiting review mode.")
         self.running = False
 
