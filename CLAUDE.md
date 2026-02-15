@@ -73,8 +73,33 @@ pip install scipy
 ### Key Functions
 
 - `show_preprocessing_preview()` - Interactive GUI for tuning preprocessing parameters (CLAHE, blur, Canny). Asymmetric layout: large Original panel (left column, ~58% width) + CLAHE/Blur/Edges stacked vertically (right column), sidebar with custom-drawn sliders and trail example thumbnails, full-width frame slider in status bar. Sleek dark-grey theme with fluorescent accent highlights (single window, no external trackbar window).
-- `process_video()` - Main video processing pipeline (handles I/O, frame iteration, output, optional YOLO dataset export)
+- `_worker_init()` / `_worker_detect()` - Multiprocessing worker functions for parallel frame detection
+- `process_video()` - Main video processing pipeline (handles I/O, frame iteration, output, optional YOLO dataset export, parallel dispatch)
 - `main()` - CLI entry point with argument parsing
+
+### Parallelism Architecture
+
+Detection is stateless per-frame (`detect_trails()` has no frame-to-frame mutation), so frames are distributed across a `multiprocessing.Pool` of N worker processes:
+
+```
+Main Process (sequential)          Worker Pool (N processes, parallel)
+────────────────────────           ─────────────────────────────────
+Read frame                    ──>  Worker 1: detect_trails(frame_A)
+Feed temporal buffer               Worker 2: detect_trails(frame_B)
+Copy temporal context               Worker 3: detect_trails(frame_C)
+Submit to pool                      Worker 4: detect_trails(frame_D)
+                              <──
+Collect results (in order)
+Apply freeze overlays
+Write output frame
+```
+
+- **Main process**: sequential I/O, temporal buffer feeding, freeze overlay, output writing
+- **Worker pool**: parallel detection via `apply_async()` with prefetch depth `workers * 2`
+- **Each worker**: has its own detector instance (created via `_worker_init()` pool initializer)
+- **GPU**: optional CUDA acceleration for `filter2D` (matched filter) and `warpAffine` (Radon)
+- **`_frame_results()` generator**: nested inside `process_video()`, abstracts sequential vs parallel detection so the post-processing loop is shared
+- **Default workers**: `min(cpu_count - 1, 8)`, auto-detected. `--workers 0` for sequential.
 
 ### Detection Data Structures
 
@@ -246,6 +271,14 @@ python satellite_trail_detector.py input.mp4 output.mp4 --preview
 
 # Export detections as YOLO ML dataset
 python satellite_trail_detector.py input.mp4 output.mp4 --dataset
+
+# Parallel processing (default: auto-detected workers, capped at 8)
+python satellite_trail_detector.py input.mp4 output.mp4              # auto parallel (default)
+python satellite_trail_detector.py input.mp4 output.mp4 --workers 4  # 4 workers
+python satellite_trail_detector.py input.mp4 output.mp4 --workers 0  # sequential (no multiprocessing)
+
+# Disable CUDA GPU acceleration (CPU only)
+python satellite_trail_detector.py input.mp4 output.mp4 --no-gpu
 ```
 
 ## Code Conventions
@@ -332,7 +365,7 @@ class CustomDetectionAlgorithm(BaseDetectionAlgorithm):
 
 5. **Classification balance**: Satellites use multiple graduated detection paths (primary + extended + SNR-based). Airplanes only need characteristic point features. The extended paths allow detection of very dim and very long satellite trails that would have been missed by the strict primary criteria.
 
-6. **No external dependencies beyond OpenCV/NumPy**: Keep the dependency footprint minimal.
+6. **No external dependencies beyond OpenCV/NumPy**: Keep the dependency footprint minimal. `multiprocessing`, `os`, `collections.deque` are stdlib.
 
 7. **Boundary checking**: ROI operations include boundary checks. Maintain these when working with image regions.
 
@@ -353,6 +386,10 @@ class CustomDetectionAlgorithm(BaseDetectionAlgorithm):
 15. **RadonStreakDetector (advanced algorithm)**: The `--algorithm radon` flag switches to the advanced `RadonStreakDetector` class which inherits from `SatelliteTrailDetector` and overrides `detect_trails()` with a three-stage pipeline: LSD + Radon Transform + Perpendicular Cross Filtering. It optionally calibrates detection thresholds from ground truth trail patches via `--groundtruth <dir>`. The Radon stage downsamples aggressively (250k pixel area cap) for performance. The parent's matched filter is skipped (Radon subsumes it).
 
 16. **Ground truth calibration**: When `--groundtruth` is provided with `--algorithm radon`, `RadonStreakDetector._calibrate_from_groundtruth()` loads PNG patches, extracts PSF width, brightness, contrast, angle, and length statistics, then `_apply_gt_calibration()` adapts detection thresholds. The calibration prints summary statistics on startup.
+
+17. **Frame-level parallelism**: `process_video()` accepts `num_workers` and `no_gpu` parameters. When `num_workers >= 1`, a `multiprocessing.Pool` distributes `detect_trails()` calls across worker processes. The temporal buffer is fed sequentially in the main process; temporal context arrays are copied for each worker. The `_frame_results()` generator inside `process_video()` abstracts the sequential/parallel paths so all post-processing code (freeze overlays, debug panels, YOLO export, output writing) is shared. Detection results are identical regardless of worker count.
+
+18. **CUDA GPU acceleration**: `_HAS_CUDA` is detected at module load. `SatelliteTrailDetector._use_gpu` controls per-instance GPU usage. GPU paths exist in `_detect_dim_lines_matched_filter()` (filter2D) and `_radon_transform()` (warpAffine). Both upload data once, run all operations on GPU, and download results. On any CUDA exception, `_use_gpu` is set to `False` permanently and the CPU path is used. The `--no-gpu` CLI flag disables CUDA.
 
 ## Common Tasks
 
@@ -389,24 +426,25 @@ Add to the `main()` function's argument parser, then handle in `process_video()`
 
 | Component | Location |
 |-----------|----------|
-| Preprocessing preview | `satellite_trail_detector.py:show_preprocessing_preview()` (line ~40) |
-| Abstract interface | `satellite_trail_detector.py:BaseDetectionAlgorithm` (line ~896) |
-| Partial implementation | `satellite_trail_detector.py:DefaultDetectionAlgorithm` (line ~1059) |
-| Main detector class | `satellite_trail_detector.py:SatelliteTrailDetector` (line ~1219) |
-| Sensitivity presets | `satellite_trail_detector.py:SatelliteTrailDetector.__init__()` (line ~1230) |
-| Signal envelope adaptation | `satellite_trail_detector.py:SatelliteTrailDetector._apply_signal_envelope()` (line ~1323) |
-| Matched filter detection | `satellite_trail_detector.py:SatelliteTrailDetector._detect_dim_lines_matched_filter()` (line ~1513) |
-| Trail SNR computation | `satellite_trail_detector.py:SatelliteTrailDetector._compute_trail_snr()` (line ~1649) |
-| Point feature detection | `satellite_trail_detector.py:SatelliteTrailDetector.detect_point_features()` (line ~1730) |
-| Classification logic | `satellite_trail_detector.py:SatelliteTrailDetector.classify_trail()` (line ~1816) |
-| Angle-aware airplane merge | `satellite_trail_detector.py:SatelliteTrailDetector.merge_airplane_detections()` (line ~2222) |
-| Two-stage detect_trails | `satellite_trail_detector.py:SatelliteTrailDetector.detect_trails()` (line ~2335) |
-| Video processing | `satellite_trail_detector.py:process_video()` (line ~2780) |
-| YOLO dataset export | `satellite_trail_detector.py:process_video()` — dataset setup ~2917, per-frame export ~2943, data.yaml ~3047 |
-| RadonStreakDetector class | `satellite_trail_detector.py:RadonStreakDetector` (line ~3500) |
-| Radon GT calibration | `satellite_trail_detector.py:RadonStreakDetector._calibrate_from_groundtruth()` (line ~3562) |
-| Radon transform | `satellite_trail_detector.py:RadonStreakDetector._radon_transform()` (line ~3851) |
-| LSD detection | `satellite_trail_detector.py:RadonStreakDetector._detect_lines_lsd()` (line ~3810) |
-| Perpendicular cross filter | `satellite_trail_detector.py:RadonStreakDetector._perpendicular_cross_filter()` (line ~4050) |
-| Radon detect_trails | `satellite_trail_detector.py:RadonStreakDetector.detect_trails()` (line ~4150) |
-| Main entry point | `satellite_trail_detector.py:main()` (line ~4800) |
+| Preprocessing preview | `satellite_trail_detector.py:show_preprocessing_preview()` (line ~55) |
+| Abstract interface | `satellite_trail_detector.py:BaseDetectionAlgorithm` (line ~1201) |
+| Partial implementation | `satellite_trail_detector.py:DefaultDetectionAlgorithm` (line ~1364) |
+| Main detector class | `satellite_trail_detector.py:SatelliteTrailDetector` (line ~1524) |
+| Sensitivity presets | `satellite_trail_detector.py:SatelliteTrailDetector.__init__()` (line ~1535) |
+| Signal envelope adaptation | `satellite_trail_detector.py:SatelliteTrailDetector._apply_signal_envelope()` (line ~1632) |
+| Matched filter detection (+ GPU) | `satellite_trail_detector.py:SatelliteTrailDetector._detect_dim_lines_matched_filter()` (line ~1838) |
+| Trail SNR computation | `satellite_trail_detector.py:SatelliteTrailDetector._compute_trail_snr()` (line ~2058) |
+| Point feature detection | `satellite_trail_detector.py:SatelliteTrailDetector.detect_point_features()` (line ~2450) |
+| Classification logic | `satellite_trail_detector.py:SatelliteTrailDetector.classify_trail()` (line ~2550) |
+| Angle-aware airplane merge | `satellite_trail_detector.py:SatelliteTrailDetector.merge_airplane_detections()` (line ~2977) |
+| Two-stage detect_trails | `satellite_trail_detector.py:SatelliteTrailDetector.detect_trails()` (line ~3090) |
+| RadonStreakDetector class | `satellite_trail_detector.py:RadonStreakDetector` (line ~3587) |
+| Radon GT calibration | `satellite_trail_detector.py:RadonStreakDetector._calibrate_from_groundtruth()` (line ~3646) |
+| LSD detection | `satellite_trail_detector.py:RadonStreakDetector._detect_lines_lsd()` (line ~3886) |
+| Radon transform (+ GPU) | `satellite_trail_detector.py:RadonStreakDetector._radon_transform()` (line ~3934) |
+| Perpendicular cross filter | `satellite_trail_detector.py:RadonStreakDetector._perpendicular_cross_filter()` (line ~4109) |
+| Radon detect_trails | `satellite_trail_detector.py:RadonStreakDetector.detect_trails()` (line ~4244) |
+| Worker functions | `satellite_trail_detector.py:_worker_init()` / `_worker_detect()` (line ~4462) |
+| Video processing | `satellite_trail_detector.py:process_video()` (line ~4493) |
+| Frame-result generator | `satellite_trail_detector.py:process_video()._frame_results()` (line ~4692) |
+| Main entry point | `satellite_trail_detector.py:main()` (line ~4990) |
