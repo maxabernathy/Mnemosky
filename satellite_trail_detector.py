@@ -1592,7 +1592,8 @@ class SatelliteTrailDetector:
                 'airplane_saturation_min': 2,
                 'satellite_min_length': 60,  # Very short fragments allowed
                 'satellite_max_length': 2000,  # No practical upper limit
-                'satellite_contrast_min': 1.05,  # Very dim trails allowed
+                'satellite_contrast_min': 1.03,  # Very dim trails allowed (groundtruth ~1.03x)
+                'mf_sigma_perp': 0.7,  # Narrower kernel to match dim trail PSF (~1.3-2px FWHM)
             }
         }
 
@@ -1712,18 +1713,16 @@ class SatelliteTrailDetector:
         )
 
         # Morphological operations to connect broken trails
-        # Enhanced to better connect dim, fragmented satellite trails
         kernel = np.ones((3, 3), np.uint8)
 
-        # Dilate to connect gaps in dim trails
-        edges = cv2.dilate(edges, kernel, iterations=3)
-        # Light erosion to preserve dim features
+        # Dilate to connect gaps in dim trails, then erode to clean up
+        edges = cv2.dilate(edges, kernel, iterations=2)
         edges = cv2.erode(edges, kernel, iterations=1)
 
-        # Additional directional dilation to bridge gaps in linear features.
-        # Dim satellite trails fragment into short segments with small gaps;
-        # elongated kernels reconnect them without bloating non-linear noise.
-        for angle in [0, 45, 90, 135]:
+        # Directional dilation to bridge gaps in linear features.
+        # Use 2 orientations (0° and 90°) — the Hough transform handles
+        # intermediate angles, so full 4-angle bridging is redundant.
+        for angle in [0, 90]:
             line_kernel = np.zeros((7, 7), dtype=np.uint8)
             cv2.line(line_kernel, *self._rotated_kernel_endpoints(7, angle), 1, thickness=1)
             edges = cv2.dilate(edges, line_kernel, iterations=1)
@@ -1740,6 +1739,15 @@ class SatelliteTrailDetector:
             minLineLength=self.params['min_line_length'],
             maxLineGap=self.params['max_line_gap']
         )
+
+        # Cap line count to avoid O(N) classify_trail bottleneck.
+        # Keep the longest lines (most likely to be real trails).
+        max_lines = 150
+        if lines is not None and len(lines) > max_lines:
+            lengths = np.sqrt((lines[:, 0, 2] - lines[:, 0, 0]).astype(np.float64)**2 +
+                              (lines[:, 0, 3] - lines[:, 0, 1]).astype(np.float64)**2)
+            top_indices = np.argpartition(lengths, -max_lines)[-max_lines:]
+            lines = lines[top_indices]
 
         return lines, edges
 
@@ -1854,8 +1862,8 @@ class SatelliteTrailDetector:
 
         h, w = gray_frame.shape
 
-        # --- Downsample for performance (2/3 resolution) ---
-        scale = 2.0 / 3.0
+        # --- Downsample for performance (1/2 resolution) ---
+        scale = 0.5
         small_w, small_h = int(w * scale), int(h * scale)
 
         if temporal_context is not None:
@@ -1880,7 +1888,7 @@ class SatelliteTrailDetector:
                                interpolation=cv2.INTER_AREA)
 
             # Background subtraction using large-kernel median
-            bg_kernel = 31  # Must be odd
+            bg_kernel = 51  # Must be odd; larger kernel removes sky gradients better
             bg = cv2.medianBlur(small, bg_kernel)
             signal = small.astype(np.float32) - bg.astype(np.float32)
             signal = np.clip(signal, 0, None)
@@ -1896,13 +1904,12 @@ class SatelliteTrailDetector:
             use_noise_map = False
 
         # --- Multi-scale directional matched filter bank ---
-        # Multiple kernel lengths catch both short bright fragments and
-        # long dim trails.  72 angles (2.5° steps) for fine angular
-        # resolution.  Gaussian-profile kernels avoid rasterisation
-        # aliasing.  Scale-corrected SNR ensures consistent thresholding
-        # across kernel sizes.
-        num_angles = 72   # 2.5-degree angular resolution
-        kernel_lengths = [21, 41, 61]  # Multi-scale: ~4.6×, 6.4×, 7.8× SNR
+        # Two kernel lengths catch both short bright fragments and long dim
+        # trails.  24 angles (7.5° steps) balances angular coverage with speed.
+        # Gaussian-profile kernels smooth over angular gaps.
+        # Scale-corrected SNR ensures consistent thresholding across sizes.
+        num_angles = 24   # 7.5-degree angular resolution
+        kernel_lengths = [21, 51]  # Dual-scale: ~4.6×, 7.1× SNR boost
 
         best_snr = np.zeros_like(signal)
         best_angle = np.zeros_like(signal)
@@ -1910,7 +1917,8 @@ class SatelliteTrailDetector:
         for klen in kernel_lengths:
             for i in range(num_angles):
                 angle_deg = i * 180.0 / num_angles
-                kernel = self._create_matched_filter_kernel(klen, angle_deg)
+                sigma_perp = self.params.get('mf_sigma_perp', 1.0)
+                kernel = self._create_matched_filter_kernel(klen, angle_deg, sigma_perp=sigma_perp)
 
                 # Noise factor for this kernel: filtered noise std =
                 # noise_std * sqrt(sum(kernel²)).  Pre-compute once.
@@ -1942,8 +1950,8 @@ class SatelliteTrailDetector:
 
         # --- Extract line segments via Hough on the thresholded map ---
         min_len = max(15, int(self.params['min_line_length'] * scale * 0.6))
-        max_gap = int(self.params['max_line_gap'] * scale * 1.5)
-        hough_thresh = max(10, int(self.params['hough_threshold'] * 0.4))
+        max_gap = int(self.params['max_line_gap'] * scale)
+        hough_thresh = max(15, int(self.params['hough_threshold'] * 0.6))
 
         lines = cv2.HoughLinesP(
             significant,
@@ -1998,7 +2006,17 @@ class SatelliteTrailDetector:
                 return None
             scaled_lines = filtered
 
-        return np.array(scaled_lines) if scaled_lines else None
+        if not scaled_lines:
+            return None
+        # Cap supplementary lines to avoid classify_trail bottleneck
+        result = np.array(scaled_lines)
+        max_supp = 100
+        if len(result) > max_supp:
+            lengths = np.sqrt((result[:, 0, 2] - result[:, 0, 0]).astype(np.float64)**2 +
+                              (result[:, 0, 3] - result[:, 0, 1]).astype(np.float64)**2)
+            top_idx = np.argpartition(lengths, -max_supp)[-max_supp:]
+            result = result[top_idx]
+        return result
 
     def _compute_trail_snr(self, gray_frame, line):
         """Compute signal-to-noise ratio of a candidate trail vs local background.
@@ -2536,7 +2554,11 @@ class SatelliteTrailDetector:
             mask.fill(0)  # Clear the mask
         else:
             mask = np.zeros(gray_frame.shape, dtype=np.uint8)
-        cv2.line(mask, (x1, y1), (x2, y2), 255, thickness=5)
+        # Use narrower mask (3px) for supplementary dim trails to avoid
+        # background contamination of brightness/smoothness measurements.
+        # Wider mask (5px) for primary detections where trails are brighter.
+        mask_thickness = 3 if supplementary else 5
+        cv2.line(mask, (x1, y1), (x2, y2), 255, thickness=mask_thickness)
 
         # Check brightness along the trail
         trail_pixels_gray = gray_frame[mask > 0]
@@ -2557,11 +2579,12 @@ class SatelliteTrailDetector:
 
         # Check minimum contrast - trail should stand out from background
         # Use per-sensitivity threshold so dim satellite trails aren't rejected
-        surround_sample_size = 30
+        surround_sample_size = 50
         x_center = (x1 + x2) // 2
         y_center = (y1 + y2) // 2
 
-        # Get background brightness from area around the trail
+        # Get background brightness from area around the trail, excluding trail
+        # pixels to avoid inflating the background estimate for dim trails
         bg_x_min = max(0, x_center - surround_sample_size)
         bg_y_min = max(0, y_center - surround_sample_size)
         bg_x_max = min(gray_frame.shape[1], x_center + surround_sample_size)
@@ -2570,14 +2593,20 @@ class SatelliteTrailDetector:
         background_region = gray_frame[bg_y_min:bg_y_max, bg_x_min:bg_x_max]
         contrast_ratio = None
         if background_region.size > 0:
-            background_brightness = np.median(background_region)
+            # Exclude trail pixels from background estimate for cleaner contrast
+            bg_mask_crop = mask[bg_y_min:bg_y_max, bg_x_min:bg_x_max]
+            bg_only = background_region[bg_mask_crop == 0]
+            if len(bg_only) > 20:
+                background_brightness = np.median(bg_only)
+            else:
+                background_brightness = np.median(background_region)
             contrast_ratio = avg_brightness / (background_brightness + 1e-5)
             min_contrast = self.params.get('satellite_contrast_min', 1.08)
             # Supplementary candidates already passed the matched-filter SNR
             # gate, so the contrast criterion can be relaxed to avoid rejecting
             # dim trails that the primary pipeline would never have seen.
             if supplementary:
-                min_contrast = max(1.02, min_contrast * 0.7)
+                min_contrast = max(1.01, min_contrast * 0.6)
             if contrast_ratio < min_contrast:
                 return None, None
 
@@ -2840,7 +2869,7 @@ class SatelliteTrailDetector:
         # trails that are clearly above the local noise floor.
         if supplementary and not has_dotted_pattern and length >= self.params['satellite_min_length']:
             trail_snr = self._compute_trail_snr(gray_frame, line)
-            if trail_snr >= 2.5 and is_smooth:
+            if trail_snr >= 2.0 and is_smooth:
                 return 'satellite', _make_detection_info()
 
         return None, None
@@ -3167,18 +3196,25 @@ class SatelliteTrailDetector:
             [('satellite', info) for info in merged_satellite_infos] +
             [('airplane', info) for info in merged_airplane_infos]
         )
+        # Skip expensive photometry/curvature when detection count is high
+        # (likely false-positive-heavy frames). Velocity is cheap and always runs.
+        do_full_enrichment = len(all_merged) <= 20
         for trail_type, info in all_merged:
             line_arr = np.array([[info['line'][0], info['line'][1],
                                   info['line'][2], info['line'][3]]])
 
-            # Streak photometry
-            info['photometry'] = self._analyze_streak_photometry(gray, line_arr)
+            if do_full_enrichment:
+                # Streak photometry
+                info['photometry'] = self._analyze_streak_photometry(gray, line_arr)
 
-            # Trail curvature
-            info['curvature'] = self._fit_trail_curvature(
-                gray, line_arr, diff_image=diff_img)
+                # Trail curvature
+                info['curvature'] = self._fit_trail_curvature(
+                    gray, line_arr, diff_image=diff_img)
+            else:
+                info['photometry'] = None
+                info['curvature'] = None
 
-            # Angular velocity
+            # Angular velocity (cheap, always computed)
             info['velocity'] = self._estimate_angular_velocity(
                 info['length'], frame_width,
                 exposure_time=exposure_time,
@@ -3811,7 +3847,7 @@ class RadonStreakDetector(SatelliteTrailDetector):
             gray_frame: Grayscale input (uint8)
             min_length: Minimum segment length in pixels
             log_eps: Detection threshold (-log10(NFA) > log_eps).
-                     Lower = more sensitive to faint lines.
+                     Higher = stricter (fewer detections).
 
         Returns:
             List of (x1, y1, x2, y2, nfa) tuples, sorted by significance.
@@ -3968,14 +4004,10 @@ class RadonStreakDetector(SatelliteTrailDetector):
             sin_t = np.sin(theta_rad)
 
             # The line in image space: x*cos(theta) + y*sin(theta) = offset
-            # Convert to two endpoints spanning the image
+            # Closest point on line to origin (foot of perpendicular)
             # Direction along the line: (-sin(theta), cos(theta))
-            cx = offset * cos_t + pad_w  # shift back from padded coords
-            cy = offset * sin_t + pad_h
-
-            # Shift to original image coordinates
-            cx -= pad_w
-            cy -= pad_h
+            cx = offset * cos_t
+            cy = offset * sin_t
 
             # Estimate streak length from sinogram peak width (FWHM along offset)
             col_profile = snr_sinogram[:, angle_idx]
@@ -4006,44 +4038,6 @@ class RadonStreakDetector(SatelliteTrailDetector):
         return results
 
     # ── Perpendicular cross filtering ───────────────────────────────
-
-    def _make_oriented_kernel(self, angle_deg, length, width=3):
-        """Create an oriented averaging kernel.
-
-        Args:
-            angle_deg: Orientation in degrees
-            length: Kernel length in pixels
-            width: Kernel width (Gaussian sigma) in pixels
-
-        Returns:
-            2D float64 kernel, normalised to unit sum.
-        """
-        size = length
-        if size % 2 == 0:
-            size += 1
-        half = size // 2
-        kernel = np.zeros((size, size), dtype=np.float64)
-
-        angle_rad = np.radians(angle_deg)
-        cos_a = np.cos(angle_rad)
-        sin_a = np.sin(angle_rad)
-
-        for i in range(size):
-            for j in range(size):
-                x = j - half
-                y = i - half
-                # Project onto line direction and perpendicular
-                along = x * cos_a + y * sin_a
-                perp = -x * sin_a + y * cos_a
-
-                if abs(along) <= length / 2.0:
-                    # Gaussian profile perpendicular to line
-                    kernel[i, j] = np.exp(-0.5 * (perp / max(0.5, width)) ** 2)
-
-        total = np.sum(kernel)
-        if total > 0:
-            kernel /= total
-        return kernel
 
     def _perpendicular_cross_filter(self, residual, candidates, kernel_length=None):
         """Apply perpendicular cross filtering to reject false positives.
@@ -4128,7 +4122,7 @@ class RadonStreakDetector(SatelliteTrailDetector):
             # center and the parallel profile is flat — so we test if
             # the perpendicular center value exceeds the parallel spread.
             ratio = mean_perp / (abs(mean_par) + 1e-10)
-            if ratio >= self.pcf_ratio_threshold or mean_perp > 0:
+            if ratio >= self.pcf_ratio_threshold:
                 confirmed.append((x1, y1, x2, y2, score))
 
         return confirmed
@@ -4273,11 +4267,11 @@ class RadonStreakDetector(SatelliteTrailDetector):
         # Aggressively downsample: cap total pixel area to ~250k pixels
         max_area = 250000  # 500x500 equivalent
         current_area = h * w
-        scale = min(0.5, np.sqrt(max_area / max(1, current_area)))
+        scale = min(1.0, np.sqrt(max_area / max(1, current_area)))
         small_h, small_w = max(64, int(h * scale)), max(64, int(w * scale))
         small_cleaned = cv2.resize(cleaned, (small_w, small_h),
                                    interpolation=cv2.INTER_AREA)
-        small_noise = noise_sigma * np.sqrt(scale)
+        small_noise = noise_sigma * scale
 
         radon_candidates = self._detect_streaks_radon(
             small_cleaned, small_noise,
@@ -4337,9 +4331,8 @@ class RadonStreakDetector(SatelliteTrailDetector):
         # ── Store debug info ────────────────────────────────────────
         if debug_info is not None:
             _, edges = self.detect_lines(preprocessed)
-            debug_info['all_lines'] = ([l for l in lsd_lines] +
-                                       (supplementary_lines.tolist()
-                                        if supplementary_lines is not None else []))
+            radon_lines = [(x1, y1, x2, y2) for x1, y1, x2, y2, _ in radon_candidates_full]
+            debug_info['all_lines'] = [l for l in lsd_lines] + radon_lines
             debug_info['all_classifications'] = all_classifications
             debug_info['edges'] = edges
             debug_info['gray_frame'] = gray
