@@ -23,6 +23,7 @@ Output
 ```
 Mnemosky/
 ├── satellite_trail_detector.py   # Main application (single-file implementation)
+├── hitl_architecture.md           # HITL RL system design document
 ├── .gitignore                     # Standard Python gitignore
 └── CLAUDE.md                      # This file
 ```
@@ -69,6 +70,35 @@ pip install scipy
    - `_compute_trail_snr()` — per-trail signal-to-noise ratio via perpendicular flank sampling
    - `_apply_signal_envelope()` — dynamically adapts thresholds from user-marked trail examples
    - Supports custom preprocessing parameters via `preprocessing_params` argument
+
+### HITL (Human-in-the-Loop) Classes
+
+4. **`AnnotationDatabase`** - COCO-compatible annotation database with correction tracking
+   - Stores images, annotations (with `mnemosky_ext` metadata), missed annotations, corrections, sessions
+   - `add_detection()` converts internal bbox `(x_min, y_min, x_max, y_max)` to COCO `[x, y, w, h]`
+   - `add_missed()` for user-drawn false negatives
+   - `record_correction()` with full audit trail (accept/reject/reclassify/adjust_bbox/add_missed)
+   - `get_calibration_set()` builds `(detection_meta, true_label, detector_label)` tuples for learning
+   - `get_frames_needing_review()` sorts by minimum detection confidence (active learning)
+   - `export_coco()` strips Mnemosky extensions for pure COCO format
+   - `undo_last_correction()` reverts the last action
+
+5. **`ParameterAdapter`** - Two-tier parameter learning from human corrections
+   - **Tier 1 (EMA)**: Each correction nudges relevant parameters via exponential moving average with decaying learning rate (`base_lr=0.3`, `decay_rate=0.1`)
+   - **Tier 2 (batch)**: Coordinate-wise golden section search over 13 optimizable parameters, minimizing weighted FP/FN/misclassification loss
+   - `CORRECTION_RULES` maps `(action, trail_type)` to parameter adjustments with diagnostic lambdas
+   - `PARAMETER_SAFETY_BOUNDS` enforces hard min/max per parameter to prevent drift
+   - `compute_confidence()` — pseudo-confidence score for active learning prioritization
+   - `save_profile()` / `load_profile()` persist learned parameters to `~/.mnemosky/learned_params.json`
+
+6. **`ReviewUI`** - Interactive OpenCV review window for correcting detections
+   - Single window with dark-grey/fluorescent-accent theme (matches preview GUI)
+   - Main frame view (left) + 280px sidebar with detection cards, session stats, controls hint
+   - 56px bottom status bar with frame slider and learn/save buttons
+   - Keyboard shortcuts: A(ccept), R(eject), S(atellite), P(lane), M(ark missed), Z(undo), L(earn), Tab (cycle), N(ext unreviewed), Space (accept all), X (reject all), F(ull frame), H(elp), Q(uit)
+   - Mouse: click detection boxes, click sidebar cards, drag frame slider, draw bbox in mark mode
+   - Active learning: frames sorted by minimum detection confidence, low-confidence detections pulsed with amber star
+   - Feeds corrections to `AnnotationDatabase` and applies Tier 1 learning via `ParameterAdapter`
 
 ### Key Functions
 
@@ -229,6 +259,36 @@ When `--dataset` is passed, each frame with detections is saved to a YOLO-format
 - Appends to existing dataset directory (allows processing multiple videos into one dataset)
 - Post-run summary prints image count, annotation counts by class, and dataset location
 
+## HITL Annotation Database
+
+When `--review` is used, detections are stored in a COCO-compatible JSON annotation file (`<output>.json`):
+
+```json
+{
+    "info": { "description": "Mnemosky HITL annotation database", "version": "1.0" },
+    "categories": [{"id": 0, "name": "satellite"}, {"id": 1, "name": "airplane"}],
+    "images": [{"id": 1, "frame_index": 123, "video_source": "input.mp4", ...}],
+    "annotations": [{
+        "id": 1, "image_id": 1, "category_id": 0,
+        "bbox": [100, 200, 350, 40],
+        "mnemosky_ext": {
+            "source": "detector", "status": "confirmed", "confidence": 0.82,
+            "detection_meta": {"angle": 135, "length": 352, "contrast_ratio": 1.12, ...},
+            "parameters_snapshot": {"satellite_contrast_min": 1.03, ...}
+        }
+    }],
+    "missed_annotations": [{"id": 1, "image_id": 1, "category_id": 0, "bbox": [...]}],
+    "corrections": [{"action": "accept", "annotation_id": 1, "timestamp": "..."}],
+    "sessions": [{"parameters_before": {...}, "parameters_after": {...}}],
+    "learned_parameters": {"current": {...}, "update_count": 12}
+}
+```
+
+- `annotations[].mnemosky_ext.status`: `"pending"` | `"confirmed"` | `"rejected"`
+- `annotations[].bbox`: COCO format `[x, y, width, height]` (differs from internal `(x_min, y_min, x_max, y_max)`)
+- `corrections[].action`: `"accept"` | `"reject"` | `"reclassify"` | `"adjust_bbox"` | `"add_missed"`
+- Learned parameters also persist in `~/.mnemosky/learned_params.json` (profile-based, survives across videos)
+
 ## Running the Application
 
 ### Basic Usage
@@ -279,6 +339,21 @@ python satellite_trail_detector.py input.mp4 output.mp4 --workers 0  # sequentia
 
 # Disable CUDA GPU acceleration (CPU only)
 python satellite_trail_detector.py input.mp4 output.mp4 --no-gpu
+
+# HITL review mode: process video, then open interactive review UI
+python satellite_trail_detector.py input.mp4 output.mp4 --review
+
+# Review existing annotations without re-processing
+python satellite_trail_detector.py input.mp4 output.mp4 --review-only --annotations output.json
+
+# Use a named learned parameter profile
+python satellite_trail_detector.py input.mp4 output.mp4 --review --hitl-profile my_camera
+
+# Disable auto-accept (review all detections manually)
+python satellite_trail_detector.py input.mp4 output.mp4 --review --auto-accept 1.0
+
+# Review mode without parameter learning (corrections saved, params unchanged)
+python satellite_trail_detector.py input.mp4 output.mp4 --review --no-learn
 ```
 
 ## Code Conventions
@@ -391,6 +466,14 @@ class CustomDetectionAlgorithm(BaseDetectionAlgorithm):
 
 18. **CUDA GPU acceleration**: `_HAS_CUDA` is detected at module load. `SatelliteTrailDetector._use_gpu` controls per-instance GPU usage. GPU paths exist in `_detect_dim_lines_matched_filter()` (filter2D) and `_radon_transform()` (warpAffine). Both upload data once, run all operations on GPU, and download results. On any CUDA exception, `_use_gpu` is set to `False` permanently and the CPU path is used. The `--no-gpu` CLI flag disables CUDA.
 
+19. **HITL review mode**: `--review` processes the video then launches `ReviewUI` for interactive correction. `--review-only` skips processing and opens an existing annotation file. The review UI runs sequentially after the parallel worker pool is shut down. Detections are collected in `detections_by_frame` dict during `process_video()` when `review_mode=True`.
+
+20. **HITL annotation database**: Annotations are stored in COCO-compatible JSON (`<output>.json`). The `mnemosky_ext` field on each annotation holds Mnemosky-specific metadata (detection_meta, status, confidence, parameters_snapshot). Bounding boxes are stored in COCO format `[x, y, width, height]` (converted from internal `(x_min, y_min, x_max, y_max)`). The `missed_annotations` array is separate from `annotations` to maintain clean COCO compatibility.
+
+21. **HITL parameter learning**: `ParameterAdapter` uses two tiers. Tier 1 (EMA) applies immediately per correction via `CORRECTION_RULES` mapping. Tier 2 (golden section search) runs on-demand when user presses `L` in the review UI, requires >= 10 calibration entries. `PARAMETER_SAFETY_BOUNDS` prevents catastrophic drift. Learned parameters persist across sessions via `~/.mnemosky/learned_params.json` profiles. On subsequent runs, `main()` loads the active profile and merges learned `canny_low`/`canny_high` into `preprocessing_params`.
+
+22. **HITL confidence scoring**: `ParameterAdapter.compute_confidence()` computes a pseudo-confidence from contrast margin, SNR margin, length score, and smoothness, squashed through a sigmoid. Used for active learning prioritization (low-confidence detections reviewed first) and auto-accept (detections above `--auto-accept` threshold are pre-accepted).
+
 ## Common Tasks
 
 ### Adding a new sensitivity preset
@@ -426,25 +509,31 @@ Add to the `main()` function's argument parser, then handle in `process_video()`
 
 | Component | Location |
 |-----------|----------|
-| Preprocessing preview | `satellite_trail_detector.py:show_preprocessing_preview()` (line ~55) |
-| Abstract interface | `satellite_trail_detector.py:BaseDetectionAlgorithm` (line ~1201) |
-| Partial implementation | `satellite_trail_detector.py:DefaultDetectionAlgorithm` (line ~1364) |
-| Main detector class | `satellite_trail_detector.py:SatelliteTrailDetector` (line ~1524) |
-| Sensitivity presets | `satellite_trail_detector.py:SatelliteTrailDetector.__init__()` (line ~1535) |
-| Signal envelope adaptation | `satellite_trail_detector.py:SatelliteTrailDetector._apply_signal_envelope()` (line ~1632) |
-| Matched filter detection (+ GPU) | `satellite_trail_detector.py:SatelliteTrailDetector._detect_dim_lines_matched_filter()` (line ~1838) |
-| Trail SNR computation | `satellite_trail_detector.py:SatelliteTrailDetector._compute_trail_snr()` (line ~2058) |
-| Point feature detection | `satellite_trail_detector.py:SatelliteTrailDetector.detect_point_features()` (line ~2450) |
-| Classification logic | `satellite_trail_detector.py:SatelliteTrailDetector.classify_trail()` (line ~2550) |
-| Angle-aware airplane merge | `satellite_trail_detector.py:SatelliteTrailDetector.merge_airplane_detections()` (line ~2977) |
-| Two-stage detect_trails | `satellite_trail_detector.py:SatelliteTrailDetector.detect_trails()` (line ~3090) |
-| RadonStreakDetector class | `satellite_trail_detector.py:RadonStreakDetector` (line ~3587) |
-| Radon GT calibration | `satellite_trail_detector.py:RadonStreakDetector._calibrate_from_groundtruth()` (line ~3646) |
-| LSD detection | `satellite_trail_detector.py:RadonStreakDetector._detect_lines_lsd()` (line ~3886) |
-| Radon transform (+ GPU) | `satellite_trail_detector.py:RadonStreakDetector._radon_transform()` (line ~3934) |
-| Perpendicular cross filter | `satellite_trail_detector.py:RadonStreakDetector._perpendicular_cross_filter()` (line ~4109) |
-| Radon detect_trails | `satellite_trail_detector.py:RadonStreakDetector.detect_trails()` (line ~4244) |
-| Worker functions | `satellite_trail_detector.py:_worker_init()` / `_worker_detect()` (line ~4462) |
-| Video processing | `satellite_trail_detector.py:process_video()` (line ~4493) |
-| Frame-result generator | `satellite_trail_detector.py:process_video()._frame_results()` (line ~4692) |
-| Main entry point | `satellite_trail_detector.py:main()` (line ~4990) |
+| Preprocessing preview | `satellite_trail_detector.py:show_preprocessing_preview()` (line ~57) |
+| HITL safety bounds | `satellite_trail_detector.py:PARAMETER_SAFETY_BOUNDS` (line ~1207) |
+| HITL correction rules | `satellite_trail_detector.py:CORRECTION_RULES` (line ~1224) |
+| Annotation database | `satellite_trail_detector.py:AnnotationDatabase` (line ~1296) |
+| Parameter adapter | `satellite_trail_detector.py:ParameterAdapter` (line ~1684) |
+| Review UI | `satellite_trail_detector.py:ReviewUI` (line ~1927) |
+| Abstract interface | `satellite_trail_detector.py:BaseDetectionAlgorithm` (line ~2567) |
+| Partial implementation | `satellite_trail_detector.py:DefaultDetectionAlgorithm` (line ~2730) |
+| Main detector class | `satellite_trail_detector.py:SatelliteTrailDetector` (line ~2890) |
+| Sensitivity presets | `satellite_trail_detector.py:SatelliteTrailDetector.__init__()` (line ~2901) |
+| Signal envelope adaptation | `satellite_trail_detector.py:SatelliteTrailDetector._apply_signal_envelope()` (line ~2998) |
+| Matched filter detection (+ GPU) | `satellite_trail_detector.py:SatelliteTrailDetector._detect_dim_lines_matched_filter()` (line ~3204) |
+| Trail SNR computation | `satellite_trail_detector.py:SatelliteTrailDetector._compute_trail_snr()` (line ~3424) |
+| Point feature detection | `satellite_trail_detector.py:SatelliteTrailDetector.detect_point_features()` (line ~3816) |
+| Classification logic | `satellite_trail_detector.py:SatelliteTrailDetector.classify_trail()` (line ~3916) |
+| Angle-aware airplane merge | `satellite_trail_detector.py:SatelliteTrailDetector.merge_airplane_detections()` (line ~4343) |
+| Two-stage detect_trails | `satellite_trail_detector.py:SatelliteTrailDetector.detect_trails()` (line ~4456) |
+| RadonStreakDetector class | `satellite_trail_detector.py:RadonStreakDetector` (line ~4953) |
+| Radon GT calibration | `satellite_trail_detector.py:RadonStreakDetector._calibrate_from_groundtruth()` (line ~5012) |
+| LSD detection | `satellite_trail_detector.py:RadonStreakDetector._detect_lines_lsd()` (line ~5252) |
+| Radon transform (+ GPU) | `satellite_trail_detector.py:RadonStreakDetector._radon_transform()` (line ~5300) |
+| Perpendicular cross filter | `satellite_trail_detector.py:RadonStreakDetector._perpendicular_cross_filter()` (line ~5475) |
+| Radon detect_trails | `satellite_trail_detector.py:RadonStreakDetector.detect_trails()` (line ~5610) |
+| Worker functions | `satellite_trail_detector.py:_worker_init()` / `_worker_detect()` (line ~5828) |
+| Video processing | `satellite_trail_detector.py:process_video()` (line ~5859) |
+| Frame-result generator | `satellite_trail_detector.py:process_video()._frame_results()` (line ~6061) |
+| HITL review integration | `satellite_trail_detector.py:process_video()` review section (line ~6365) |
+| Main entry point | `satellite_trail_detector.py:main()` (line ~6439) |
