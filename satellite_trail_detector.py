@@ -241,7 +241,7 @@ def show_preprocessing_preview(video_path, initial_params=None):
     # navigates to a new frame.  Much slower to compute than the MF cache
     # (requires reading N frames from disk), so it's done lazily and only
     # when the frame changes.
-    _TEMPORAL_N = 5   # Frames to each side for temporal median (total = 2N+1)
+    _TEMPORAL_N = 3   # Frames to each side for temporal median (total = 2N+1 = 7)
     temporal_ref_cache = {'frame_idx': -1, 'diff_image': None, 'noise_map': None}
 
     # ── Pre-computed MF kernel bank ──────────────────────────────────
@@ -1102,7 +1102,7 @@ class TemporalFrameBuffer:
 
     Usage::
 
-        buf = TemporalFrameBuffer(capacity=21)
+        buf = TemporalFrameBuffer(capacity=7)
         for frame in frames:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             buf.add(gray)
@@ -1111,13 +1111,13 @@ class TemporalFrameBuffer:
                 # ctx['diff_image'], ctx['noise_map'], ctx['reference']
     """
 
-    def __init__(self, capacity=21):
+    def __init__(self, capacity=7):
         """
         Args:
             capacity: Number of frames to keep in the buffer.  Should be odd
                 so the current frame sits at the centre.  Larger values give
                 cleaner backgrounds but use more RAM (~4 MB per 1080p frame).
-                21 frames ≈ 84 MB for 1080p — a reasonable default.
+                7 frames ≈ 28 MB for 1080p — a reasonable default.
         """
         self.capacity = capacity
         self._frames = []           # List of uint8 grayscale arrays
@@ -1563,12 +1563,12 @@ class SatelliteTrailDetector:
                 'airplane_brightness_min': 90,
                 'airplane_saturation_min': 10,
                 'satellite_min_length': 120,  # Satellite trail length range (1920x1080)
-                'satellite_max_length': 800,
+                'satellite_max_length': 700,
                 'satellite_contrast_min': 1.10,  # Minimum trail-to-background contrast
             },
             'medium': {
                 'min_line_length': 50,  # Lower to catch dim trail fragments
-                'max_line_gap': 50,  # Wider gap tolerance for dim fragmented trails
+                'max_line_gap': 35,  # Moderate gap tolerance (MF handles fragmented dim trails)
                 'canny_low': 4,  # Slightly more sensitive for dim trails
                 'canny_high': 45,
                 'hough_threshold': 30,  # Lower threshold to catch dim trails
@@ -1577,7 +1577,7 @@ class SatelliteTrailDetector:
                 'airplane_brightness_min': 75,
                 'airplane_saturation_min': 8,
                 'satellite_min_length': 100,  # Satellites can be shorter segments
-                'satellite_max_length': 1200,  # Very long trails for full-frame crossings
+                'satellite_max_length': 1000,  # Long trails but not full-frame artifacts
                 'satellite_contrast_min': 1.08,  # Lower contrast for dim satellites
             },
             'high': {
@@ -1591,7 +1591,7 @@ class SatelliteTrailDetector:
                 'airplane_brightness_min': 45,
                 'airplane_saturation_min': 2,
                 'satellite_min_length': 60,  # Very short fragments allowed
-                'satellite_max_length': 2000,  # No practical upper limit
+                'satellite_max_length': 1400,  # Very long trails but reject full-frame artifacts
                 'satellite_contrast_min': 1.03,  # Very dim trails allowed (groundtruth ~1.03x)
                 'mf_sigma_perp': 0.7,  # Narrower kernel to match dim trail PSF (~1.3-2px FWHM)
             }
@@ -1716,7 +1716,7 @@ class SatelliteTrailDetector:
         kernel = np.ones((3, 3), np.uint8)
 
         # Dilate to connect gaps in dim trails, then erode to clean up
-        edges = cv2.dilate(edges, kernel, iterations=2)
+        edges = cv2.dilate(edges, kernel, iterations=1)
         edges = cv2.erode(edges, kernel, iterations=1)
 
         # Directional dilation to bridge gaps in linear features.
@@ -1742,7 +1742,7 @@ class SatelliteTrailDetector:
 
         # Cap line count to avoid O(N) classify_trail bottleneck.
         # Keep the longest lines (most likely to be real trails).
-        max_lines = 150
+        max_lines = 100
         if lines is not None and len(lines) > max_lines:
             lengths = np.sqrt((lines[:, 0, 2] - lines[:, 0, 0]).astype(np.float64)**2 +
                               (lines[:, 0, 3] - lines[:, 0, 1]).astype(np.float64)**2)
@@ -2010,7 +2010,7 @@ class SatelliteTrailDetector:
             return None
         # Cap supplementary lines to avoid classify_trail bottleneck
         result = np.array(scaled_lines)
-        max_supp = 100
+        max_supp = 50
         if len(result) > max_supp:
             lengths = np.sqrt((result[:, 0, 2] - result[:, 0, 0]).astype(np.float64)**2 +
                               (result[:, 0, 3] - result[:, 0, 1]).astype(np.float64)**2)
@@ -2548,6 +2548,13 @@ class SatelliteTrailDetector:
         if length < self.params['min_line_length']:
             return None, None
 
+        # Reject full-frame-width artifacts early — real satellite trails
+        # rarely span > 80% of the frame.  Lines this long are typically
+        # edge artifacts from morphological operations or sky gradients.
+        frame_w = color_frame.shape[1] if color_frame is not None else 1920
+        if length > frame_w * 0.80:
+            return None, None
+
         # Use reusable mask if provided, otherwise allocate new one
         if reusable_mask is not None:
             mask = reusable_mask
@@ -2606,7 +2613,7 @@ class SatelliteTrailDetector:
             # gate, so the contrast criterion can be relaxed to avoid rejecting
             # dim trails that the primary pipeline would never have seen.
             if supplementary:
-                min_contrast = max(1.01, min_contrast * 0.6)
+                min_contrast = max(1.03, min_contrast * 0.7)
             if contrast_ratio < min_contrast:
                 return None, None
 
@@ -2843,21 +2850,24 @@ class SatelliteTrailDetector:
             return 'satellite', _make_detection_info()
 
         # --- Extended paths for dim/long trails that miss primary criteria ---
+        # These paths allow slightly beyond satellite_max_length (1.3×) but
+        # NOT unlimited — full-frame artifacts are already rejected above.
+        extended_max = self.params['satellite_max_length'] * 1.3
 
         # Long smooth dim trail outside the "typical" length range but clearly
         # not an airplane: no dotted pattern, dim, monochrome, smooth
-        if is_smooth and is_dim and is_monochrome and not has_dotted_pattern and length >= self.params['satellite_min_length']:
+        if is_smooth and is_dim and is_monochrome and not has_dotted_pattern and length >= self.params['satellite_min_length'] and length <= extended_max:
             return 'satellite', _make_detection_info()
 
         # Dim smooth trail with confirmed background contrast — even if
         # length or monochrome criteria aren't perfectly met
-        if is_smooth and is_dim and has_contrast and not has_dotted_pattern and length >= self.params['satellite_min_length']:
+        if is_smooth and is_dim and has_contrast and not has_dotted_pattern and length >= self.params['satellite_min_length'] and length <= extended_max:
             return 'satellite', _make_detection_info()
 
         # Very dim trail (below brightness_threshold) that is smooth and long
         # enough — relaxed monochrome requirement since very dim trails have
         # negligible color information anyway
-        if is_smooth and avg_brightness <= self.params['brightness_threshold'] and not has_dotted_pattern and length >= self.params['satellite_min_length']:
+        if is_smooth and avg_brightness <= self.params['brightness_threshold'] and not has_dotted_pattern and length >= self.params['satellite_min_length'] and length <= extended_max:
             return 'satellite', _make_detection_info()
 
         # --- SNR-based path for matched-filter candidates ---
@@ -2867,9 +2877,9 @@ class SatelliteTrailDetector:
         # perpendicular flank sampling — a statistically rigorous measure
         # that is independent of absolute brightness.  This rescues very dim
         # trails that are clearly above the local noise floor.
-        if supplementary and not has_dotted_pattern and length >= self.params['satellite_min_length']:
+        if supplementary and not has_dotted_pattern and length >= self.params['satellite_min_length'] and length <= extended_max:
             trail_snr = self._compute_trail_snr(gray_frame, line)
-            if trail_snr >= 2.0 and is_smooth:
+            if trail_snr >= 2.5 and is_smooth:
                 return 'satellite', _make_detection_info()
 
         return None, None
@@ -4387,7 +4397,7 @@ class RadonStreakDetector(SatelliteTrailDetector):
         return all_merged
 
 
-def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=21, algorithm='default', groundtruth_dir=None):
+def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=7, algorithm='default', groundtruth_dir=None):
     """
     Process video to detect and highlight satellite and airplane trails.
 
@@ -4414,7 +4424,7 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         fov_degrees: Horizontal field of view in degrees (optional).
             Enables angular velocity output in degrees/second.
         temporal_buffer_size: Number of frames in the temporal rolling buffer
-            (default: 21).  The temporal median of this many surrounding frames
+            (default: 7).  The temporal median of this many surrounding frames
             is used as a reference background — stars, vignetting, and sky
             gradients are removed perfectly, leaving only transient trails.
             Set to 0 to disable temporal integration.
@@ -4931,8 +4941,8 @@ Notes:
     parser.add_argument(
         '--temporal-buffer',
         type=int,
-        default=21,
-        help='Size of the temporal rolling buffer for background subtraction (default: 21). '
+        default=7,
+        help='Size of the temporal rolling buffer for background subtraction (default: 7). '
              'The per-pixel temporal median removes stars, sky gradients, and vignetting. '
              'Set to 0 to disable temporal integration.'
     )
