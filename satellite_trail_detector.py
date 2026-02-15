@@ -34,14 +34,22 @@ import numpy as np
 import argparse
 import sys
 import time
+import os
+import multiprocessing
 from pathlib import Path
 from abc import ABC, abstractmethod
+from collections import deque
 
 try:
     from scipy.ndimage import maximum_filter as _scipy_maximum_filter
     _HAS_SCIPY = True
 except ImportError:
     _HAS_SCIPY = False
+
+try:
+    _HAS_CUDA = cv2.cuda.getCudaEnabledDeviceCount() > 0
+except Exception:
+    _HAS_CUDA = False
 
 
 def show_preprocessing_preview(video_path, initial_params=None):
@@ -1614,6 +1622,9 @@ class SatelliteTrailDetector:
             if 'mf_snr_threshold' in self.preprocessing_params:
                 self.params['mf_snr_threshold'] = self.preprocessing_params['mf_snr_threshold']
 
+        # GPU acceleration flag (CUDA filter2D, warpAffine)
+        self._use_gpu = _HAS_CUDA
+
         # Adapt detection parameters from user-marked trail signal envelope
         if self.signal_envelope:
             self._apply_signal_envelope(self.signal_envelope)
@@ -1914,25 +1925,51 @@ class SatelliteTrailDetector:
         best_snr = np.zeros_like(signal)
         best_angle = np.zeros_like(signal)
 
+        # Pre-compute all kernels and noise factors
+        sigma_perp = self.params.get('mf_sigma_perp', 1.0)
+        kernels_and_factors = []
         for klen in kernel_lengths:
             for i in range(num_angles):
                 angle_deg = i * 180.0 / num_angles
-                sigma_perp = self.params.get('mf_sigma_perp', 1.0)
                 kernel = self._create_matched_filter_kernel(klen, angle_deg, sigma_perp=sigma_perp)
-
-                # Noise factor for this kernel: filtered noise std =
-                # noise_std * sqrt(sum(kernel²)).  Pre-compute once.
                 noise_factor = np.sqrt(np.sum(kernel ** 2))
+                kernels_and_factors.append((angle_deg, kernel, noise_factor))
 
+        # GPU-accelerated path: upload signal once, run all filters on GPU
+        if self._use_gpu:
+            try:
+                gpu_signal = cv2.cuda_GpuMat()
+                gpu_signal.upload(signal)
+                for angle_deg, kernel, noise_factor in kernels_and_factors:
+                    filt = cv2.cuda.createLinearFilter(
+                        cv2.CV_32F, cv2.CV_32F, kernel)
+                    gpu_response = filt.apply(gpu_signal)
+                    response = gpu_response.download()
+
+                    if use_noise_map:
+                        snr = response / (noise_map_small * noise_factor + 1e-10)
+                    else:
+                        snr = response / (noise_std * noise_factor + 1e-10)
+
+                    better = snr > best_snr
+                    best_snr[better] = snr[better]
+                    best_angle[better] = angle_deg
+            except Exception:
+                # CUDA failed at runtime — fall back to CPU for this
+                # frame and all future frames
+                self._use_gpu = False
+                best_snr = np.zeros_like(signal)
+                best_angle = np.zeros_like(signal)
+                # Re-run on CPU (fall through below)
+
+        # CPU path (default or CUDA fallback)
+        if not self._use_gpu:
+            for angle_deg, kernel, noise_factor in kernels_and_factors:
                 response = cv2.filter2D(signal, cv2.CV_32F, kernel)
 
                 if use_noise_map:
-                    # Per-pixel SNR: filter the noise map through the same
-                    # kernel to get the local filtered noise std at each pixel.
-                    # For a mean-normalised kernel, σ_out² = σ_in² · Σ(k²).
                     snr = response / (noise_map_small * noise_factor + 1e-10)
                 else:
-                    # Scalar noise: same SNR formula as before
                     snr = response / (noise_std * noise_factor + 1e-10)
 
                 better = snr > best_snr
@@ -3918,6 +3955,26 @@ class RadonStreakDetector(SatelliteTrailDetector):
         sinogram = np.zeros((diag, num_angles), dtype=np.float32)
         center = (diag / 2.0, diag / 2.0)
 
+        # GPU-accelerated path: upload padded image once
+        if self._use_gpu:
+            try:
+                gpu_padded = cv2.cuda_GpuMat()
+                gpu_padded.upload(padded)
+                for i, theta in enumerate(angles):
+                    M = cv2.getRotationMatrix2D(center, -theta, 1.0)
+                    gpu_rotated = cv2.cuda.warpAffine(
+                        gpu_padded, M, (diag, diag),
+                        flags=cv2.INTER_NEAREST,
+                        borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=(0,))
+                    rotated = gpu_rotated.download()
+                    sinogram[:, i] = np.sum(rotated, axis=0)
+                return sinogram.astype(np.float64), angles
+            except Exception:
+                self._use_gpu = False
+                # Fall through to CPU path
+
+        # CPU path
         for i, theta in enumerate(angles):
             M = cv2.getRotationMatrix2D(center, -theta, 1.0)
             rotated = cv2.warpAffine(padded, M, (diag, diag),
@@ -4397,7 +4454,43 @@ class RadonStreakDetector(SatelliteTrailDetector):
         return all_merged
 
 
-def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=7, algorithm='default', groundtruth_dir=None):
+# ── Multiprocessing worker for parallel frame detection ────────────────
+
+_worker_detector = None
+
+
+def _worker_init(algorithm, sensitivity, preprocessing_params,
+                 skip_aspect_ratio_check, signal_envelope, groundtruth_dir,
+                 use_gpu):
+    """Create a detector instance in each worker process."""
+    global _worker_detector
+    if algorithm == 'radon':
+        _worker_detector = RadonStreakDetector(
+            sensitivity, preprocessing_params=preprocessing_params,
+            skip_aspect_ratio_check=skip_aspect_ratio_check,
+            signal_envelope=signal_envelope,
+            groundtruth_dir=groundtruth_dir)
+    else:
+        _worker_detector = SatelliteTrailDetector(
+            sensitivity, preprocessing_params=preprocessing_params,
+            skip_aspect_ratio_check=skip_aspect_ratio_check,
+            signal_envelope=signal_envelope)
+    _worker_detector._use_gpu = use_gpu
+
+
+def _worker_detect(args):
+    """Run detection on a single frame in a worker process."""
+    frame, temporal_context, need_debug, exposure_time, fov_degrees = args
+    debug_info = {} if need_debug else None
+    detected_trails = _worker_detector.detect_trails(
+        frame, debug_info=debug_info,
+        temporal_context=temporal_context,
+        exposure_time=exposure_time,
+        fov_degrees=fov_degrees)
+    return detected_trails, debug_info
+
+
+def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=7, algorithm='default', groundtruth_dir=None, num_workers=0, no_gpu=False):
     """
     Process video to detect and highlight satellite and airplane trails.
 
@@ -4517,7 +4610,8 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
             out.release()
         sys.exit(1)
     
-    # Initialize detector
+    # Initialize detector (used in sequential mode; parallel mode creates
+    # per-worker detectors via _worker_init)
     if algorithm == 'radon':
         detector = RadonStreakDetector(
             sensitivity, preprocessing_params=preprocessing_params,
@@ -4569,44 +4663,120 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     debug_panels = []
     debug_panel_duration = int(fps * 2)  # 2 seconds
 
+    # ── Parallel worker pool setup ─────────────────────────────────
+    pool = None
+    if num_workers >= 1:
+        use_gpu_workers = _HAS_CUDA and not no_gpu
+        pool = multiprocessing.Pool(
+            num_workers,
+            initializer=_worker_init,
+            initargs=(algorithm, sensitivity, preprocessing_params,
+                      skip_aspect_ratio_check, signal_envelope,
+                      groundtruth_dir, use_gpu_workers))
+        pending = deque()  # (frame, frame_idx, AsyncResult)
+        prefetch = num_workers * 2
+        print(f"Parallel workers: {num_workers}" +
+              (f" + CUDA" if use_gpu_workers else ""))
+    else:
+        if no_gpu:
+            detector._use_gpu = False
+        print(f"Workers: sequential" +
+              (f" + CUDA" if detector._use_gpu else ""))
+
     print("\nProcessing video...")
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    # ── Unified frame-result generator ─────────────────────────────
+    # Abstracts sequential vs parallel detection so the post-processing
+    # loop below is shared.  Yields (frame, frame_idx, detected_trails,
+    # debug_info) tuples in frame order.
+    def _frame_results():
+        nonlocal frame_count
 
-        frame_count += 1
+        if pool is not None:
+            # ── Parallel path: read-ahead + async detection ────────
+            reading_done = False
+            while True:
+                # Fill the pipeline up to prefetch depth
+                while not reading_done and len(pending) < prefetch:
+                    ret, frame = cap.read()
+                    if not ret:
+                        reading_done = True
+                        break
+                    frame_count += 1
+                    if frame_count > max_frames:
+                        reading_done = True
+                        break
 
-        # Check if we've reached the maximum duration
-        if frame_count > max_frames:
-            print(f"\rReached maximum duration limit at frame {frame_count - 1}")
-            break
+                    # Feed temporal buffer (must be sequential)
+                    temporal_context = None
+                    if temporal_buffer is not None:
+                        gray_fb = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        temporal_buffer.add(gray_fb)
+                        if temporal_buffer.is_ready():
+                            temporal_context = \
+                                temporal_buffer.get_temporal_context(gray_fb)
 
+                    # Copy temporal context arrays for the worker process
+                    tc_copy = None
+                    if temporal_context is not None:
+                        tc_copy = {
+                            'diff_image': temporal_context['diff_image'].copy(),
+                            'noise_map': temporal_context['noise_map'].copy(),
+                            'reference': temporal_context['reference'].copy(),
+                            'buffer_depth': temporal_context['buffer_depth'],
+                        }
+
+                    async_result = pool.apply_async(
+                        _worker_detect,
+                        ((frame.copy(), tc_copy, debug_mode,
+                          exposure_time, fov_degrees),))
+                    pending.append((frame, frame_count, async_result))
+
+                if not pending:
+                    break
+
+                orig_frame, fidx, async_result = pending.popleft()
+                det_trails, dbg_info = async_result.get()
+                yield orig_frame, fidx, det_trails, dbg_info
+
+            pool.close()
+            pool.join()
+
+        else:
+            # ── Sequential path (original logic) ──────────────────
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_count += 1
+                if frame_count > max_frames:
+                    break
+
+                temporal_context = None
+                if temporal_buffer is not None:
+                    gray_fb = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    temporal_buffer.add(gray_fb)
+                    if temporal_buffer.is_ready():
+                        temporal_context = \
+                            temporal_buffer.get_temporal_context(gray_fb)
+
+                dbg_info = {} if debug_mode else None
+                det_trails = detector.detect_trails(
+                    frame, debug_info=dbg_info,
+                    temporal_context=temporal_context,
+                    exposure_time=exposure_time,
+                    fov_degrees=fov_degrees)
+                yield frame, frame_count, det_trails, dbg_info
+
+    for frame, fc, detected_trails, debug_info in _frame_results():
         # Progress indicator
-        if frame_count % 30 == 0:
-            progress = (frame_count / max_frames) * 100
-            print(f"\rProgress: {progress:.1f}% ({frame_count}/{max_frames})", end="", flush=True)
+        if fc % 30 == 0:
+            progress = (fc / max_frames) * 100
+            print(f"\rProgress: {progress:.1f}% ({fc}/{max_frames})",
+                  end="", flush=True)
 
         # Start with current frame
         output_frame = frame.copy()
-
-        # ── Feed temporal buffer and build context ────────────────
-        temporal_context = None
-        if temporal_buffer is not None:
-            gray_for_buffer = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            temporal_buffer.add(gray_for_buffer)
-            if temporal_buffer.is_ready():
-                temporal_context = temporal_buffer.get_temporal_context(
-                    gray_for_buffer)
-
-        # Detect and classify trails (with debug info if needed)
-        debug_info = {} if debug_mode else None
-        detected_trails = detector.detect_trails(
-            frame, debug_info=debug_info,
-            temporal_context=temporal_context,
-            exposure_time=exposure_time,
-            fov_degrees=fov_degrees)
 
         # Filter trails based on detect_type parameter
         if detect_type == 'satellites':
@@ -4626,7 +4796,7 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
                     airplanes_detected += 1
 
                 # Log enrichment metadata for this detection
-                _meta_parts = [f"f{frame_count}",
+                _meta_parts = [f"f{fc}",
                                f"{trail_type}",
                                f"L={detection_info['length']:.0f}px"]
                 vel = detection_info.get('velocity')
@@ -4670,7 +4840,7 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
                 })
 
                 # Create debug panel for this detection (if in debug mode)
-                if debug_mode and 'edges' in debug_info and 'gray_frame' in debug_info and debug_info['all_lines'] is not None:
+                if debug_mode and debug_info and 'edges' in debug_info and 'gray_frame' in debug_info and debug_info.get('all_lines') is not None:
                     # Find the corresponding line for this detection
                     for classification in debug_info['all_classifications']:
                         if classification['type'] == trail_type and classification['bbox'] == bbox:
@@ -4686,7 +4856,7 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
 
             # ── YOLO dataset export (one image + label per frame with detections)
             if dataset_dir is not None:
-                img_name = f"{video_stem}_f{frame_count:06d}.jpg"
+                img_name = f"{video_stem}_f{fc:06d}.jpg"
                 cv2.imwrite(str(dataset_dir / 'images' / img_name), frame,
                             [cv2.IMWRITE_JPEG_QUALITY, 95])
                 label_lines = []
@@ -4965,6 +5135,21 @@ Notes:
              'If not specified with --algorithm radon, uses default thresholds.'
     )
 
+    _default_workers = min(max(1, (os.cpu_count() or 4) - 1), 8)
+    parser.add_argument(
+        '--workers', '-w',
+        type=int,
+        default=_default_workers,
+        help=f'Number of parallel detection workers (default: {_default_workers}, '
+             f'auto-detected from CPU count). Set to 0 for sequential processing.'
+    )
+
+    parser.add_argument(
+        '--no-gpu',
+        action='store_true',
+        help='Disable CUDA GPU acceleration even if available'
+    )
+
     args = parser.parse_args()
 
     # Handle preprocessing preview if requested
@@ -4997,6 +5182,8 @@ Notes:
         temporal_buffer_size=args.temporal_buffer,
         algorithm=args.algorithm,
         groundtruth_dir=args.groundtruth,
+        num_workers=args.workers,
+        no_gpu=args.no_gpu,
     )
 
 
