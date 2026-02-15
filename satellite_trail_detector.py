@@ -35,10 +35,12 @@ import argparse
 import sys
 import time
 import os
+import json
 import multiprocessing
 from pathlib import Path
 from abc import ABC, abstractmethod
 from collections import deque
+from datetime import datetime, timezone
 
 try:
     from scipy.ndimage import maximum_filter as _scipy_maximum_filter
@@ -1196,6 +1198,1370 @@ class TemporalFrameBuffer:
             'reference': self._reference,
             'buffer_depth': len(self._frames),
         }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  HITL (Human-in-the-Loop) Reinforcement Learning Components
+# ═══════════════════════════════════════════════════════════════════════
+
+PARAMETER_SAFETY_BOUNDS = {
+    'satellite_contrast_min':   (1.01,  1.30),
+    'satellite_min_length':     (20,    200),
+    'satellite_max_length':     (300,   2000),
+    'canny_low':                (1,     30),
+    'canny_high':               (20,    150),
+    'hough_threshold':          (10,    80),
+    'min_line_length':          (15,    120),
+    'max_line_gap':             (10,    100),
+    'brightness_threshold':     (5,     50),
+    'airplane_brightness_min':  (20,    150),
+    'airplane_saturation_min':  (1,     25),
+    'min_aspect_ratio':         (2,     8),
+    'mf_snr_threshold':         (1.5,   5.0),
+    'mf_sigma_perp':            (0.3,   2.0),
+}
+
+CORRECTION_RULES = {
+    ('reject', 'satellite'): [
+        {
+            'param': 'satellite_contrast_min',
+            'diagnostic': lambda meta: meta.get('contrast_ratio'),
+            'direction': 'raise',
+            'target_fn': lambda diag_val, current: max(current, diag_val + 0.01),
+        },
+        {
+            'param': 'satellite_min_length',
+            'diagnostic': lambda meta: meta.get('length'),
+            'direction': 'raise',
+            'condition': lambda meta, params: meta.get('length', 999) < params.get('satellite_min_length', 60) * 1.5,
+            'target_fn': lambda diag_val, current: max(current, diag_val + 5),
+        },
+    ],
+    ('reject', 'airplane'): [
+        {
+            'param': 'airplane_brightness_min',
+            'diagnostic': lambda meta: meta.get('avg_brightness'),
+            'direction': 'raise',
+            'target_fn': lambda diag_val, current: max(current, diag_val + 5),
+        },
+    ],
+    ('add_missed', 'satellite'): [
+        {
+            'param': 'satellite_contrast_min',
+            'diagnostic': lambda meta: meta.get('contrast_ratio'),
+            'direction': 'lower',
+            'target_fn': lambda diag_val, current: min(current, max(1.01, diag_val - 0.005)),
+        },
+        {
+            'param': 'satellite_min_length',
+            'diagnostic': lambda meta: meta.get('length'),
+            'direction': 'lower',
+            'target_fn': lambda diag_val, current: min(current, max(20, diag_val - 10)),
+        },
+        {
+            'param': 'mf_snr_threshold',
+            'diagnostic': lambda meta: meta.get('trail_snr'),
+            'direction': 'lower',
+            'condition': lambda meta, params: meta.get('trail_snr') is not None,
+            'target_fn': lambda diag_val, current: min(current, max(1.5, diag_val - 0.2)),
+        },
+    ],
+    ('add_missed', 'airplane'): [
+        {
+            'param': 'airplane_brightness_min',
+            'diagnostic': lambda meta: meta.get('avg_brightness'),
+            'direction': 'lower',
+            'target_fn': lambda diag_val, current: min(current, max(20, diag_val - 5)),
+        },
+    ],
+    ('reclassify_to_airplane', 'satellite'): [
+        {
+            'param': 'airplane_brightness_min',
+            'diagnostic': lambda meta: meta.get('avg_brightness'),
+            'direction': 'lower',
+            'target_fn': lambda diag_val, current: min(current, diag_val - 5),
+        },
+    ],
+    ('reclassify_to_satellite', 'airplane'): [
+        {
+            'param': 'airplane_brightness_min',
+            'diagnostic': lambda meta: meta.get('avg_brightness'),
+            'direction': 'raise',
+            'target_fn': lambda diag_val, current: max(current, diag_val + 10),
+        },
+    ],
+}
+
+
+class AnnotationDatabase:
+    """COCO-compatible annotation database with correction tracking.
+
+    Manages detection annotations, human corrections, and session metadata.
+    Supports loading/saving to JSON and export to pure COCO format.
+    """
+
+    CATEGORY_MAP = {0: 'satellite', 1: 'airplane'}
+    CATEGORY_ID = {'satellite': 0, 'airplane': 1}
+
+    def __init__(self, path=None):
+        """Load existing database or create empty one."""
+        self._path = Path(path) if path else None
+        self._next_image_id = 1
+        self._next_annotation_id = 1
+        self._next_missed_id = 1
+        self._next_correction_id = 1
+        self._current_session_id = None
+
+        self.data = {
+            'info': {
+                'description': 'Mnemosky HITL annotation database',
+                'version': '1.0',
+                'date_created': datetime.now(timezone.utc).isoformat(),
+            },
+            'categories': [
+                {'id': 0, 'name': 'satellite', 'supercategory': 'trail'},
+                {'id': 1, 'name': 'airplane', 'supercategory': 'trail'},
+            ],
+            'images': [],
+            'annotations': [],
+            'missed_annotations': [],
+            'corrections': [],
+            'sessions': [],
+            'learned_parameters': {
+                'current': {},
+                'update_count': 0,
+                'last_updated': None,
+                'history': [],
+            },
+        }
+
+        if path and Path(path).exists():
+            self._load(path)
+
+    def _load(self, path):
+        """Load database from JSON file."""
+        with open(path, 'r') as f:
+            loaded = json.load(f)
+        self.data.update(loaded)
+        # Rebuild ID counters
+        if self.data['images']:
+            self._next_image_id = max(img['id'] for img in self.data['images']) + 1
+        if self.data['annotations']:
+            self._next_annotation_id = max(a['id'] for a in self.data['annotations']) + 1
+        if self.data['missed_annotations']:
+            self._next_missed_id = max(m['id'] for m in self.data['missed_annotations']) + 1
+        if self.data['corrections']:
+            self._next_correction_id = max(c['id'] for c in self.data['corrections']) + 1
+
+    def add_image(self, frame_index, video_source, width, height):
+        """Register a frame image, return image_id."""
+        # Check if image already exists for this frame
+        for img in self.data['images']:
+            if img['frame_index'] == frame_index and img['video_source'] == video_source:
+                return img['id']
+
+        img_id = self._next_image_id
+        self._next_image_id += 1
+        stem = Path(video_source).stem
+        self.data['images'].append({
+            'id': img_id,
+            'file_name': f'{stem}_f{frame_index:06d}.jpg',
+            'width': width,
+            'height': height,
+            'frame_index': frame_index,
+            'video_source': video_source,
+            'session_id': self._current_session_id,
+        })
+        return img_id
+
+    def add_detection(self, image_id, category_id, bbox_xyxy, detection_info,
+                      params_snapshot, confidence):
+        """Add a detector-produced annotation, return annotation_id.
+        Converts from internal (x_min, y_min, x_max, y_max) to COCO (x, y, w, h)."""
+        ann_id = self._next_annotation_id
+        self._next_annotation_id += 1
+        x_min, y_min, x_max, y_max = [int(v) for v in bbox_xyxy]
+        coco_bbox = [x_min, y_min, x_max - x_min, y_max - y_min]
+        area = coco_bbox[2] * coco_bbox[3]
+
+        # Build detection metadata from detection_info
+        det_meta = {}
+        for key in ('angle', 'center', 'length', 'avg_brightness', 'max_brightness',
+                     'line', 'contrast_ratio', 'brightness_std', 'trail_snr',
+                     'has_dotted_pattern', 'avg_saturation'):
+            if key in detection_info:
+                val = detection_info[key]
+                # Convert numpy types to native Python for JSON
+                if isinstance(val, (np.integer,)):
+                    val = int(val)
+                elif isinstance(val, (np.floating,)):
+                    val = float(val)
+                elif isinstance(val, tuple):
+                    val = [float(v) if isinstance(v, (np.floating, np.integer)) else v for v in val]
+                det_meta[key] = val
+
+        self.data['annotations'].append({
+            'id': ann_id,
+            'image_id': image_id,
+            'category_id': category_id,
+            'bbox': coco_bbox,
+            'area': area,
+            'iscrowd': 0,
+            'mnemosky_ext': {
+                'source': 'detector',
+                'status': 'pending',
+                'confidence': round(confidence, 4),
+                'review_action': None,
+                'reviewed_at': None,
+                'detection_meta': det_meta,
+                'original_category_id': category_id,
+                'original_bbox': coco_bbox[:],
+                'parameters_snapshot': dict(params_snapshot) if params_snapshot else {},
+            },
+        })
+        return ann_id
+
+    def add_missed(self, image_id, category_id, bbox_xyxy, estimated_meta=None):
+        """Add a user-marked missed detection, return missed_annotation_id."""
+        mid = self._next_missed_id
+        self._next_missed_id += 1
+        x_min, y_min, x_max, y_max = [int(v) for v in bbox_xyxy]
+        coco_bbox = [x_min, y_min, x_max - x_min, y_max - y_min]
+
+        entry = {
+            'id': mid,
+            'image_id': image_id,
+            'category_id': category_id,
+            'bbox': coco_bbox,
+            'area': coco_bbox[2] * coco_bbox[3],
+            'marked_at': datetime.now(timezone.utc).isoformat(),
+            'session_id': self._current_session_id,
+            'estimated_meta': estimated_meta or {},
+        }
+        self.data['missed_annotations'].append(entry)
+
+        # Record as correction
+        self.record_correction(None, 'add_missed',
+                               new_category_id=category_id,
+                               new_bbox=coco_bbox,
+                               missed_annotation_id=mid)
+        return mid
+
+    def record_correction(self, annotation_id, action,
+                          new_category_id=None, new_bbox=None, notes=None,
+                          missed_annotation_id=None):
+        """Record a human correction action."""
+        cid = self._next_correction_id
+        self._next_correction_id += 1
+
+        prev_status = None
+        prev_cat = None
+        new_status = None
+
+        if annotation_id is not None:
+            ann = self._get_annotation(annotation_id)
+            if ann:
+                prev_status = ann['mnemosky_ext']['status']
+                prev_cat = ann['category_id']
+                if action == 'accept':
+                    ann['mnemosky_ext']['status'] = 'confirmed'
+                    ann['mnemosky_ext']['review_action'] = 'accepted'
+                    new_status = 'confirmed'
+                elif action == 'reject':
+                    ann['mnemosky_ext']['status'] = 'rejected'
+                    ann['mnemosky_ext']['review_action'] = 'rejected'
+                    new_status = 'rejected'
+                elif action == 'reclassify':
+                    ann['mnemosky_ext']['status'] = 'confirmed'
+                    ann['mnemosky_ext']['review_action'] = 'reclassified'
+                    if new_category_id is not None:
+                        ann['category_id'] = new_category_id
+                    new_status = 'confirmed'
+                elif action == 'adjust_bbox':
+                    if new_bbox is not None:
+                        ann['bbox'] = new_bbox[:]
+                        ann['area'] = new_bbox[2] * new_bbox[3]
+                    new_status = ann['mnemosky_ext']['status']
+                ann['mnemosky_ext']['reviewed_at'] = datetime.now(timezone.utc).isoformat()
+        elif action == 'add_missed':
+            new_status = 'confirmed'
+
+        correction = {
+            'id': cid,
+            'annotation_id': annotation_id,
+            'session_id': self._current_session_id,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'action': action,
+            'previous_status': prev_status,
+            'new_status': new_status,
+            'previous_category_id': prev_cat,
+            'new_category_id': new_category_id,
+            'previous_bbox': None,
+            'new_bbox': new_bbox,
+            'notes': notes,
+        }
+        if missed_annotation_id is not None:
+            correction['missed_annotation_id'] = missed_annotation_id
+        self.data['corrections'].append(correction)
+        return cid
+
+    def _get_annotation(self, annotation_id):
+        """Get annotation by ID."""
+        for ann in self.data['annotations']:
+            if ann['id'] == annotation_id:
+                return ann
+        return None
+
+    def get_calibration_set(self):
+        """Build calibration set for the learning loop.
+        Returns list of (detection_meta, true_label, detector_label) tuples."""
+        cal_set = []
+
+        for ann in self.data['annotations']:
+            ext = ann['mnemosky_ext']
+            meta = ext.get('detection_meta', {})
+            detector_label = self.CATEGORY_MAP.get(ext['original_category_id'])
+
+            if ext['status'] == 'confirmed':
+                true_label = self.CATEGORY_MAP.get(ann['category_id'])
+                cal_set.append((meta, true_label, detector_label))
+            elif ext['status'] == 'rejected':
+                cal_set.append((meta, None, detector_label))
+
+        for missed in self.data['missed_annotations']:
+            meta = missed.get('estimated_meta', {})
+            true_label = self.CATEGORY_MAP.get(missed['category_id'])
+            cal_set.append((meta, true_label, None))
+
+        return cal_set
+
+    def get_pending_annotations(self, image_id=None):
+        """Get annotations awaiting review, sorted by confidence (low first)."""
+        pending = []
+        for ann in self.data['annotations']:
+            if ann['mnemosky_ext']['status'] != 'pending':
+                continue
+            if image_id is not None and ann['image_id'] != image_id:
+                continue
+            pending.append(ann)
+        pending.sort(key=lambda a: a['mnemosky_ext'].get('confidence', 0.5))
+        return pending
+
+    def get_frames_needing_review(self):
+        """Get image_ids sorted by minimum detection confidence."""
+        frame_min_conf = {}
+        for ann in self.data['annotations']:
+            if ann['mnemosky_ext']['status'] != 'pending':
+                continue
+            img_id = ann['image_id']
+            conf = ann['mnemosky_ext'].get('confidence', 0.5)
+            if img_id not in frame_min_conf or conf < frame_min_conf[img_id]:
+                frame_min_conf[img_id] = conf
+        return sorted(frame_min_conf.keys(), key=lambda k: frame_min_conf[k])
+
+    def get_image_by_id(self, image_id):
+        """Get image entry by ID."""
+        for img in self.data['images']:
+            if img['id'] == image_id:
+                return img
+        return None
+
+    def get_annotations_for_image(self, image_id):
+        """Get all annotations for a given image."""
+        return [a for a in self.data['annotations'] if a['image_id'] == image_id]
+
+    def get_missed_for_image(self, image_id):
+        """Get all missed annotations for a given image."""
+        return [m for m in self.data['missed_annotations'] if m['image_id'] == image_id]
+
+    def start_session(self, video_source, sensitivity, algorithm, params):
+        """Begin a new review session."""
+        ts = datetime.now(timezone.utc)
+        self._current_session_id = f"sess_{ts.strftime('%Y%m%d_%H%M%S')}"
+        self.data['sessions'].append({
+            'id': self._current_session_id,
+            'video_source': video_source,
+            'started_at': ts.isoformat(),
+            'completed_at': None,
+            'sensitivity': sensitivity,
+            'algorithm': algorithm,
+            'frames_reviewed': 0,
+            'total_frames': 0,
+            'corrections_count': 0,
+            'accepted_count': 0,
+            'rejected_count': 0,
+            'reclassified_count': 0,
+            'missed_count': 0,
+            'parameters_before': dict(params),
+            'parameters_after': None,
+        })
+
+    def end_session(self, params_after=None):
+        """Finalize current session with post-learning parameters."""
+        if not self._current_session_id:
+            return
+        for sess in self.data['sessions']:
+            if sess['id'] == self._current_session_id:
+                sess['completed_at'] = datetime.now(timezone.utc).isoformat()
+                if params_after:
+                    sess['parameters_after'] = dict(params_after)
+                # Count corrections for this session
+                session_corrections = [c for c in self.data['corrections']
+                                       if c['session_id'] == self._current_session_id]
+                sess['corrections_count'] = len(session_corrections)
+                sess['accepted_count'] = sum(1 for c in session_corrections if c['action'] == 'accept')
+                sess['rejected_count'] = sum(1 for c in session_corrections if c['action'] == 'reject')
+                sess['reclassified_count'] = sum(1 for c in session_corrections if c['action'] == 'reclassify')
+                sess['missed_count'] = sum(1 for c in session_corrections if c['action'] == 'add_missed')
+                break
+
+    def save(self, path=None):
+        """Write database to JSON file."""
+        save_path = Path(path) if path else self._path
+        if not save_path:
+            return
+        with open(save_path, 'w') as f:
+            json.dump(self.data, f, indent=2, default=str)
+
+    def export_coco(self, path):
+        """Export pure COCO format (confirmed annotations only)."""
+        coco = {
+            'images': self.data['images'][:],
+            'annotations': [],
+            'categories': self.data['categories'][:],
+        }
+        ann_id = 1
+        for ann in self.data['annotations']:
+            if ann['mnemosky_ext']['status'] == 'confirmed':
+                coco['annotations'].append({
+                    'id': ann_id,
+                    'image_id': ann['image_id'],
+                    'category_id': ann['category_id'],
+                    'bbox': ann['bbox'],
+                    'area': ann['area'],
+                    'iscrowd': 0,
+                })
+                ann_id += 1
+        # Include missed annotations as regular annotations
+        for missed in self.data['missed_annotations']:
+            coco['annotations'].append({
+                'id': ann_id,
+                'image_id': missed['image_id'],
+                'category_id': missed['category_id'],
+                'bbox': missed['bbox'],
+                'area': missed['area'],
+                'iscrowd': 0,
+            })
+            ann_id += 1
+        with open(path, 'w') as f:
+            json.dump(coco, f, indent=2)
+
+    def undo_last_correction(self):
+        """Undo the most recent correction. Returns True if successful."""
+        if not self.data['corrections']:
+            return False
+        correction = self.data['corrections'].pop()
+        ann_id = correction.get('annotation_id')
+        if ann_id is not None:
+            ann = self._get_annotation(ann_id)
+            if ann:
+                # Restore previous status
+                if correction['previous_status']:
+                    ann['mnemosky_ext']['status'] = correction['previous_status']
+                if correction['previous_category_id'] is not None:
+                    ann['category_id'] = correction['previous_category_id']
+                ann['mnemosky_ext']['review_action'] = None
+                ann['mnemosky_ext']['reviewed_at'] = None
+        if correction['action'] == 'add_missed' and correction.get('missed_annotation_id'):
+            # Remove the missed annotation
+            self.data['missed_annotations'] = [
+                m for m in self.data['missed_annotations']
+                if m['id'] != correction['missed_annotation_id']
+            ]
+        return True
+
+
+class ParameterAdapter:
+    """Adapts detection parameters from human corrections.
+
+    Tier 1: Immediate EMA adaptation per correction.
+    Tier 2: Batch coordinate-wise golden section search over calibration set.
+    """
+
+    def __init__(self, initial_params, safety_bounds=None):
+        """Initialize with starting parameters and safety bounds."""
+        self.params = dict(initial_params)
+        self.safety_bounds = safety_bounds or PARAMETER_SAFETY_BOUNDS
+        self.update_counts = {p: 0 for p in initial_params}
+        self.base_lr = 0.3
+        self.decay_rate = 0.1
+
+    def apply_correction(self, correction_action, trail_type, detection_meta):
+        """Tier 1: Apply single correction via EMA. Returns {param: new_value} updates."""
+        key = (correction_action, trail_type)
+        rules = CORRECTION_RULES.get(key, [])
+
+        updates = {}
+        for rule in rules:
+            param = rule['param']
+            if param not in self.params:
+                continue
+            if 'condition' in rule and not rule['condition'](detection_meta, self.params):
+                continue
+            diag_val = rule['diagnostic'](detection_meta)
+            if diag_val is None:
+                continue
+
+            target = rule['target_fn'](diag_val, self.params[param])
+            n = self.update_counts.get(param, 0)
+            alpha = self.base_lr / (1.0 + n * self.decay_rate)
+
+            new_val = self.params[param] + alpha * (target - self.params[param])
+            lo, hi = self.safety_bounds.get(param, (float('-inf'), float('inf')))
+            new_val = max(lo, min(hi, new_val))
+
+            self.params[param] = new_val
+            self.update_counts[param] = n + 1
+            updates[param] = new_val
+
+        return updates
+
+    def optimize_batch(self, calibration_set):
+        """Tier 2: Run coordinate-wise golden section search.
+        Returns optimized parameters dict."""
+        if len(calibration_set) < 10:
+            return dict(self.params)
+
+        params = dict(self.params)
+        best_loss = self._compute_loss(params, calibration_set)
+
+        phi = (1 + 5 ** 0.5) / 2
+        resphi = 2 - phi
+
+        optimizable = [p for p in [
+            'satellite_contrast_min', 'satellite_min_length', 'satellite_max_length',
+            'canny_low', 'canny_high', 'hough_threshold', 'min_line_length',
+            'max_line_gap', 'brightness_threshold', 'airplane_brightness_min',
+            'airplane_saturation_min', 'min_aspect_ratio', 'mf_snr_threshold',
+        ] if p in params and p in self.safety_bounds]
+
+        for _ in range(3):
+            improved = False
+            for param_name in optimizable:
+                lo, hi = self.safety_bounds[param_name]
+                a, b = lo, hi
+                x1 = a + resphi * (b - a)
+                x2 = b - resphi * (b - a)
+
+                test = dict(params)
+                test[param_name] = x1
+                f1 = self._compute_loss(test, calibration_set)
+                test[param_name] = x2
+                f2 = self._compute_loss(test, calibration_set)
+
+                for __ in range(15):
+                    if f1 < f2:
+                        b = x2
+                        x2 = x1
+                        f2 = f1
+                        x1 = a + resphi * (b - a)
+                        test[param_name] = x1
+                        f1 = self._compute_loss(test, calibration_set)
+                    else:
+                        a = x1
+                        x1 = x2
+                        f1 = f2
+                        x2 = b - resphi * (b - a)
+                        test[param_name] = x2
+                        f2 = self._compute_loss(test, calibration_set)
+
+                optimal = (a + b) / 2
+                test[param_name] = optimal
+                new_loss = self._compute_loss(test, calibration_set)
+                if new_loss < best_loss:
+                    params[param_name] = optimal
+                    best_loss = new_loss
+                    improved = True
+
+            if not improved:
+                break
+
+        # Reversion safety: reject if >20% worse
+        original_loss = self._compute_loss(self.params, calibration_set)
+        if best_loss > original_loss * 1.2:
+            return dict(self.params)
+
+        self.params = params
+        return dict(params)
+
+    @staticmethod
+    def _simulate_classify(meta, params):
+        """Simulate whether a detection would pass classification with given params."""
+        contrast = meta.get('contrast_ratio', 1.0)
+        length = meta.get('length', 0)
+        brightness = meta.get('avg_brightness', 0)
+        brightness_std = meta.get('brightness_std', 0)
+        has_dotted = meta.get('has_dotted_pattern', False)
+
+        if contrast < params.get('satellite_contrast_min', 1.08):
+            return False, None
+        if length < params.get('satellite_min_length', 60):
+            return False, None
+        if length > params.get('satellite_max_length', 1400):
+            return False, None
+
+        is_bright = brightness > params.get('airplane_brightness_min', 45)
+        if has_dotted and is_bright:
+            return True, 'airplane'
+
+        is_dim = brightness < params.get('airplane_brightness_min', 45)
+        brightness_var = brightness_std / (brightness + 1e-5)
+        is_smooth = brightness_var < 0.40
+        if is_dim and is_smooth:
+            return True, 'satellite'
+
+        return False, None
+
+    @staticmethod
+    def _compute_loss(params, calibration_set, weights=None):
+        """Evaluate a parameter vector against the calibration set."""
+        if weights is None:
+            weights = {'fp': 1.0, 'fn': 2.0, 'mc': 0.5}
+        fp_count = fn_count = mc_count = 0
+
+        for meta, true_label, detector_label in calibration_set:
+            would_detect, predicted_label = ParameterAdapter._simulate_classify(meta, params)
+            if true_label is None:
+                if would_detect:
+                    fp_count += 1
+            elif detector_label is None:
+                if not would_detect:
+                    fn_count += 1
+            else:
+                if not would_detect:
+                    fn_count += 1
+                elif predicted_label != true_label:
+                    mc_count += 1
+
+        return (weights['fp'] * fp_count +
+                weights['fn'] * fn_count +
+                weights['mc'] * mc_count)
+
+    def get_params(self):
+        """Get current parameter values."""
+        return dict(self.params)
+
+    def save_profile(self, profile_name='default'):
+        """Save learned parameters to ~/.mnemosky/learned_params.json."""
+        profile_dir = Path.home() / '.mnemosky'
+        profile_dir.mkdir(exist_ok=True)
+        profile_path = profile_dir / 'learned_params.json'
+
+        profiles = {'version': 1, 'profiles': {}, 'active_profile': profile_name}
+        if profile_path.exists():
+            try:
+                with open(profile_path, 'r') as f:
+                    profiles = json.load(f)
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        profiles['profiles'][profile_name] = {
+            'parameters': dict(self.params),
+            'calibration_stats': {
+                'total_corrections': sum(self.update_counts.values()),
+            },
+            'last_updated': datetime.now(timezone.utc).isoformat(),
+        }
+        profiles['active_profile'] = profile_name
+
+        with open(profile_path, 'w') as f:
+            json.dump(profiles, f, indent=2)
+
+    def load_profile(self, profile_name='default'):
+        """Load learned parameters from profile. Returns True if found."""
+        profile_path = Path.home() / '.mnemosky' / 'learned_params.json'
+        if not profile_path.exists():
+            return False
+        try:
+            with open(profile_path, 'r') as f:
+                profiles = json.load(f)
+            if profile_name in profiles.get('profiles', {}):
+                learned = profiles['profiles'][profile_name]['parameters']
+                for k, v in learned.items():
+                    if k in self.params:
+                        self.params[k] = v
+                return True
+        except (json.JSONDecodeError, KeyError):
+            pass
+        return False
+
+    @staticmethod
+    def compute_confidence(detection_info, params):
+        """Compute pseudo-confidence score for a detection."""
+        contrast = detection_info.get('contrast_ratio', 1.0)
+        snr = detection_info.get('trail_snr', 0.0) or 0.0
+        length = detection_info.get('length', 0.0)
+        brightness = detection_info.get('avg_brightness', 0.0)
+        brightness_std = detection_info.get('brightness_std', 0.0)
+
+        contrast_min = params.get('satellite_contrast_min', 1.08)
+        contrast_margin = (contrast - contrast_min) / max(contrast_min, 0.01)
+        snr_margin = (snr - 2.5) / 2.5 if snr > 0 else 0
+
+        min_len = params.get('satellite_min_length', 60)
+        max_len = params.get('satellite_max_length', 1400)
+        len_mid = (min_len + max_len) / 2
+        len_range = max_len - min_len
+        length_score = 1.0 - min(1.0, 2 * abs(length - len_mid) / max(len_range, 1)) if len_range > 0 else 0.5
+
+        smoothness = 1.0 - min(1.0, brightness_std / (brightness + 1e-5) / 0.4)
+
+        raw = (0.30 * max(0, min(1, contrast_margin * 5))
+             + 0.25 * max(0, min(1, snr_margin * 2))
+             + 0.20 * max(0, length_score)
+             + 0.25 * max(0, smoothness))
+
+        return 1.0 / (1.0 + np.exp(-6 * (raw - 0.5)))
+
+
+class ReviewUI:
+    """Interactive review interface for HITL correction workflow.
+
+    Single OpenCV window with dark theme matching the existing preview GUI.
+    Displays detections for review, handles keyboard/mouse interaction,
+    and feeds corrections to AnnotationDatabase and ParameterAdapter.
+    """
+
+    # Theme colours (BGR)
+    BG_COLOR = (30, 30, 30)
+    PANEL_COLOR = (42, 42, 42)
+    TEXT_COLOR = (210, 210, 210)
+    DIM_TEXT = (120, 120, 120)
+    ACCENT = (200, 255, 80)          # Fluorescent green-yellow
+    CONFIRMED_COLOR = (80, 200, 80)  # Green
+    REJECTED_COLOR = (80, 80, 180)   # Dim red
+    MISSED_COLOR = (255, 100, 200)   # Magenta
+    AMBER = (0, 200, 255)            # Warning amber
+
+    SIDEBAR_W = 280
+    STATUS_H = 56
+    WINDOW_NAME = 'Mnemosky Review'
+
+    def __init__(self, video_path, detections_by_frame, detector,
+                 annotation_db, param_adapter=None, auto_accept_threshold=0.9):
+        self.video_path = video_path
+        self.detections_by_frame = detections_by_frame or {}
+        self.detector = detector
+        self.ann_db = annotation_db
+        self.param_adapter = param_adapter
+        self.auto_accept_threshold = auto_accept_threshold
+
+        self.cap = cv2.VideoCapture(video_path)
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.vid_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.vid_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        self.current_frame_idx = -1
+        self.current_frame = None
+        self.selected_ann_idx = 0
+        self.current_annotations = []
+        self.current_missed = []
+
+        self.mark_mode = False
+        self.mark_start = None
+        self.mark_end = None
+
+        # Frame index list ordered by review priority
+        self.review_queue = []
+        self._build_review_queue()
+
+        # Session stats
+        self.stats = {'reviewed': 0, 'accepted': 0, 'rejected': 0,
+                      'reclassified': 0, 'missed': 0}
+
+        self.running = True
+        self.help_visible = False
+        self.full_frame_mode = False
+
+    def _build_review_queue(self):
+        """Build frame review queue sorted by minimum confidence."""
+        frames_with_detections = sorted(self.detections_by_frame.keys())
+        if not frames_with_detections:
+            self.review_queue = []
+            return
+
+        # Build confidence map from annotation DB
+        frame_confs = {}
+        for img in self.ann_db.data['images']:
+            fi = img['frame_index']
+            pending = self.ann_db.get_pending_annotations(img['id'])
+            if pending:
+                min_conf = min(a['mnemosky_ext'].get('confidence', 0.5) for a in pending)
+                frame_confs[fi] = min_conf
+
+        # Sort by confidence (lowest first), then by frame index
+        self.review_queue = sorted(
+            frames_with_detections,
+            key=lambda fi: (frame_confs.get(fi, 1.0), fi))
+
+    def run(self):
+        """Main event loop."""
+        cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL)
+        display_w = self.vid_w + (0 if self.full_frame_mode else self.SIDEBAR_W)
+        display_h = self.vid_h + self.STATUS_H
+        cv2.resizeWindow(self.WINDOW_NAME, min(display_w, 1920), min(display_h, 1136))
+        cv2.setMouseCallback(self.WINDOW_NAME, self._handle_mouse)
+
+        # Navigate to first frame with detections
+        if self.review_queue:
+            self._navigate_to_frame(self.review_queue[0])
+        elif self.total_frames > 0:
+            self._navigate_to_frame(0)
+
+        while self.running:
+            canvas = self._render()
+            cv2.imshow(self.WINDOW_NAME, canvas)
+            key = cv2.waitKey(30) & 0xFF
+            if key != 255:
+                self._handle_key(key)
+
+        self.cap.release()
+        cv2.destroyWindow(self.WINDOW_NAME)
+
+    def _navigate_to_frame(self, frame_idx):
+        """Seek video to frame and load annotations."""
+        frame_idx = max(0, min(frame_idx, self.total_frames - 1))
+        if frame_idx == self.current_frame_idx and self.current_frame is not None:
+            return
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = self.cap.read()
+        if not ret:
+            return
+        self.current_frame_idx = frame_idx
+        self.current_frame = frame
+        self.selected_ann_idx = 0
+
+        # Load annotations for this frame
+        img = None
+        for im in self.ann_db.data['images']:
+            if im['frame_index'] == frame_idx:
+                img = im
+                break
+        if img:
+            self.current_annotations = self.ann_db.get_annotations_for_image(img['id'])
+            self.current_missed = self.ann_db.get_missed_for_image(img['id'])
+        else:
+            self.current_annotations = []
+            self.current_missed = []
+
+        # Sort by confidence (lowest first for review priority)
+        self.current_annotations.sort(
+            key=lambda a: a['mnemosky_ext'].get('confidence', 0.5))
+
+    def _render(self):
+        """Render current frame with overlays, sidebar, and status bar."""
+        sidebar_w = 0 if self.full_frame_mode else self.SIDEBAR_W
+        canvas_w = self.vid_w + sidebar_w
+        canvas_h = self.vid_h + self.STATUS_H
+        canvas = np.full((canvas_h, canvas_w, 3), self.BG_COLOR, dtype=np.uint8)
+
+        if self.current_frame is not None:
+            frame_display = self.current_frame.copy()
+            self._draw_overlays(frame_display)
+            canvas[0:self.vid_h, 0:self.vid_w] = frame_display
+
+        if not self.full_frame_mode:
+            self._render_sidebar(canvas)
+
+        self._render_status_bar(canvas)
+
+        if self.help_visible:
+            self._render_help(canvas)
+
+        return canvas
+
+    def _draw_overlays(self, frame):
+        """Draw detection boxes on the frame."""
+        for i, ann in enumerate(self.current_annotations):
+            ext = ann['mnemosky_ext']
+            status = ext['status']
+            is_selected = (i == self.selected_ann_idx)
+
+            # COCO bbox to xyxy
+            bx, by, bw, bh = ann['bbox']
+            x1, y1, x2, y2 = int(bx), int(by), int(bx + bw), int(by + bh)
+
+            if status == 'confirmed':
+                color = self.CONFIRMED_COLOR
+                thickness = 3 if is_selected else 1
+            elif status == 'rejected':
+                color = self.REJECTED_COLOR
+                thickness = 1
+            else:  # pending
+                color = self.ACCENT if is_selected else tuple(int(c * 0.7) for c in self.ACCENT)
+                thickness = 3 if is_selected else 2
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+
+            # Detection number label
+            label = f"#{i+1}"
+            cat_name = AnnotationDatabase.CATEGORY_MAP.get(ann['category_id'], '?')[:3].upper()
+            label += f" {cat_name}"
+            conf = ext.get('confidence', 0)
+            if conf < 0.5:
+                label += " *"
+            cv2.putText(frame, label, (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+        # Draw missed annotations
+        for missed in self.current_missed:
+            bx, by, bw, bh = missed['bbox']
+            x1, y1, x2, y2 = int(bx), int(by), int(bx + bw), int(by + bh)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), self.MISSED_COLOR, 2)
+            cv2.putText(frame, "MISSED", (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, self.MISSED_COLOR, 1, cv2.LINE_AA)
+
+        # Draw bbox being marked
+        if self.mark_mode and self.mark_start and self.mark_end:
+            cv2.rectangle(frame, self.mark_start, self.mark_end, self.MISSED_COLOR, 2)
+
+    def _render_sidebar(self, canvas):
+        """Draw detection cards, session stats, and parameter display."""
+        sx = self.vid_w
+        sy = 0
+        sw = self.SIDEBAR_W
+        sh = self.vid_h
+
+        # Background
+        canvas[sy:sy+sh, sx:sx+sw] = self.PANEL_COLOR
+
+        # Title
+        cv2.putText(canvas, "DETECTIONS", (sx + 10, sy + 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.ACCENT, 1, cv2.LINE_AA)
+        count_text = f"({len(self.current_annotations)})"
+        cv2.putText(canvas, count_text, (sx + 130, sy + 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.DIM_TEXT, 1, cv2.LINE_AA)
+
+        y = sy + 45
+        for i, ann in enumerate(self.current_annotations):
+            if y + 70 > sy + sh - 180:
+                cv2.putText(canvas, f"... +{len(self.current_annotations) - i} more",
+                            (sx + 10, y + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                            self.DIM_TEXT, 1, cv2.LINE_AA)
+                break
+
+            ext = ann['mnemosky_ext']
+            is_selected = (i == self.selected_ann_idx)
+            card_color = self.ACCENT if is_selected else self.BG_COLOR
+            cv2.rectangle(canvas, (sx + 5, y), (sx + sw - 5, y + 65), card_color,
+                          2 if is_selected else 1)
+
+            cat_name = AnnotationDatabase.CATEGORY_MAP.get(ann['category_id'], '?')[:3].upper()
+            conf = ext.get('confidence', 0.5)
+            status = ext['status']
+            status_label = {'pending': 'REVIEW', 'confirmed': 'ACCEPT', 'rejected': 'REJECT'}.get(status, status)
+            status_color = {'pending': self.AMBER, 'confirmed': self.CONFIRMED_COLOR,
+                            'rejected': self.REJECTED_COLOR}.get(status, self.DIM_TEXT)
+
+            cv2.putText(canvas, f"#{i+1} {cat_name}", (sx + 12, y + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.TEXT_COLOR, 1, cv2.LINE_AA)
+            cv2.putText(canvas, f"conf {conf:.2f}", (sx + 12, y + 35),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, self.DIM_TEXT, 1, cv2.LINE_AA)
+
+            meta = ext.get('detection_meta', {})
+            info_parts = []
+            if 'length' in meta:
+                info_parts.append(f"L={meta['length']:.0f}")
+            if 'angle' in meta:
+                info_parts.append(f"A={meta['angle']:.0f}")
+            if info_parts:
+                cv2.putText(canvas, "  ".join(info_parts), (sx + 12, y + 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.3, self.DIM_TEXT, 1, cv2.LINE_AA)
+
+            # Status badge
+            cv2.putText(canvas, f"[{status_label}]", (sx + 170, y + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, status_color, 1, cv2.LINE_AA)
+
+            if conf < 0.5:
+                cv2.putText(canvas, "*", (sx + sw - 20, y + 18),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.AMBER, 1, cv2.LINE_AA)
+
+            y += 72
+
+        # Session stats
+        stats_y = sy + sh - 170
+        cv2.line(canvas, (sx + 10, stats_y), (sx + sw - 10, stats_y), self.DIM_TEXT, 1)
+        stats_y += 20
+        cv2.putText(canvas, "SESSION STATS", (sx + 10, stats_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.ACCENT, 1, cv2.LINE_AA)
+        for label, key in [("Reviewed", "reviewed"), ("Accepted", "accepted"),
+                           ("Rejected", "rejected"), ("Reclassed", "reclassified"),
+                           ("Missed", "missed")]:
+            stats_y += 20
+            cv2.putText(canvas, f"  {label}: {self.stats[key]}", (sx + 10, stats_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, self.TEXT_COLOR, 1, cv2.LINE_AA)
+
+        # Controls hint
+        stats_y += 25
+        cv2.putText(canvas, "[H] Help  [Q] Quit", (sx + 10, stats_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, self.DIM_TEXT, 1, cv2.LINE_AA)
+
+    def _render_status_bar(self, canvas):
+        """Draw bottom bar with frame slider."""
+        bar_y = self.vid_h
+        bar_w = canvas.shape[1]
+        canvas[bar_y:bar_y + self.STATUS_H, :] = self.BG_COLOR
+
+        # Frame info
+        mode_text = "MARK MISSED" if self.mark_mode else "REVIEW"
+        cv2.putText(canvas, f"  {mode_text}", (10, bar_y + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    self.MISSED_COLOR if self.mark_mode else self.ACCENT,
+                    1, cv2.LINE_AA)
+
+        frame_text = f"frame {self.current_frame_idx + 1}/{self.total_frames}"
+        cv2.putText(canvas, frame_text, (10, bar_y + 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, self.DIM_TEXT, 1, cv2.LINE_AA)
+
+        # Frame slider
+        slider_x = 200
+        slider_w = bar_w - 400
+        slider_y = bar_y + 28
+        if slider_w > 100 and self.total_frames > 0:
+            cv2.line(canvas, (slider_x, slider_y), (slider_x + slider_w, slider_y),
+                     self.DIM_TEXT, 2)
+            pos = int(slider_x + (self.current_frame_idx / max(1, self.total_frames - 1)) * slider_w)
+            cv2.circle(canvas, (pos, slider_y), 8, self.ACCENT, -1)
+
+        # Right-side buttons
+        btn_x = bar_w - 180
+        cv2.putText(canvas, "[L] LEARN", (btn_x, bar_y + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.ACCENT, 1, cv2.LINE_AA)
+        cv2.putText(canvas, "[Ctrl+S] SAVE", (btn_x, bar_y + 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.DIM_TEXT, 1, cv2.LINE_AA)
+
+    def _render_help(self, canvas):
+        """Draw help overlay."""
+        h, w = canvas.shape[:2]
+        overlay = canvas.copy()
+        cv2.rectangle(overlay, (50, 50), (w - 50, h - 50), self.BG_COLOR, -1)
+        cv2.addWeighted(overlay, 0.95, canvas, 0.05, 0, canvas)
+        cv2.rectangle(canvas, (50, 50), (w - 50, h - 50), self.ACCENT, 2)
+
+        lines = [
+            "KEYBOARD SHORTCUTS",
+            "",
+            "A        Accept selected detection",
+            "R        Reject selected detection",
+            "S        Reclassify as satellite",
+            "P        Reclassify as airplane (plane)",
+            "M        Mark missed detection mode",
+            "Escape   Cancel / exit mark mode",
+            "Tab      Next detection",
+            "Right/D  Next frame",
+            "Left/W   Previous frame",
+            "N        Next unreviewed frame",
+            "Space    Accept all on frame",
+            "X        Reject all on frame",
+            "1-9      Select detection by number",
+            "Z        Undo last correction",
+            "L        Run learning",
+            "F        Toggle full frame view",
+            "H        Toggle this help",
+            "Q        Quit (prompts save)",
+        ]
+        y = 90
+        for line in lines:
+            color = self.ACCENT if line == "KEYBOARD SHORTCUTS" else self.TEXT_COLOR
+            size = 0.5 if line == "KEYBOARD SHORTCUTS" else 0.4
+            cv2.putText(canvas, line, (80, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        size, color, 1, cv2.LINE_AA)
+            y += 22
+
+    def _handle_key(self, key):
+        """Process keyboard input."""
+        if key == ord('q') or key == ord('Q'):
+            self._prompt_save_and_quit()
+        elif key == ord('h') or key == ord('H'):
+            self.help_visible = not self.help_visible
+        elif key == ord('f') or key == ord('F'):
+            self.full_frame_mode = not self.full_frame_mode
+        elif key == 27:  # Escape
+            if self.mark_mode:
+                self.mark_mode = False
+                self.mark_start = None
+                self.mark_end = None
+            elif self.help_visible:
+                self.help_visible = False
+        elif key == ord('a') or key == ord('A'):
+            self._accept_selected()
+        elif key == ord('r'):
+            self._reject_selected()
+        elif key == ord('s'):
+            self._reclassify_selected(0)  # satellite
+        elif key == ord('p'):
+            self._reclassify_selected(1)  # airplane
+        elif key == ord('m') or key == ord('M'):
+            self.mark_mode = not self.mark_mode
+            self.mark_start = None
+            self.mark_end = None
+        elif key == 9:  # Tab
+            if self.current_annotations:
+                self.selected_ann_idx = (self.selected_ann_idx + 1) % len(self.current_annotations)
+        elif key == ord('d') or key == ord('D') or key == 83 or key == 3:  # Right arrow
+            self._navigate_to_frame(self.current_frame_idx + 1)
+        elif key == ord('w') or key == 81 or key == 2:  # Left arrow  (w or left arrow)
+            self._navigate_to_frame(self.current_frame_idx - 1)
+        elif key == ord('n') or key == ord('N'):
+            self._next_unreviewed_frame()
+        elif key == ord(' '):  # Space = accept all
+            self._accept_all_on_frame()
+        elif key == ord('x') or key == ord('X'):
+            self._reject_all_on_frame()
+        elif key == ord('z') or key == ord('Z'):
+            self._undo()
+        elif key == ord('l') or key == ord('L'):
+            self._run_learning()
+        elif key == 19:  # Ctrl+S
+            self.ann_db.save()
+            print("Annotations saved.")
+        elif ord('1') <= key <= ord('9'):
+            idx = key - ord('1')
+            if idx < len(self.current_annotations):
+                self.selected_ann_idx = idx
+
+    def _handle_mouse(self, event, x, y, flags, param):
+        """Process mouse input."""
+        if self.mark_mode:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                self.mark_start = (x, y)
+                self.mark_end = (x, y)
+            elif event == cv2.EVENT_MOUSEMOVE and self.mark_start:
+                self.mark_end = (x, y)
+            elif event == cv2.EVENT_LBUTTONUP and self.mark_start:
+                self.mark_end = (x, y)
+                self._finish_mark_missed()
+            return
+
+        # Click on status bar slider
+        if event == cv2.EVENT_LBUTTONDOWN and y >= self.vid_h:
+            slider_x = 200
+            sidebar_w = 0 if self.full_frame_mode else self.SIDEBAR_W
+            slider_w = (self.vid_w + sidebar_w) - 400
+            if slider_w > 100 and slider_x <= x <= slider_x + slider_w:
+                frac = (x - slider_x) / slider_w
+                target = int(frac * (self.total_frames - 1))
+                self._navigate_to_frame(target)
+            return
+
+        # Click on main frame area to select detection
+        if event == cv2.EVENT_LBUTTONDOWN and x < self.vid_w and y < self.vid_h:
+            for i, ann in enumerate(self.current_annotations):
+                bx, by_, bw, bh = ann['bbox']
+                if bx <= x <= bx + bw and by_ <= y <= by_ + bh:
+                    self.selected_ann_idx = i
+                    return
+
+        # Click on sidebar card
+        if (event == cv2.EVENT_LBUTTONDOWN and not self.full_frame_mode
+                and x >= self.vid_w):
+            card_y = 45
+            for i in range(len(self.current_annotations)):
+                if card_y <= y <= card_y + 65:
+                    self.selected_ann_idx = i
+                    return
+                card_y += 72
+
+    def _accept_selected(self):
+        """Accept the currently selected detection."""
+        if not self.current_annotations or self.selected_ann_idx >= len(self.current_annotations):
+            return
+        ann = self.current_annotations[self.selected_ann_idx]
+        if ann['mnemosky_ext']['status'] == 'pending':
+            self.ann_db.record_correction(ann['id'], 'accept')
+            self.stats['accepted'] += 1
+            self.stats['reviewed'] += 1
+            self._reload_current_frame_annotations()
+
+    def _reject_selected(self):
+        """Reject the currently selected detection."""
+        if not self.current_annotations or self.selected_ann_idx >= len(self.current_annotations):
+            return
+        ann = self.current_annotations[self.selected_ann_idx]
+        if ann['mnemosky_ext']['status'] == 'pending':
+            self.ann_db.record_correction(ann['id'], 'reject')
+            self.stats['rejected'] += 1
+            self.stats['reviewed'] += 1
+            # Apply Tier 1 learning
+            if self.param_adapter:
+                trail_type = AnnotationDatabase.CATEGORY_MAP.get(ann['category_id'], 'satellite')
+                meta = ann['mnemosky_ext'].get('detection_meta', {})
+                self.param_adapter.apply_correction('reject', trail_type, meta)
+            self._reload_current_frame_annotations()
+
+    def _reclassify_selected(self, new_category_id):
+        """Reclassify the currently selected detection."""
+        if not self.current_annotations or self.selected_ann_idx >= len(self.current_annotations):
+            return
+        ann = self.current_annotations[self.selected_ann_idx]
+        if ann['category_id'] == new_category_id:
+            return
+        old_type = AnnotationDatabase.CATEGORY_MAP.get(ann['category_id'], 'satellite')
+        new_type = AnnotationDatabase.CATEGORY_MAP.get(new_category_id, 'satellite')
+        self.ann_db.record_correction(ann['id'], 'reclassify', new_category_id=new_category_id)
+        self.stats['reclassified'] += 1
+        self.stats['reviewed'] += 1
+        # Apply Tier 1 learning
+        if self.param_adapter:
+            meta = ann['mnemosky_ext'].get('detection_meta', {})
+            action = f'reclassify_to_{new_type}'
+            self.param_adapter.apply_correction(action, old_type, meta)
+        self._reload_current_frame_annotations()
+
+    def _accept_all_on_frame(self):
+        """Accept all pending detections on current frame."""
+        for ann in self.current_annotations:
+            if ann['mnemosky_ext']['status'] == 'pending':
+                self.ann_db.record_correction(ann['id'], 'accept')
+                self.stats['accepted'] += 1
+                self.stats['reviewed'] += 1
+        self._reload_current_frame_annotations()
+
+    def _reject_all_on_frame(self):
+        """Reject all pending detections on current frame."""
+        for ann in self.current_annotations:
+            if ann['mnemosky_ext']['status'] == 'pending':
+                self.ann_db.record_correction(ann['id'], 'reject')
+                self.stats['rejected'] += 1
+                self.stats['reviewed'] += 1
+                if self.param_adapter:
+                    trail_type = AnnotationDatabase.CATEGORY_MAP.get(ann['category_id'], 'satellite')
+                    meta = ann['mnemosky_ext'].get('detection_meta', {})
+                    self.param_adapter.apply_correction('reject', trail_type, meta)
+        self._reload_current_frame_annotations()
+
+    def _finish_mark_missed(self):
+        """Complete marking a missed detection."""
+        if not self.mark_start or not self.mark_end:
+            self.mark_mode = False
+            return
+        x1, y1 = self.mark_start
+        x2, y2 = self.mark_end
+        x_min, x_max = min(x1, x2), max(x1, x2)
+        y_min, y_max = min(y1, y2), max(y1, y2)
+        if x_max - x_min < 10 or y_max - y_min < 5:
+            self.mark_mode = False
+            self.mark_start = None
+            self.mark_end = None
+            return
+
+        # Find or create image entry
+        img = None
+        for im in self.ann_db.data['images']:
+            if im['frame_index'] == self.current_frame_idx:
+                img = im
+                break
+        if not img:
+            video_src = self.ann_db.data['sessions'][-1]['video_source'] if self.ann_db.data['sessions'] else self.video_path
+            img_id = self.ann_db.add_image(self.current_frame_idx, video_src, self.vid_w, self.vid_h)
+        else:
+            img_id = img['id']
+
+        # Estimate metadata from the marked region
+        estimated_meta = {}
+        if self.current_frame is not None:
+            roi = self.current_frame[y_min:y_max, x_min:x_max]
+            if roi.size > 0:
+                gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if len(roi.shape) == 3 else roi
+                estimated_meta['avg_brightness'] = float(np.mean(gray_roi))
+                estimated_meta['length'] = float(max(x_max - x_min, y_max - y_min))
+                estimated_meta['angle'] = 0.0 if (x_max - x_min) > (y_max - y_min) else 90.0
+
+        # Default to satellite for missed detections
+        category_id = 0
+        self.ann_db.add_missed(img_id, category_id, (x_min, y_min, x_max, y_max), estimated_meta)
+        self.stats['missed'] += 1
+        self.stats['reviewed'] += 1
+
+        # Apply Tier 1 learning for missed trail
+        if self.param_adapter:
+            self.param_adapter.apply_correction('add_missed', 'satellite', estimated_meta)
+
+        self.mark_mode = False
+        self.mark_start = None
+        self.mark_end = None
+        self._reload_current_frame_annotations()
+
+    def _reload_current_frame_annotations(self):
+        """Reload annotations for current frame after changes."""
+        img = None
+        for im in self.ann_db.data['images']:
+            if im['frame_index'] == self.current_frame_idx:
+                img = im
+                break
+        if img:
+            self.current_annotations = self.ann_db.get_annotations_for_image(img['id'])
+            self.current_missed = self.ann_db.get_missed_for_image(img['id'])
+            self.current_annotations.sort(
+                key=lambda a: a['mnemosky_ext'].get('confidence', 0.5))
+        if self.selected_ann_idx >= len(self.current_annotations):
+            self.selected_ann_idx = max(0, len(self.current_annotations) - 1)
+
+    def _next_unreviewed_frame(self):
+        """Jump to next frame with pending detections."""
+        for fi in self.review_queue:
+            if fi > self.current_frame_idx:
+                # Check if it has pending annotations
+                for im in self.ann_db.data['images']:
+                    if im['frame_index'] == fi:
+                        pending = self.ann_db.get_pending_annotations(im['id'])
+                        if pending:
+                            self._navigate_to_frame(fi)
+                            return
+        # Wrap around
+        for fi in self.review_queue:
+            if fi != self.current_frame_idx:
+                for im in self.ann_db.data['images']:
+                    if im['frame_index'] == fi:
+                        pending = self.ann_db.get_pending_annotations(im['id'])
+                        if pending:
+                            self._navigate_to_frame(fi)
+                            return
+
+    def _run_learning(self):
+        """Trigger Tier 2 batch optimization."""
+        if not self.param_adapter:
+            print("Learning disabled (--no-learn).")
+            return
+        cal_set = self.ann_db.get_calibration_set()
+        if len(cal_set) < 10:
+            print(f"Need at least 10 corrections for batch optimization (have {len(cal_set)}).")
+            return
+        print("Running batch parameter optimization...")
+        optimized = self.param_adapter.optimize_batch(cal_set)
+        # Update detector params
+        for k, v in optimized.items():
+            if k in self.detector.params:
+                self.detector.params[k] = v
+        print(f"Optimization complete. Updated {len(optimized)} parameters.")
+
+    def _undo(self):
+        """Undo last correction."""
+        if self.ann_db.undo_last_correction():
+            # Adjust stats (approximate -- just decrement reviewed)
+            self.stats['reviewed'] = max(0, self.stats['reviewed'] - 1)
+            self._reload_current_frame_annotations()
+            print("Undid last correction.")
+        else:
+            print("Nothing to undo.")
+
+    def _prompt_save_and_quit(self):
+        """Save and quit."""
+        self.ann_db.save()
+        if self.param_adapter:
+            self.param_adapter.save_profile()
+        print("Annotations saved. Exiting review mode.")
+        self.running = False
 
 
 class BaseDetectionAlgorithm(ABC):
@@ -4490,7 +5856,7 @@ def _worker_detect(args):
     return detected_trails, debug_info
 
 
-def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=7, algorithm='default', groundtruth_dir=None, num_workers=0, no_gpu=False):
+def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=7, algorithm='default', groundtruth_dir=None, num_workers=0, no_gpu=False, review_mode=False, review_only=False, annotations_path=None, hitl_profile='default', auto_accept=0.9, no_learn=False):
     """
     Process video to detect and highlight satellite and airplane trails.
 
@@ -4643,6 +6009,9 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     satellites_detected = 0
     airplanes_detected = 0
 
+    # ── HITL review mode: collect detections per frame ────────────
+    detections_by_frame = {} if review_mode else None
+
     # ── YOLO dataset setup ────────────────────────────────────────
     dataset_dir = None
     dataset_images = 0
@@ -4784,6 +6153,10 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         elif detect_type == 'airplanes':
             detected_trails = [(t, b) for t, b in detected_trails if t == 'airplane']
         # If detect_type == 'both', no filtering needed
+
+        # Collect detections for HITL review mode
+        if detections_by_frame is not None and detected_trails:
+            detections_by_frame[fc] = list(detected_trails)
 
         if detected_trails:
             # Count detections by type and add new frozen regions
@@ -4986,6 +6359,82 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     elif dataset_dir is not None:
         print("\nNo detections found — dataset directory is empty.")
 
+    # ── HITL Review Mode ──────────────────────────────────────────
+    if review_mode or review_only:
+        if annotations_path:
+            ann_path = Path(annotations_path)
+        else:
+            ann_path = Path(output_path).with_suffix('.json')
+
+        if review_only and ann_path.exists():
+            ann_db = AnnotationDatabase(ann_path)
+        else:
+            ann_db = AnnotationDatabase()
+
+        # Initialize parameter adapter
+        param_adapter = None
+        if not no_learn:
+            param_adapter = ParameterAdapter(detector.params, PARAMETER_SAFETY_BOUNDS)
+            if hitl_profile:
+                param_adapter.load_profile(hitl_profile)
+
+        # Populate annotations from detection results
+        if not review_only and detections_by_frame:
+            ann_db.start_session(str(input_path), sensitivity, algorithm, detector.params)
+
+            for frame_idx, detections in detections_by_frame.items():
+                img_id = ann_db.add_image(frame_idx, str(input_path), width, height)
+                for trail_type, det_info in detections:
+                    cat_id = AnnotationDatabase.CATEGORY_ID.get(trail_type, 0)
+                    confidence = ParameterAdapter.compute_confidence(det_info, detector.params)
+                    ann_db.add_detection(img_id, cat_id, det_info['bbox'],
+                                         det_info, detector.params, confidence)
+
+            # Auto-accept high-confidence detections
+            if auto_accept < 1.0:
+                auto_accepted = 0
+                for ann in ann_db.data['annotations']:
+                    if (ann['mnemosky_ext']['status'] == 'pending' and
+                            ann['mnemosky_ext'].get('confidence', 0) >= auto_accept):
+                        ann_db.record_correction(ann['id'], 'accept')
+                        auto_accepted += 1
+                if auto_accepted:
+                    print(f"Auto-accepted {auto_accepted} high-confidence detections (>= {auto_accept:.2f})")
+
+        # Launch review UI
+        print(f"\nLaunching review UI with {len(ann_db.data['annotations'])} annotations...")
+        review_ui = ReviewUI(
+            str(input_path), detections_by_frame or {}, detector,
+            ann_db, param_adapter,
+            auto_accept_threshold=auto_accept,
+        )
+        review_ui.run()
+
+        # After review: save
+        ann_db.end_session(param_adapter.get_params() if param_adapter else None)
+        ann_db.save(ann_path)
+
+        if param_adapter and hitl_profile:
+            param_adapter.save_profile(hitl_profile)
+
+        print(f"\nAnnotations saved to: {ann_path}")
+        if param_adapter:
+            print(f"Learned parameters saved to profile: {hitl_profile}")
+
+        # Print review summary
+        cal_set = ann_db.get_calibration_set()
+        confirmed = sum(1 for a in ann_db.data['annotations'] if a['mnemosky_ext']['status'] == 'confirmed')
+        rejected = sum(1 for a in ann_db.data['annotations'] if a['mnemosky_ext']['status'] == 'rejected')
+        missed_count = len(ann_db.data['missed_annotations'])
+        print(f"\n{'=' * 42}")
+        print(f"  Review Session Summary")
+        print(f"{'-' * 42}")
+        print(f"  Confirmed: {confirmed}")
+        print(f"  Rejected:  {rejected}")
+        print(f"  Missed:    {missed_count}")
+        print(f"  Calibration set: {len(cal_set)} entries")
+        print(f"{'=' * 42}")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -5150,6 +6599,53 @@ Notes:
         help='Disable CUDA GPU acceleration even if available'
     )
 
+    # --- HITL Review Mode ---
+    parser.add_argument(
+        '--review',
+        action='store_true',
+        help='Run in HITL review mode: process video, then open interactive '
+             'review UI for correcting detections and learning parameters'
+    )
+
+    parser.add_argument(
+        '--review-only',
+        action='store_true',
+        help='Open review UI on an existing annotation file without re-processing '
+             'the video. Requires --annotations.'
+    )
+
+    parser.add_argument(
+        '--annotations',
+        type=str,
+        default=None,
+        help='Path to annotation JSON file. Used with --review-only to load '
+             'existing annotations, or with --review to specify output path.'
+    )
+
+    parser.add_argument(
+        '--hitl-profile',
+        type=str,
+        default='default',
+        help='Name of the learned parameter profile to load/save '
+             '(stored in ~/.mnemosky/learned_params.json). Default: "default"'
+    )
+
+    parser.add_argument(
+        '--auto-accept',
+        type=float,
+        default=0.9,
+        help='Confidence threshold for auto-accepting detections in review mode. '
+             'Detections with confidence above this value are pre-accepted. '
+             'Set to 1.0 to disable auto-accept. Default: 0.9'
+    )
+
+    parser.add_argument(
+        '--no-learn',
+        action='store_true',
+        help='Disable parameter learning in review mode (corrections are still '
+             'saved to the annotation database, but parameters are not updated)'
+    )
+
     args = parser.parse_args()
 
     # Handle preprocessing preview if requested
@@ -5162,6 +6658,18 @@ Notes:
         else:
             # Extract signal envelope (if user marked trail examples)
             signal_envelope = preprocessing_params.pop('signal_envelope', None)
+
+    # Load learned parameters profile if available
+    if args.hitl_profile and not args.review and not args.review_only:
+        adapter = ParameterAdapter({})
+        if adapter.load_profile(args.hitl_profile):
+            learned = adapter.get_params()
+            if preprocessing_params is None:
+                preprocessing_params = {}
+            for key in ['canny_low', 'canny_high']:
+                if key in learned:
+                    preprocessing_params[key] = learned[key]
+            print(f"Loaded learned parameters from profile: {args.hitl_profile}")
 
     process_video(
         args.input,
@@ -5184,6 +6692,12 @@ Notes:
         groundtruth_dir=args.groundtruth,
         num_workers=args.workers,
         no_gpu=args.no_gpu,
+        review_mode=args.review,
+        review_only=args.review_only,
+        annotations_path=args.annotations,
+        hitl_profile=args.hitl_profile,
+        auto_accept=args.auto_accept,
+        no_learn=args.no_learn,
     )
 
 
