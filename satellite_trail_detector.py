@@ -2036,6 +2036,9 @@ class ReviewUI:
         self.mark_mode = False
         self.mark_start = None
         self.mark_end = None
+        self.mark_pending_bbox = None    # (x_min, y_min, x_max, y_max) awaiting category
+        self.mark_pending_meta = None    # estimated metadata awaiting category
+        self.mark_pending_img_id = None  # image ID awaiting category
 
         # Frame index list ordered by review priority
         self.review_queue = []
@@ -2250,12 +2253,22 @@ class ReviewUI:
             bx, by, bw, bh = missed['bbox']
             x1, y1, x2, y2 = int(bx), int(by), int(bx + bw), int(by + bh)
             cv2.rectangle(frame, (x1, y1), (x2, y2), self.MISSED_COLOR, 2)
-            cv2.putText(frame, "MISSED", (x1, y1 - 5),
+            cat_label = "MISSED SAT" if missed.get('category_id', 0) == 0 else "MISSED AIR"
+            cv2.putText(frame, cat_label, (x1, y1 - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, self.MISSED_COLOR, 1, cv2.LINE_AA)
 
         # Draw bbox being marked
         if self.mark_mode and self.mark_start and self.mark_end:
             cv2.rectangle(frame, self.mark_start, self.mark_end, self.MISSED_COLOR, 2)
+
+        # Draw pending mark-missed bbox with pulsing effect
+        if self.mark_pending_bbox is not None:
+            px1, py1, px2, py2 = self.mark_pending_bbox
+            pulse = 0.5 + 0.5 * abs((self._tick % 30) - 15) / 15.0
+            pcolor = tuple(int(c * pulse) for c in self.MISSED_COLOR)
+            cv2.rectangle(frame, (px1, py1), (px2, py2), pcolor, 2)
+            cv2.putText(frame, "S/P?", (px1, py1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, pcolor, 1, cv2.LINE_AA)
 
     def _render_sidebar(self, canvas):
         """Draw detection cards, session stats, and parameter display."""
@@ -2399,6 +2412,9 @@ class ReviewUI:
         if self._loading_frame:
             mode_text = "LOADING..."
             mode_color = self.AMBER
+        elif self.mark_pending_bbox is not None:
+            mode_text = "S=Satellite  P=Airplane  Esc=Cancel"
+            mode_color = self.MISSED_COLOR
         elif self.mark_mode:
             mode_text = "MARK MISSED"
             mode_color = self.MISSED_COLOR
@@ -2434,10 +2450,12 @@ class ReviewUI:
             cv2.circle(canvas, (pos, slider_y), 8, self.ACCENT, -1)
 
         # Right-side buttons
-        btn_x = bar_w - 180
-        cv2.putText(canvas, "[L] LEARN", (btn_x, bar_y + 20),
+        btn_x = bar_w - 280
+        cv2.putText(canvas, "[E] EXPORT", (btn_x, bar_y + 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.ACCENT, 1, cv2.LINE_AA)
-        cv2.putText(canvas, "[Ctrl+S] SAVE", (btn_x, bar_y + 42),
+        cv2.putText(canvas, "[L] LEARN", (btn_x + 100, bar_y + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.ACCENT, 1, cv2.LINE_AA)
+        cv2.putText(canvas, "[Ctrl+S] SAVE", (btn_x + 100, bar_y + 42),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.DIM_TEXT, 1, cv2.LINE_AA)
 
     def _render_help(self, canvas):
@@ -2455,7 +2473,7 @@ class ReviewUI:
             "R        Reject selected detection",
             "S        Reclassify as satellite",
             "P        Reclassify as airplane (plane)",
-            "M        Mark missed detection mode",
+            "M        Mark missed (draw bbox, then S/P)",
             "Escape   Cancel / exit mark mode",
             "Tab      Next detection",
             "Right/D  Next frame",
@@ -2466,6 +2484,7 @@ class ReviewUI:
             "1-9      Select detection by number",
             "Z        Undo last correction",
             "L        Run learning",
+            "E        Export YOLO dataset",
             "F        Toggle full frame view",
             "H        Toggle this help",
             "Q        Quit (prompts save)",
@@ -2480,6 +2499,20 @@ class ReviewUI:
 
     def _handle_key(self, key):
         """Process keyboard input."""
+        # Intercept category selection when a mark-missed bbox is pending
+        if self.mark_pending_bbox is not None:
+            if key == ord('s') or key == ord('S'):
+                self._commit_mark_missed(0)  # satellite
+            elif key == ord('p') or key == ord('P'):
+                self._commit_mark_missed(1)  # airplane
+            elif key == 27:  # Escape - cancel
+                self.mark_pending_bbox = None
+                self.mark_pending_meta = None
+                self.mark_pending_img_id = None
+                self._toast("Mark cancelled", self.DIM_TEXT)
+            # Ignore all other keys during pending state
+            return
+
         if key == ord('q') or key == ord('Q'):
             self._prompt_save_and_quit()
         elif key == ord('h') or key == ord('H'):
@@ -2522,6 +2555,8 @@ class ReviewUI:
             self._undo()
         elif key == ord('l') or key == ord('L'):
             self._run_learning()
+        elif key == ord('e') or key == ord('E'):
+            self._export_dataset()
         elif key == 19:  # Ctrl+S
             self.ann_db.save()
             if self.param_adapter:
@@ -2695,23 +2730,38 @@ class ReviewUI:
                 estimated_meta['length'] = float(max(x_max - x_min, y_max - y_min))
                 estimated_meta['angle'] = 0.0 if (x_max - x_min) > (y_max - y_min) else 90.0
 
-        # Default to satellite for missed detections
-        category_id = 0
-        self.ann_db.add_missed(img_id, category_id, (x_min, y_min, x_max, y_max), estimated_meta)
+        # Store pending state — user must choose category (S=satellite, P=airplane)
+        self.mark_pending_bbox = (x_min, y_min, x_max, y_max)
+        self.mark_pending_meta = estimated_meta
+        self.mark_pending_img_id = img_id
+
+        self.mark_mode = False
+        self.mark_start = None
+        self.mark_end = None
+        self._toast("S=Satellite  P=Airplane  Esc=Cancel", self.MISSED_COLOR, duration=120)
+
+    def _commit_mark_missed(self, category_id):
+        """Commit a pending missed detection with the chosen category."""
+        if self.mark_pending_bbox is None:
+            return
+        trail_type = AnnotationDatabase.CATEGORY_MAP.get(category_id, 'satellite')
+        self.ann_db.add_missed(self.mark_pending_img_id, category_id,
+                               self.mark_pending_bbox, self.mark_pending_meta)
         self.stats['missed'] += 1
         self.stats['reviewed'] += 1
 
         # Apply Tier 1 learning for missed trail
         if self.param_adapter:
-            self.param_adapter.apply_correction('add_missed', 'satellite', estimated_meta)
+            self.param_adapter.apply_correction('add_missed', trail_type,
+                                                self.mark_pending_meta)
             self.stats['param_adjustments'] += 1
 
-        length = estimated_meta.get('length', 0)
-        self._toast(f"Marked missed satellite (L={length:.0f}px)", self.MISSED_COLOR)
+        length = self.mark_pending_meta.get('length', 0)
+        self._toast(f"Marked missed {trail_type} (L={length:.0f}px)", self.MISSED_COLOR)
 
-        self.mark_mode = False
-        self.mark_start = None
-        self.mark_end = None
+        self.mark_pending_bbox = None
+        self.mark_pending_meta = None
+        self.mark_pending_img_id = None
         self._reload_current_frame_annotations()
 
     def _reload_current_frame_annotations(self):
@@ -2773,6 +2823,36 @@ class ReviewUI:
         self.stats['params_optimized'] += n_updated
         self._toast(f"Optimized {n_updated} params from {len(cal_set)} corrections",
                     self.CONFIRMED_COLOR, duration=90)
+
+    def _export_dataset(self):
+        """Export YOLO dataset from confirmed + missed annotations."""
+        # Count exportable annotations
+        n_confirmed = sum(1 for a in self.ann_db.data['annotations']
+                          if a.get('mnemosky_ext', {}).get('status') == 'confirmed')
+        n_missed = len(self.ann_db.data.get('missed_annotations', []))
+        total = n_confirmed + n_missed
+        if total == 0:
+            self._toast("No confirmed/missed annotations to export", self.AMBER)
+            return
+        # Save DB first to ensure export reads latest data
+        self.ann_db.save()
+        self._toast(f"Exporting {total} annotations...", self.ACCENT, duration=120)
+        # Render so user sees the toast
+        canvas = self._render()
+        cv2.imshow(self.WINDOW_NAME, canvas)
+        cv2.waitKey(1)
+        try:
+            ann_path = self.ann_db._path
+            if not ann_path:
+                self._toast("No annotation file path — save first", self.REJECTED_COLOR)
+                return
+            export_dataset_from_annotations(
+                input_path=self.video_path,
+                annotations_path=str(ann_path),
+            )
+            self._toast(f"Exported YOLO dataset ({total} annotations)", self.CONFIRMED_COLOR, duration=90)
+        except Exception as e:
+            self._toast(f"Export failed: {e}", self.REJECTED_COLOR, duration=90)
 
     def _undo(self):
         """Undo last correction."""
