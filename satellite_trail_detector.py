@@ -38,9 +38,10 @@ import os
 import json
 import math
 import random
+import tempfile
 import multiprocessing
 from pathlib import Path
-from abc import ABC, abstractmethod
+
 from collections import deque
 from datetime import datetime, timezone
 
@@ -1133,9 +1134,12 @@ class TemporalFrameBuffer:
         """
         self.capacity = capacity
         self._frames = []           # List of uint8 grayscale arrays
-        self._reference = None      # Cached temporal median (uint8)
+        self._reference = None      # Cached temporal median (float32)
         self._noise_map = None      # Cached per-pixel MAD noise (float32)
         self._dirty = True          # True if buffer changed since last compute
+        # Pre-allocated arrays to avoid repeated ~58MB allocations per frame
+        self._stack = None          # float32 (capacity, H, W) — reused
+        self._abs_dev = None        # float32 (capacity, H, W) — reused
 
     def add(self, gray_frame):
         """Add a grayscale frame to the buffer, evicting the oldest if full."""
@@ -1153,23 +1157,39 @@ class TemporalFrameBuffer:
         return len(self._frames)
 
     def _compute(self):
-        """Compute temporal median and noise map from the current buffer."""
+        """Compute temporal median and noise map from the current buffer.
+
+        Uses pre-allocated arrays to avoid ~116MB of allocations per frame.
+        """
         if not self._dirty:
             return
 
-        # Stack frames into a 3D array: (N, H, W)
-        stack = np.stack(self._frames, axis=0).astype(np.float32)
+        n = len(self._frames)
+        h, w = self._frames[0].shape[:2]
+
+        # Allocate or resize the pre-allocated stack (only on first call or shape change)
+        if (self._stack is None or self._stack.shape[0] < n or
+                self._stack.shape[1] != h or self._stack.shape[2] != w):
+            self._stack = np.empty((self.capacity, h, w), dtype=np.float32)
+            self._abs_dev = np.empty((self.capacity, h, w), dtype=np.float32)
+
+        # Fill stack from current frames (only the active slice)
+        for i, frame in enumerate(self._frames):
+            np.copyto(self._stack[i], frame, casting='unsafe')
+
+        active = self._stack[:n]
 
         # Per-pixel temporal median — stars and fixed pattern noise vanish
-        self._reference = np.median(stack, axis=0)
+        self._reference = np.median(active, axis=0)
 
         # Per-pixel MAD (Median Absolute Deviation) → robust noise estimate
-        # MAD is unaffected by the transient trail pixels (outliers)
-        abs_dev = np.abs(stack - self._reference[np.newaxis, :, :])
-        mad = np.median(abs_dev, axis=0)
-        self._noise_map = (mad * 1.4826).astype(np.float32)  # Gaussian σ equiv
+        np.subtract(active, self._reference[np.newaxis, :, :], out=self._abs_dev[:n])
+        np.abs(self._abs_dev[:n], out=self._abs_dev[:n])
+        mad = np.median(self._abs_dev[:n], axis=0)
+        self._noise_map = mad  # reuse the array from median
+        self._noise_map *= 1.4826  # Gaussian σ equivalent
         # Floor at 0.5 to avoid division by zero in SNR calculations
-        self._noise_map = np.maximum(self._noise_map, 0.5)
+        np.maximum(self._noise_map, 0.5, out=self._noise_map)
 
         self._dirty = False
 
@@ -1341,19 +1361,29 @@ class AnnotationDatabase:
             self._load(path)
 
     def _load(self, path):
-        """Load database from JSON file."""
-        with open(path, 'r') as f:
-            loaded = json.load(f)
-        self.data.update(loaded)
+        """Load database from JSON file, with validation and corruption recovery."""
+        try:
+            with open(path, 'r') as f:
+                loaded = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            print(f"Warning: Annotation database corrupted ({e}), starting fresh.")
+            return
+        except OSError as e:
+            print(f"Warning: Cannot read annotation database ({e}), starting fresh.")
+            return
+        # Validate expected structure before merging
+        for key in list(self.data.keys()):
+            if key in loaded and isinstance(loaded[key], type(self.data[key])):
+                self.data[key] = loaded[key]
         # Rebuild ID counters
         if self.data['images']:
-            self._next_image_id = max(img['id'] for img in self.data['images']) + 1
+            self._next_image_id = max((img.get('id', 0) for img in self.data['images']), default=0) + 1
         if self.data['annotations']:
-            self._next_annotation_id = max(a['id'] for a in self.data['annotations']) + 1
+            self._next_annotation_id = max((a.get('id', 0) for a in self.data['annotations']), default=0) + 1
         if self.data['missed_annotations']:
-            self._next_missed_id = max(m['id'] for m in self.data['missed_annotations']) + 1
+            self._next_missed_id = max((m.get('id', 0) for m in self.data['missed_annotations']), default=0) + 1
         if self.data['corrections']:
-            self._next_correction_id = max(c['id'] for c in self.data['corrections']) + 1
+            self._next_correction_id = max((c.get('id', 0) for c in self.data['corrections']), default=0) + 1
 
     def add_image(self, frame_index, video_source, width, height):
         """Register a frame image, return image_id."""
@@ -1608,22 +1638,46 @@ class AnnotationDatabase:
                 if params_after:
                     sess['parameters_after'] = dict(params_after)
                 # Count corrections for this session
-                session_corrections = [c for c in self.data['corrections']
-                                       if c['session_id'] == self._current_session_id]
-                sess['corrections_count'] = len(session_corrections)
-                sess['accepted_count'] = sum(1 for c in session_corrections if c['action'] == 'accept')
-                sess['rejected_count'] = sum(1 for c in session_corrections if c['action'] == 'reject')
-                sess['reclassified_count'] = sum(1 for c in session_corrections if c['action'] == 'reclassify')
-                sess['missed_count'] = sum(1 for c in session_corrections if c['action'] == 'add_missed')
+                counts = {'accept': 0, 'reject': 0, 'reclassify': 0, 'add_missed': 0}
+                n_sess = 0
+                for c in self.data['corrections']:
+                    if c['session_id'] == self._current_session_id:
+                        n_sess += 1
+                        action = c.get('action')
+                        if action in counts:
+                            counts[action] += 1
+                sess['corrections_count'] = n_sess
+                sess['accepted_count'] = counts['accept']
+                sess['rejected_count'] = counts['reject']
+                sess['reclassified_count'] = counts['reclassify']
+                sess['missed_count'] = counts['add_missed']
                 break
 
     def save(self, path=None):
-        """Write database to JSON file."""
+        """Write database to JSON file (atomic: write to temp, then rename)."""
         save_path = Path(path) if path else self._path
         if not save_path:
             return
-        with open(save_path, 'w') as f:
-            json.dump(self.data, f, indent=2, default=str)
+        # Warn if annotation database is getting very large
+        n_ann = len(self.data.get('annotations', []))
+        n_corr = len(self.data.get('corrections', []))
+        if n_ann + n_corr > 50000:
+            print(f"Warning: Annotation database has {n_ann} annotations and "
+                  f"{n_corr} corrections. Consider exporting and archiving.")
+        # Atomic write: dump to temp file in same directory, then os.replace
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(save_path.parent), suffix='.tmp', prefix=save_path.stem)
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump(self.data, f, indent=2, default=str)
+            os.replace(tmp_path, str(save_path))
+        except Exception:
+            # Clean up temp file on failure
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def export_coco(self, path):
         """Export pure COCO format (confirmed annotations only)."""
@@ -1855,16 +1909,22 @@ class ParameterAdapter:
 
     def save_profile(self, profile_name='default'):
         """Save learned parameters to ~/.mnemosky/learned_params.json."""
-        profile_dir = Path.home() / '.mnemosky'
-        profile_dir.mkdir(exist_ok=True)
+        try:
+            profile_dir = Path.home() / '.mnemosky'
+            profile_dir.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError) as e:
+            print(f"Warning: Cannot create profile directory ({e}), parameters not saved.")
+            return
         profile_path = profile_dir / 'learned_params.json'
 
         profiles = {'version': 1, 'profiles': {}, 'active_profile': profile_name}
         if profile_path.exists():
             try:
                 with open(profile_path, 'r') as f:
-                    profiles = json.load(f)
-            except (json.JSONDecodeError, KeyError):
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    profiles = loaded
+            except (json.JSONDecodeError, OSError):
                 pass
 
         profiles['profiles'][profile_name] = {
@@ -1887,13 +1947,15 @@ class ParameterAdapter:
         try:
             with open(profile_path, 'r') as f:
                 profiles = json.load(f)
+            if not isinstance(profiles, dict):
+                return False
             if profile_name in profiles.get('profiles', {}):
-                learned = profiles['profiles'][profile_name]['parameters']
+                learned = profiles['profiles'][profile_name].get('parameters', {})
                 for k, v in learned.items():
                     if k in self.params:
                         self.params[k] = v
                 return True
-        except (json.JSONDecodeError, KeyError):
+        except (json.JSONDecodeError, OSError, KeyError, TypeError):
             pass
         return False
 
@@ -1959,6 +2021,8 @@ class ReviewUI:
         self.auto_accept_threshold = auto_accept_threshold
 
         self.cap = cv2.VideoCapture(video_path)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Cannot open video for review: {video_path}")
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.vid_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.vid_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -2026,8 +2090,9 @@ class ReviewUI:
             fi = img['frame_index']
             pending = self.ann_db.get_pending_annotations(img['id'])
             if pending:
-                min_conf = min(a['mnemosky_ext'].get('confidence', 0.5) for a in pending)
-                frame_confs[fi] = min_conf
+                confs = [a.get('mnemosky_ext', {}).get('confidence', 0.5) for a in pending]
+                if confs:
+                    frame_confs[fi] = min(confs)
 
         # Sort by confidence (lowest first), then by frame index
         self.review_queue = sorted(
@@ -2057,6 +2122,12 @@ class ReviewUI:
             key = cv2.waitKey(30) & 0xFF
             if key != 255:
                 self._handle_key(key)
+            # Detect window closed via X button
+            try:
+                if cv2.getWindowProperty(self.WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                    self.running = False
+            except cv2.error:
+                self.running = False
 
         self.cap.release()
         cv2.destroyWindow(self.WINDOW_NAME)
@@ -2727,329 +2798,6 @@ class ReviewUI:
         self.running = False
 
 
-class BaseDetectionAlgorithm(ABC):
-    """
-    Abstract base class for trail detection algorithms.
-
-    Subclass this to implement custom detection algorithms while maintaining
-    compatibility with the processing pipeline.
-    """
-
-    def __init__(self, params):
-        """
-        Initialize the detection algorithm with parameters.
-
-        Args:
-            params: Dictionary of detection parameters
-        """
-        self.params = params
-
-    @abstractmethod
-    def preprocess_frame(self, frame):
-        """
-        Preprocess a frame for detection.
-
-        Args:
-            frame: Input BGR frame
-
-        Returns:
-            Tuple of (original_gray, preprocessed) frames
-        """
-        pass
-
-    @abstractmethod
-    def detect_lines(self, preprocessed):
-        """
-        Detect lines in preprocessed frame.
-
-        Args:
-            preprocessed: Preprocessed frame
-
-        Returns:
-            Tuple of (lines, edges) where lines is array of detected lines
-        """
-        pass
-
-    @abstractmethod
-    def classify_trail(self, line, gray_frame, color_frame):
-        """
-        Classify a detected line as satellite, airplane, or neither.
-
-        Args:
-            line: Detected line coordinates
-            gray_frame: Grayscale frame
-            color_frame: Color frame
-
-        Returns:
-            Tuple of (trail_type, detection_info) where trail_type is
-            'satellite', 'airplane', or None, and detection_info is a dict
-            with at least a 'bbox' key (x_min, y_min, x_max, y_max) plus
-            optional metadata like 'angle', 'center', 'length', etc.
-        """
-        pass
-
-    def detect_trails(self, frame, debug_info=None):
-        """
-        Main detection pipeline. Can be overridden for completely custom logic.
-
-        Args:
-            frame: Input frame
-            debug_info: Optional dict to collect debug information
-
-        Returns:
-            List of tuples: [('satellite', detection_info), ('airplane', detection_info), ...]
-            where detection_info is a dict with at least 'bbox' key.
-        """
-        gray, preprocessed = self.preprocess_frame(frame)
-        lines, edges = self.detect_lines(preprocessed)
-
-        if lines is None:
-            if debug_info is not None:
-                debug_info['all_lines'] = []
-                debug_info['all_classifications'] = []
-                debug_info['edges'] = edges
-                debug_info['gray_frame'] = gray
-            return []
-
-        classified_trails = []
-        all_classifications = []
-
-        for line in lines:
-            trail_type, detection_info = self.classify_trail(line, gray, frame)
-
-            if debug_info is not None:
-                all_classifications.append({
-                    'line': line,
-                    'type': trail_type,
-                    'detection_info': detection_info,
-                    'bbox': detection_info['bbox'] if detection_info else None,
-                })
-
-            if trail_type and detection_info:
-                classified_trails.append((trail_type, detection_info))
-
-        if debug_info is not None:
-            debug_info['all_lines'] = lines
-            debug_info['all_classifications'] = all_classifications
-            debug_info['edges'] = edges
-            debug_info['gray_frame'] = gray
-
-        # Separate by type for merging
-        satellite_boxes = [info['bbox'] for t, info in classified_trails if t == 'satellite']
-        airplane_boxes = [info['bbox'] for t, info in classified_trails if t == 'airplane']
-
-        # Merge overlapping detections within each type
-        merged_satellites = self.merge_overlapping_boxes(satellite_boxes)
-        merged_airplanes = self.merge_overlapping_boxes(airplane_boxes)
-
-        # Combine results with type labels (wrap in detection_info dicts)
-        results = [('satellite', {'bbox': bbox}) for bbox in merged_satellites]
-        results.extend([('airplane', {'bbox': bbox}) for bbox in merged_airplanes])
-
-        return results
-
-    def merge_overlapping_boxes(self, boxes, overlap_threshold=0.3):
-        """Merge overlapping bounding boxes."""
-        if not boxes:
-            return []
-
-        boxes = sorted(boxes, key=lambda b: b[0])
-        merged = []
-
-        for box in boxes:
-            if not merged:
-                merged.append(list(box))
-                continue
-
-            found_overlap = False
-            for i, mbox in enumerate(merged):
-                x1 = max(box[0], mbox[0])
-                y1 = max(box[1], mbox[1])
-                x2 = min(box[2], mbox[2])
-                y2 = min(box[3], mbox[3])
-
-                if x1 < x2 and y1 < y2:
-                    intersection = (x2 - x1) * (y2 - y1)
-                    box_area = (box[2] - box[0]) * (box[3] - box[1])
-                    mbox_area = (mbox[2] - mbox[0]) * (mbox[3] - mbox[1])
-                    min_area = min(box_area, mbox_area)
-
-                    if min_area > 0 and intersection / min_area > overlap_threshold:
-                        merged[i] = [
-                            min(box[0], mbox[0]),
-                            min(box[1], mbox[1]),
-                            max(box[2], mbox[2]),
-                            max(box[3], mbox[3])
-                        ]
-                        found_overlap = True
-                        break
-
-            if not found_overlap:
-                merged.append(list(box))
-
-        return [tuple(b) for b in merged]
-
-
-class DefaultDetectionAlgorithm(BaseDetectionAlgorithm):
-    """
-    Default detection algorithm using Hough line detection and brightness analysis.
-
-    This is the original detection implementation that identifies trails based on:
-    - Edge detection (Canny)
-    - Line detection (Hough transform)
-    - Brightness analysis (dotted vs smooth patterns)
-    - Color saturation (for airplane navigation lights)
-    """
-
-    def __init__(self, params):
-        super().__init__(params)
-
-    def preprocess_frame(self, frame):
-        """Convert frame to grayscale and enhance for trail detection."""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # Apply CLAHE for contrast enhancement (helps with dim trails)
-        # Increased clipLimit and smaller tiles for better detection of very dim satellites
-        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(6, 6))
-        enhanced = clahe.apply(gray)
-
-        # Very minimal Gaussian blur - reduced to preserve more signal and detail
-        # Using sigma=0.3 for extremely light smoothing to reduce sensor noise only
-        blurred = cv2.GaussianBlur(enhanced, (3, 3), 0.3)
-
-        return gray, blurred
-
-    def detect_lines(self, preprocessed):
-        """Detect lines using Canny edge detection and Hough transform."""
-        # Edge detection
-        edges = cv2.Canny(
-            preprocessed,
-            self.params['canny_low'],
-            self.params['canny_high']
-        )
-
-        # Morphological operations to connect broken trails
-        # Enhanced to better connect dim, fragmented, and less steady satellite trails
-        kernel = np.ones((3, 3), np.uint8)
-
-        # Dilate more aggressively to connect gaps in dim trails
-        edges = cv2.dilate(edges, kernel, iterations=3)
-        # Erode less to preserve dim features
-        edges = cv2.erode(edges, kernel, iterations=1)
-
-        # Hough line detection
-        lines = cv2.HoughLinesP(
-            edges,
-            rho=1,
-            theta=np.pi / 180,
-            threshold=self.params['hough_threshold'],
-            minLineLength=self.params['min_line_length'],
-            maxLineGap=self.params['max_line_gap']
-        )
-
-        return lines, edges
-
-    def detect_point_features(self, line, gray_frame, return_debug_info=False):
-        """
-        Detect point-like features (bright spots) along a trail using spatial analysis.
-        Returns the number of distinct bright points detected.
-
-        Args:
-            line: Detected line coordinates
-            gray_frame: Grayscale frame
-            return_debug_info: If True, return detailed debug information
-
-        Returns:
-            If return_debug_info is False: number of peaks
-            If return_debug_info is True: (num_peaks, debug_dict)
-        """
-        x1, y1, x2, y2 = line[0]
-        length = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-
-        if length < 30:
-            if return_debug_info:
-                return 0, {'sample_points': [], 'peak_indices': [], 'brightness_samples': []}
-            return 0
-
-        # Sample points along the line
-        num_samples = int(length / 5)  # Sample every 5 pixels
-        num_samples = max(10, min(num_samples, 100))  # Between 10 and 100 samples
-
-        brightness_samples = []
-        sample_points = []  # Store (x, y) coordinates for debug visualization
-
-        for i in range(num_samples):
-            t = i / (num_samples - 1) if num_samples > 1 else 0
-            px = int(x1 + t * (x2 - x1))
-            py = int(y1 + t * (y2 - y1))
-
-            # Check bounds
-            if 0 <= py < gray_frame.shape[0] and 0 <= px < gray_frame.shape[1]:
-                # Get brightness in a small neighborhood (3x3) around the point
-                y_min = max(0, py - 1)
-                y_max = min(gray_frame.shape[0], py + 2)
-                x_min = max(0, px - 1)
-                x_max = min(gray_frame.shape[1], px + 2)
-
-                neighborhood = gray_frame[y_min:y_max, x_min:x_max]
-                if neighborhood.size > 0:
-                    brightness_samples.append(np.max(neighborhood))
-                    sample_points.append((px, py))
-
-        if len(brightness_samples) < 10:
-            if return_debug_info:
-                return 0, {'sample_points': sample_points, 'peak_indices': [], 'brightness_samples': brightness_samples}
-            return 0
-
-        # Detect local maxima (bright points)
-        brightness_array = np.array(brightness_samples)
-        mean_brightness = np.mean(brightness_array)
-        std_brightness = np.std(brightness_array)
-
-        # A point is considered a "peak" if it's significantly brighter than the mean
-        # Tightened to require more prominent peaks
-        threshold = mean_brightness + std_brightness * 1.0
-        peaks = brightness_array > threshold
-
-        # Count distinct peaks.  Consecutive above-threshold samples are
-        # merged into one peak group, and peak groups closer than
-        # min_peak_separation samples apart are also merged — a single
-        # star can produce nearby brightness bumps that should not count
-        # as separate airplane navigation-light features.
-        min_peak_separation = max(5, num_samples // 10)  # ≥10 % of trail apart
-
-        num_peaks = 0
-        in_peak = False
-        peak_indices = []  # Store indices of peak starts for debug visualization
-        last_peak_end = -min_peak_separation  # Allow the first peak unconditionally
-
-        for i, is_peak in enumerate(peaks):
-            if is_peak and not in_peak:
-                if i - last_peak_end >= min_peak_separation:
-                    num_peaks += 1
-                    peak_indices.append(i)
-                else:
-                    # Too close to previous peak — merge (don't increment)
-                    pass
-                in_peak = True
-            elif not is_peak:
-                if in_peak:
-                    last_peak_end = i  # Record where this peak group ended
-                in_peak = False
-
-        if return_debug_info:
-            debug_info = {
-                'sample_points': sample_points,
-                'peak_indices': peak_indices,
-                'brightness_samples': brightness_samples,
-                'threshold': threshold,
-                'mean_brightness': mean_brightness
-            }
-            return num_peaks, debug_info
-
-        return num_peaks
-
-
 class SatelliteTrailDetector:
     """
     Satellite and airplane trail detector with configurable sensitivity presets.
@@ -3154,6 +2902,38 @@ class SatelliteTrailDetector:
         # GPU acceleration flag (CUDA filter2D, warpAffine)
         self._use_gpu = _HAS_CUDA
 
+        # Pre-compute matched filter kernel bank (48 kernels: 24 angles x 2 lengths)
+        # These depend only on num_angles, kernel_lengths, and sigma_perp —
+        # all fixed at init time.  Saves ~5-15ms per frame by avoiding
+        # repeated numpy allocations and trig calls.
+        sigma_perp = self.params.get('mf_sigma_perp', 1.0)
+        self._mf_kernel_bank = []
+        for klen in [21, 51]:
+            for i in range(24):
+                angle_deg = i * 180.0 / 24
+                kernel = self._create_matched_filter_kernel(klen, angle_deg, sigma_perp=sigma_perp)
+                noise_factor = np.sqrt(np.sum(kernel ** 2))
+                self._mf_kernel_bank.append((angle_deg, kernel, noise_factor))
+        # Pre-create GPU filter objects if CUDA is available
+        self._gpu_filters = None
+        if self._use_gpu:
+            try:
+                self._gpu_filters = []
+                for angle_deg, kernel, noise_factor in self._mf_kernel_bank:
+                    filt = cv2.cuda.createLinearFilter(cv2.CV_32F, cv2.CV_32F, kernel)
+                    self._gpu_filters.append((angle_deg, filt, noise_factor))
+            except Exception:
+                self._gpu_filters = None
+
+        # Pre-create CLAHE object (reused every frame with same parameters)
+        if self.preprocessing_params:
+            clip_limit = self.preprocessing_params.get('clahe_clip_limit', 6.0)
+            tile_size = self.preprocessing_params.get('clahe_tile_size', 6)
+        else:
+            clip_limit = 6.0
+            tile_size = 6
+        self._clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_size, tile_size))
+
         # Adapt detection parameters from user-marked trail signal envelope
         if self.signal_envelope:
             self._apply_signal_envelope(self.signal_envelope)
@@ -3215,15 +2995,10 @@ class SatelliteTrailDetector:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # Get preprocessing parameters (use custom if available, otherwise defaults)
-        # Higher CLAHE clip limit (6.0) enhances dim satellite trails more aggressively
         if self.preprocessing_params:
-            clip_limit = self.preprocessing_params.get('clahe_clip_limit', 6.0)
-            tile_size = self.preprocessing_params.get('clahe_tile_size', 6)
             blur_kernel = self.preprocessing_params.get('blur_kernel_size', 3)
             blur_sigma = self.preprocessing_params.get('blur_sigma', 0.3)
         else:
-            clip_limit = 6.0
-            tile_size = 6
             blur_kernel = 3
             blur_sigma = 0.3
 
@@ -3231,9 +3006,8 @@ class SatelliteTrailDetector:
         if blur_kernel % 2 == 0:
             blur_kernel += 1
 
-        # Apply CLAHE for contrast enhancement (helps with dim trails)
-        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_size, tile_size))
-        enhanced = clahe.apply(gray)
+        # Apply CLAHE for contrast enhancement (reuse cached object)
+        enhanced = self._clahe.apply(gray)
 
         # Apply Gaussian blur - smoothing to reduce sensor noise
         if blur_kernel >= 1 and blur_sigma > 0:
@@ -3444,34 +3218,16 @@ class SatelliteTrailDetector:
             use_noise_map = False
 
         # --- Multi-scale directional matched filter bank ---
-        # Two kernel lengths catch both short bright fragments and long dim
-        # trails.  24 angles (7.5° steps) balances angular coverage with speed.
-        # Gaussian-profile kernels smooth over angular gaps.
-        # Scale-corrected SNR ensures consistent thresholding across sizes.
-        num_angles = 24   # 7.5-degree angular resolution
-        kernel_lengths = [21, 51]  # Dual-scale: ~4.6×, 7.1× SNR boost
-
+        # Uses pre-computed kernel bank from __init__ (24 angles x 2 lengths).
         best_snr = np.zeros_like(signal)
         best_angle = np.zeros_like(signal)
 
-        # Pre-compute all kernels and noise factors
-        sigma_perp = self.params.get('mf_sigma_perp', 1.0)
-        kernels_and_factors = []
-        for klen in kernel_lengths:
-            for i in range(num_angles):
-                angle_deg = i * 180.0 / num_angles
-                kernel = self._create_matched_filter_kernel(klen, angle_deg, sigma_perp=sigma_perp)
-                noise_factor = np.sqrt(np.sum(kernel ** 2))
-                kernels_and_factors.append((angle_deg, kernel, noise_factor))
-
         # GPU-accelerated path: upload signal once, run all filters on GPU
-        if self._use_gpu:
+        if self._use_gpu and self._gpu_filters is not None:
             try:
                 gpu_signal = cv2.cuda_GpuMat()
                 gpu_signal.upload(signal)
-                for angle_deg, kernel, noise_factor in kernels_and_factors:
-                    filt = cv2.cuda.createLinearFilter(
-                        cv2.CV_32F, cv2.CV_32F, kernel)
+                for angle_deg, filt, noise_factor in self._gpu_filters:
                     gpu_response = filt.apply(gpu_signal)
                     response = gpu_response.download()
 
@@ -3487,13 +3243,14 @@ class SatelliteTrailDetector:
                 # CUDA failed at runtime — fall back to CPU for this
                 # frame and all future frames
                 self._use_gpu = False
+                self._gpu_filters = None
                 best_snr = np.zeros_like(signal)
                 best_angle = np.zeros_like(signal)
                 # Re-run on CPU (fall through below)
 
         # CPU path (default or CUDA fallback)
-        if not self._use_gpu:
-            for angle_deg, kernel, noise_factor in kernels_and_factors:
+        if not self._use_gpu or self._gpu_filters is None:
+            for angle_deg, kernel, noise_factor in self._mf_kernel_bank:
                 response = cv2.filter2D(signal, cv2.CV_32F, kernel)
 
                 if use_noise_map:
@@ -3609,35 +3366,37 @@ class SatelliteTrailDetector:
         if length < 10:
             return 0.0
 
-        n_samples = max(20, int(length / 3))
-        n_samples = min(n_samples, 200)
+        n_samples = max(20, min(200, int(length / 3)))
 
         h, w = gray_frame.shape
-        dx = (x2 - x1) / length
-        dy = (y2 - y1) / length
-        perp_dx = -dy   # Perpendicular direction
-        perp_dy = dx
-
-        trail_values = []
-        flank_values = []
+        dx_n = (x2 - x1) / length
+        dy_n = (y2 - y1) / length
+        perp_dx = -dy_n  # Perpendicular direction
+        perp_dy = dx_n
         flank_dist = 8  # Pixels from trail center to flank sample
 
-        for i in range(n_samples):
-            t = i / (n_samples - 1) if n_samples > 1 else 0
-            cx = x1 + t * (x2 - x1)
-            cy = y1 + t * (y2 - y1)
+        # Vectorized sampling: compute all coordinates at once
+        ts = np.linspace(0, 1, n_samples)
+        cx_all = x1 + ts * (x2 - x1)
+        cy_all = y1 + ts * (y2 - y1)
 
-            # Trail pixel
-            tx, ty = int(round(cx)), int(round(cy))
-            if 0 <= tx < w and 0 <= ty < h:
-                trail_values.append(float(gray_frame[ty, tx]))
+        # Trail pixels
+        tx = np.round(cx_all).astype(int)
+        ty = np.round(cy_all).astype(int)
+        t_valid = (tx >= 0) & (tx < w) & (ty >= 0) & (ty < h)
+        trail_values = gray_frame[ty[t_valid], tx[t_valid]].astype(np.float64)
 
-            # Flank pixels (both sides of the trail)
-            for sign in (-1, 1):
-                fx = int(round(cx + sign * flank_dist * perp_dx))
-                fy = int(round(cy + sign * flank_dist * perp_dy))
-                if 0 <= fx < w and 0 <= fy < h:
-                    flank_values.append(float(gray_frame[fy, fx]))
+        # Flank pixels (both sides)
+        fx_neg = np.round(cx_all - flank_dist * perp_dx).astype(int)
+        fy_neg = np.round(cy_all - flank_dist * perp_dy).astype(int)
+        fx_pos = np.round(cx_all + flank_dist * perp_dx).astype(int)
+        fy_pos = np.round(cy_all + flank_dist * perp_dy).astype(int)
+        fn_valid = (fx_neg >= 0) & (fx_neg < w) & (fy_neg >= 0) & (fy_neg < h)
+        fp_valid = (fx_pos >= 0) & (fx_pos < w) & (fy_pos >= 0) & (fy_pos < h)
+        flank_values = np.concatenate([
+            gray_frame[fy_neg[fn_valid], fx_neg[fn_valid]].astype(np.float64),
+            gray_frame[fy_pos[fp_valid], fx_pos[fp_valid]].astype(np.float64),
+        ])
 
         if len(trail_values) < 5 or len(flank_values) < 5:
             return 0.0
@@ -4304,17 +4063,13 @@ class SatelliteTrailDetector:
         # brightness along the line and check what fraction of the trail
         # length the bright pixels span.
         if has_bright_spots or has_high_variance:
-            n_spread = max(20, int(length / 5))
-            n_spread = min(n_spread, 100)
-            spread_samples = []
-            for si in range(n_spread):
-                st = si / (n_spread - 1) if n_spread > 1 else 0
-                spx = int(x1 + st * (x2 - x1))
-                spy = int(y1 + st * (y2 - y1))
-                if 0 <= spy < gray_frame.shape[0] and 0 <= spx < gray_frame.shape[1]:
-                    spread_samples.append(gray_frame[spy, spx])
-            if len(spread_samples) >= 10:
-                spread_arr = np.array(spread_samples)
+            n_spread = max(20, min(100, int(length / 5)))
+            ts = np.linspace(0, 1, n_spread)
+            spx = (x1 + ts * (x2 - x1)).astype(int)
+            spy = (y1 + ts * (y2 - y1)).astype(int)
+            valid = (spy >= 0) & (spy < gray_frame.shape[0]) & (spx >= 0) & (spx < gray_frame.shape[1])
+            spread_arr = gray_frame[spy[valid], spx[valid]]
+            if len(spread_arr) >= 10:
                 spread_mean = np.mean(spread_arr)
                 spread_std = np.std(spread_arr)
                 bright_mask = spread_arr > (spread_mean + spread_std)
@@ -4341,6 +4096,10 @@ class SatelliteTrailDetector:
                 'avg_brightness': float(avg_brightness),
                 'max_brightness': int(max_brightness),
                 'line': (x1, y1, x2, y2),
+                'contrast_ratio': float(contrast_ratio) if contrast_ratio is not None else None,
+                'brightness_std': float(brightness_std),
+                'avg_saturation': float(avg_saturation),
+                'has_dotted_pattern': bool(has_bright_spots or has_high_variance or has_multiple_points),
             }
 
         # AIRPLANE DETECTION CRITERIA (check first - dotted features are distinctive)
@@ -4397,7 +4156,7 @@ class SatelliteTrailDetector:
         is_satellite_length = self.params['satellite_min_length'] <= length <= self.params['satellite_max_length']
 
         # Check if trail has good contrast with background (useful for dim trails)
-        has_contrast = contrast_ratio is not None and contrast_ratio >= self.params.get('satellite_contrast_min', 1.08)
+        has_contrast = contrast_ratio is not None and contrast_ratio >= min_contrast
 
         satellite_score = sum([is_dim, is_monochrome, is_smooth, is_satellite_length])
 
@@ -4688,7 +4447,7 @@ class SatelliteTrailDetector:
                         'type': trail_type,
                         'detection_info': detection_info,
                         # Keep 'bbox' for backward compat with debug panel lookup
-                        'bbox': detection_info['bbox'] if detection_info else None,
+                        'bbox': detection_info['bbox'] if detection_info is not None else None,
                     })
 
                 if trail_type and detection_info:
@@ -4713,7 +4472,7 @@ class SatelliteTrailDetector:
                         'line': line,
                         'type': trail_type,
                         'detection_info': detection_info,
-                        'bbox': detection_info['bbox'] if detection_info else None,
+                        'bbox': detection_info['bbox'] if detection_info is not None else None,
                     })
 
                 if trail_type and detection_info:
@@ -4734,8 +4493,9 @@ class SatelliteTrailDetector:
                 debug_info['temporal_context'] = temporal_context
 
         # Separate by type for merging
-        satellite_infos = [info for t, info in classified_trails if t == 'satellite']
-        airplane_infos = [info for t, info in classified_trails if t == 'airplane']
+        satellite_infos, airplane_infos = [], []
+        for t, info in classified_trails:
+            (satellite_infos if t == 'satellite' else airplane_infos).append(info)
 
         # Merge overlapping satellite detections (simple box merge)
         satellite_boxes = [info['bbox'] for info in satellite_infos]
@@ -4878,18 +4638,17 @@ class SatelliteTrailDetector:
             label_x = x_min
             label_y = y_min - 10 if y_min > 30 else y_max + 20
 
-            # Create semi-transparent background for label
-            overlay = frame.copy()
-            cv2.rectangle(
-                overlay,
-                (label_x - 2, label_y - label_size[1] - 6),
-                (label_x + label_size[0] + 4, label_y + 4),
-                color,
-                -1
-            )
-            # Blend the overlay with the original frame for transparency
+            # Create semi-transparent background for label (ROI-based, not full frame copy)
             alpha = 0.7
-            cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+            rx1 = max(0, label_x - 2)
+            ry1 = max(0, label_y - label_size[1] - 6)
+            rx2 = min(frame.shape[1], label_x + label_size[0] + 4)
+            ry2 = min(frame.shape[0], label_y + 4)
+            if rx2 > rx1 and ry2 > ry1:
+                roi = frame[ry1:ry2, rx1:rx2].copy()
+                cv2.rectangle(roi, (0, 0), (rx2 - rx1, ry2 - ry1), color, -1)
+                cv2.addWeighted(roi, alpha, frame[ry1:ry2, rx1:rx2], 1 - alpha, 0,
+                                frame[ry1:ry2, rx1:rx2])
 
             # Draw label text
             cv2.putText(
@@ -5578,10 +5337,10 @@ class RadonStreakDetector(SatelliteTrailDetector):
             return []
 
         # Sort by SNR descending
-        peak_snrs = [snr_sinogram[r, c] for r, c in peak_coords]
+        peak_snrs = np.array([snr_sinogram[r, c] for r, c in peak_coords])
         order = np.argsort(peak_snrs)[::-1]
         peak_coords = peak_coords[order]
-        peak_snrs = [peak_snrs[i] for i in order]
+        peak_snrs = peak_snrs[order]
 
         # Limit to top 20 candidates to avoid processing too many
         peak_coords = peak_coords[:20]
@@ -5620,6 +5379,12 @@ class RadonStreakDetector(SatelliteTrailDetector):
             y1 = cy - half_len * cos_t
             x2 = cx + half_len * (-sin_t)
             y2 = cy + half_len * cos_t
+
+            # Convert from padded to original image coordinates
+            x1 -= pad_w
+            y1 -= pad_h
+            x2 -= pad_w
+            y2 -= pad_h
 
             # Clip to image bounds
             x1 = np.clip(x1, 0, w - 1)
@@ -5853,7 +5618,7 @@ class RadonStreakDetector(SatelliteTrailDetector):
                 all_classifications.append({
                     'line': line, 'type': trail_type,
                     'detection_info': detection_info,
-                    'bbox': detection_info['bbox'] if detection_info else None,
+                    'bbox': detection_info['bbox'] if detection_info is not None else None,
                 })
 
             if trail_type and detection_info:
@@ -5914,7 +5679,7 @@ class RadonStreakDetector(SatelliteTrailDetector):
                 all_classifications.append({
                     'line': line, 'type': trail_type,
                     'detection_info': detection_info,
-                    'bbox': detection_info['bbox'] if detection_info else None,
+                    'bbox': detection_info['bbox'] if detection_info is not None else None,
                 })
 
             if trail_type and detection_info:
@@ -5936,8 +5701,9 @@ class RadonStreakDetector(SatelliteTrailDetector):
                 debug_info['temporal_context'] = temporal_context
 
         # ── Merge overlapping detections ────────────────────────────
-        satellite_infos = [info for t, info in classified_trails if t == 'satellite']
-        airplane_infos = [info for t, info in classified_trails if t == 'airplane']
+        satellite_infos, airplane_infos = [], []
+        for t, info in classified_trails:
+            (satellite_infos if t == 'satellite' else airplane_infos).append(info)
 
         satellite_boxes = [info['bbox'] for info in satellite_infos]
         merged_satellite_boxes = self.merge_overlapping_boxes(satellite_boxes)
@@ -5970,12 +5736,18 @@ class RadonStreakDetector(SatelliteTrailDetector):
             [('satellite', info) for info in merged_satellite_infos] +
             [('airplane', info) for info in merged_airplane_infos]
         )
+        # Skip expensive enrichment when many detections (same guard as parent)
+        do_full_enrichment = len(all_merged) <= 20
         for trail_type, info in all_merged:
             line_arr = np.array([[info['line'][0], info['line'][1],
                                   info['line'][2], info['line'][3]]])
-            info['photometry'] = self._analyze_streak_photometry(gray, line_arr)
-            info['curvature'] = self._fit_trail_curvature(
-                gray, line_arr, diff_image=diff_img)
+            if do_full_enrichment:
+                info['photometry'] = self._analyze_streak_photometry(gray, line_arr)
+                info['curvature'] = self._fit_trail_curvature(
+                    gray, line_arr, diff_image=diff_img)
+            else:
+                info['photometry'] = None
+                info['curvature'] = None
             info['velocity'] = self._estimate_angular_velocity(
                 info['length'], frame_width,
                 exposure_time=exposure_time, fov_degrees=fov_degrees)
@@ -6846,11 +6618,13 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         print(f"Error: Could not open video: {input_path}")
         sys.exit(1)
     
-    # Get video properties
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    # Get video properties (guard against zero/invalid values)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
+        total_frames = float('inf')  # unknown length — process until EOF
 
     # Adjust output dimensions for debug mode (side-by-side or debug-only)
     if debug_only:
@@ -7022,53 +6796,58 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
 
         if pool is not None:
             # ── Parallel path: read-ahead + async detection ────────
-            reading_done = False
-            while True:
-                # Fill the pipeline up to prefetch depth
-                while not reading_done and len(pending) < prefetch:
-                    ret, frame = cap.read()
-                    if not ret:
-                        reading_done = True
+            try:
+                reading_done = False
+                while True:
+                    # Fill the pipeline up to prefetch depth
+                    while not reading_done and len(pending) < prefetch:
+                        ret, frame = cap.read()
+                        if not ret:
+                            reading_done = True
+                            break
+                        frame_count += 1
+                        if frame_count > max_frames:
+                            reading_done = True
+                            break
+
+                        # Feed temporal buffer (must be sequential)
+                        temporal_context = None
+                        if temporal_buffer is not None:
+                            gray_fb = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                            temporal_buffer.add(gray_fb)
+                            if temporal_buffer.is_ready():
+                                temporal_context = \
+                                    temporal_buffer.get_temporal_context(gray_fb)
+
+                        # Copy temporal context arrays for the worker process
+                        tc_copy = None
+                        if temporal_context is not None:
+                            tc_copy = {
+                                'diff_image': temporal_context['diff_image'].copy(),
+                                'noise_map': temporal_context['noise_map'].copy(),
+                                'reference': temporal_context['reference'].copy(),
+                                'buffer_depth': temporal_context['buffer_depth'],
+                            }
+
+                        async_result = pool.apply_async(
+                            _worker_detect,
+                            ((frame.copy(), tc_copy, debug_mode,
+                              exposure_time, fov_degrees),))
+                        pending.append((frame, frame_count, async_result))
+
+                    if not pending:
                         break
-                    frame_count += 1
-                    if frame_count > max_frames:
-                        reading_done = True
-                        break
 
-                    # Feed temporal buffer (must be sequential)
-                    temporal_context = None
-                    if temporal_buffer is not None:
-                        gray_fb = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                        temporal_buffer.add(gray_fb)
-                        if temporal_buffer.is_ready():
-                            temporal_context = \
-                                temporal_buffer.get_temporal_context(gray_fb)
-
-                    # Copy temporal context arrays for the worker process
-                    tc_copy = None
-                    if temporal_context is not None:
-                        tc_copy = {
-                            'diff_image': temporal_context['diff_image'].copy(),
-                            'noise_map': temporal_context['noise_map'].copy(),
-                            'reference': temporal_context['reference'].copy(),
-                            'buffer_depth': temporal_context['buffer_depth'],
-                        }
-
-                    async_result = pool.apply_async(
-                        _worker_detect,
-                        ((frame.copy(), tc_copy, debug_mode,
-                          exposure_time, fov_degrees),))
-                    pending.append((frame, frame_count, async_result))
-
-                if not pending:
-                    break
-
-                orig_frame, fidx, async_result = pending.popleft()
-                det_trails, dbg_info = async_result.get()
-                yield orig_frame, fidx, det_trails, dbg_info
-
-            pool.close()
-            pool.join()
+                    orig_frame, fidx, async_result = pending.popleft()
+                    try:
+                        det_trails, dbg_info = async_result.get(timeout=300)
+                    except Exception as e:
+                        print(f"\r  [Worker error on frame {fidx}: {e}]")
+                        det_trails, dbg_info = [], {} if debug_mode else None
+                    yield orig_frame, fidx, det_trails, dbg_info
+            finally:
+                pool.terminate()
+                pool.join()
 
         else:
             # ── Sequential path (original logic) ──────────────────
@@ -7099,9 +6878,13 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     for frame, fc, detected_trails, debug_info in _frame_results():
         # Progress indicator
         if fc % 30 == 0:
-            progress = (fc / max_frames) * 100
-            print(f"\rProgress: {progress:.1f}% ({fc}/{max_frames})",
-                  end="", flush=True)
+            if max_frames != float('inf'):
+                progress = (fc / max_frames) * 100
+                print(f"\rProgress: {progress:.1f}% ({fc}/{max_frames})",
+                      end="", flush=True)
+            else:
+                print(f"\rProcessed: {fc} frames",
+                      end="", flush=True)
 
         # Start with current frame
         output_frame = frame.copy()
@@ -7114,8 +6897,9 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         # If detect_type == 'both', no filtering needed
 
         # Collect detections for HITL review mode
+        # fc is 1-based frame_count; store as 0-based index for cap.set()
         if detections_by_frame is not None and detected_trails:
-            detections_by_frame[fc] = list(detected_trails)
+            detections_by_frame[fc - 1] = list(detected_trails)
 
         if detected_trails:
             # Count detections by type and add new frozen regions
@@ -7209,13 +6993,15 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
                 frame_h, frame_w = output_frame.shape[:2]
 
                 # Adjust if region extends beyond frame boundaries
+                x_min_c = max(0, x_min)
+                y_min_c = max(0, y_min)
                 actual_y_max = min(y_max, frame_h)
                 actual_x_max = min(x_max, frame_w)
-                actual_region_h = actual_y_max - y_min
-                actual_region_w = actual_x_max - x_min
+                actual_region_h = actual_y_max - y_min_c
+                actual_region_w = actual_x_max - x_min_c
 
                 if actual_region_h > 0 and actual_region_w > 0:
-                    output_frame[y_min:actual_y_max, x_min:actual_x_max] = region[:actual_region_h, :actual_region_w]
+                    output_frame[y_min_c:actual_y_max, x_min_c:actual_x_max] = region[:actual_region_h, :actual_region_w]
 
                 # Decrement frames remaining
                 frozen_data['frames_remaining'] -= 1
@@ -7640,6 +7426,12 @@ Notes:
     )
 
     args = parser.parse_args()
+
+    # Validate parameter ranges
+    if args.workers < 0:
+        parser.error("--workers must be >= 0")
+    if hasattr(args, 'auto_accept') and not (0.0 <= args.auto_accept <= 1.0):
+        parser.error("--auto-accept must be in range [0.0, 1.0]")
 
     # Handle preprocessing preview if requested
     preprocessing_params = None
