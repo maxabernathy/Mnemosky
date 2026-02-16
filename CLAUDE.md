@@ -231,33 +231,61 @@ The satellite classifier uses multiple detection paths to catch dim and long tra
 6. **Extended — very dim+smooth**: Below brightness threshold, relaxed monochrome (dim trails have negligible colour)
 7. **SNR-based (supplementary only)**: Matched-filter candidates with per-trail SNR ≥ 2.5 and smooth brightness
 
-## YOLO Dataset Export
+## ML Dataset Export
 
-When `--dataset` is passed, each frame with detections is saved to a YOLO-format dataset alongside the output video:
+When `--dataset` is passed, detections are exported as a training-ready ML dataset with automatic train/val/test splitting, temporal deduplication, and negative sample generation.
+
+### Dataset Formats (`--dataset-format`)
+
+| Format | Flag | Label format | Use case |
+|--------|------|-------------|----------|
+| **AABB** (default) | `--dataset-format aabb` | `class_id xc yc w h` | Standard YOLO detection |
+| **OBB** | `--dataset-format obb` | `class_id x1 y1 x2 y2 x3 y3 x4 y4` | YOLO OBB — ideal for thin trails |
+| **Segment** | `--dataset-format segment` | `class_id x1 y1 ... x4 y4` | YOLO instance segmentation |
+| **COCO** | `--dataset-format coco` | COCO JSON per split | Detectron2, MMDetection |
+
+All coordinates are normalized to [0, 1]. Class IDs: `0=satellite`, `1=airplane`.
+
+### Directory Structure
 
 ```
 <output_stem>_dataset/
-├── data.yaml              # YOLOv8 config (class names, paths)
-├── images/
-│   ├── <video>_f000123.jpg   # Original (clean) frames — no annotations drawn
-│   └── ...
-└── labels/
-    ├── <video>_f000123.txt   # One line per detection
-    └── ...
+├── data.yaml                  # YOLOv8 config (task, split paths, class names, metadata)
+├── train/
+│   ├── images/
+│   │   └── <video>_f000123.jpg
+│   ├── labels/
+│   │   └── <video>_f000123.txt
+│   └── annotations.json       # (COCO format only)
+├── val/
+│   ├── images/ ...
+│   └── labels/ ...
+└── test/
+    ├── images/ ...
+    └── labels/ ...
 ```
 
-**Label format** (standard YOLO): `<class_id> <x_center> <y_center> <width> <height>` — all coordinates normalized to [0, 1].
+### Key Features
 
-| Class ID | Name |
-|----------|------|
-| 0 | satellite |
-| 1 | airplane |
+- **Train/val/test splitting** (`--dataset-split 0.7 0.2 0.1`): Temporal-episode-based splitting prevents data leakage from consecutive near-identical frames. All frames from a single continuous trail sighting go into the same split.
+- **Temporal deduplication** (`--dataset-dedup 5`): Perceptual-hash-based near-duplicate filtering removes redundant frames from the same scene.
+- **Frame skip** (`--dataset-skip N`): Exports every Nth frame with detections. Default: auto (fps/2, i.e., one frame per 0.5 seconds).
+- **Negative samples** (`--dataset-negatives 0.2`): Frames without detections are exported as hard negatives (empty label files) to reduce false positive rates during training.
+- **Oriented bounding boxes**: OBB format uses the original trail line endpoints and perpendicular width to compute tight rotated boxes. Eliminates ~50% wasted area vs axis-aligned boxes on diagonal trails.
+- **HITL-verified export** (`--dataset-from-annotations`): Exports only human-confirmed detections from an annotation JSON for highest label quality.
+- **Statistics report**: Prints class distribution, split sizes, bbox size stats, and health warnings (class imbalance, high annotation density).
+- **Configurable images**: `--dataset-image-format jpg|png`, `--dataset-image-quality 95`
 
-- Images are JPEG quality 95 (clean originals, no bounding boxes drawn)
-- Only frames with at least one detection are saved
-- `data.yaml` is compatible with Ultralytics `yolo train` out of the box
-- Appends to existing dataset directory (allows processing multiple videos into one dataset)
-- Post-run summary prints image count, annotation counts by class, and dataset location
+### DatasetExporter Class
+
+Encapsulates all dataset export logic: frame filtering (skip + dedup), label writing (all 4 formats), temporal episode grouping, train/val/test splitting, file reorganization, `data.yaml` generation, COCO JSON export, and statistics.
+
+### Utility Functions
+
+- `_compute_obb_corners(x1, y1, x2, y2, half_width)` — 4 oriented box corners from line endpoints
+- `_trail_to_polygon(x1, y1, x2, y2, half_width, frame_w, frame_h)` — Normalized polygon for YOLO segment format
+- `_compute_phash(frame_gray)` — 64-bit perceptual hash (resize to 8×8 + median threshold)
+- `_hamming_distance(h1, h2)` — Hamming distance between two perceptual hashes
 
 ## HITL Annotation Database
 
@@ -329,8 +357,29 @@ python satellite_trail_detector.py input.mp4 output.mp4 --no-labels
 # Interactive preprocessing preview (tune CLAHE, blur, Canny parameters)
 python satellite_trail_detector.py input.mp4 output.mp4 --preview
 
-# Export detections as YOLO ML dataset
+# Export ML dataset (default: AABB with 70/20/10 split, dedup, negatives)
 python satellite_trail_detector.py input.mp4 output.mp4 --dataset
+
+# Export with oriented bounding boxes (ideal for thin trails)
+python satellite_trail_detector.py input.mp4 output.mp4 --dataset --dataset-format obb
+
+# Export as COCO JSON for Detectron2/MMDetection
+python satellite_trail_detector.py input.mp4 output.mp4 --dataset --dataset-format coco
+
+# Export as instance segmentation polygons
+python satellite_trail_detector.py input.mp4 output.mp4 --dataset --dataset-format segment
+
+# Custom split ratios (train/val/test)
+python satellite_trail_detector.py input.mp4 output.mp4 --dataset --dataset-split 0.8 0.1 0.1
+
+# Disable dedup and negatives for raw export
+python satellite_trail_detector.py input.mp4 output.mp4 --dataset --dataset-dedup 0 --dataset-negatives 0
+
+# Export lossless PNG images
+python satellite_trail_detector.py input.mp4 output.mp4 --dataset --dataset-image-format png
+
+# Export from HITL-verified annotations (highest quality labels)
+python satellite_trail_detector.py input.mp4 output.mp4 --dataset-from-annotations output.json
 
 # Parallel processing (default: auto-detected workers, capped at 8)
 python satellite_trail_detector.py input.mp4 output.mp4              # auto parallel (default)
@@ -456,7 +505,7 @@ class CustomDetectionAlgorithm(BaseDetectionAlgorithm):
 
 13. **Signal envelope**: When users mark trail examples in the preview, `_compute_signal_envelope()` measures brightness, contrast, length, and angle ranges. `_apply_signal_envelope()` dynamically widens detection thresholds to match. The envelope flows from `show_preprocessing_preview()` → `main()` → `process_video()` → `SatelliteTrailDetector.__init__()`.
 
-14. **YOLO dataset export**: The `--dataset` flag saves clean (unannotated) original frames and normalized bounding-box labels. Class IDs are `0=satellite`, `1=airplane`. Export happens inside the detection loop in `process_video()`. `data.yaml` is written after the main loop. Do not draw annotations on exported images.
+14. **ML dataset export**: The `--dataset` flag exports training-ready datasets via the `DatasetExporter` class. Supports 4 formats: AABB (standard YOLO), OBB (oriented bounding boxes using trail line endpoints), segment (instance segmentation polygons), and COCO JSON. By default, applies temporal-episode-based train/val/test splitting, perceptual-hash deduplication, frame skip, and negative sample generation. Class IDs are `0=satellite`, `1=airplane`. Export is driven by `DatasetExporter` methods called from the detection loop in `process_video()`. `data.yaml` and COCO JSON are written during `DatasetExporter.finalize()` after the main loop. Do not draw annotations on exported images. `--dataset-from-annotations` exports from HITL-verified annotations for highest label quality.
 
 15. **RadonStreakDetector (advanced algorithm)**: The `--algorithm radon` flag switches to the advanced `RadonStreakDetector` class which inherits from `SatelliteTrailDetector` and overrides `detect_trails()` with a three-stage pipeline: LSD + Radon Transform + Perpendicular Cross Filtering. It optionally calibrates detection thresholds from ground truth trail patches via `--groundtruth <dir>`. The Radon stage downsamples aggressively (250k pixel area cap) for performance. The parent's matched filter is skipped (Radon subsumes it).
 
@@ -533,7 +582,9 @@ Add to the `main()` function's argument parser, then handle in `process_video()`
 | Perpendicular cross filter | `satellite_trail_detector.py:RadonStreakDetector._perpendicular_cross_filter()` (line ~5475) |
 | Radon detect_trails | `satellite_trail_detector.py:RadonStreakDetector.detect_trails()` (line ~5610) |
 | Worker functions | `satellite_trail_detector.py:_worker_init()` / `_worker_detect()` (line ~5828) |
-| Video processing | `satellite_trail_detector.py:process_video()` (line ~5859) |
-| Frame-result generator | `satellite_trail_detector.py:process_video()._frame_results()` (line ~6061) |
-| HITL review integration | `satellite_trail_detector.py:process_video()` review section (line ~6365) |
-| Main entry point | `satellite_trail_detector.py:main()` (line ~6439) |
+| Dataset utility functions | `satellite_trail_detector.py:_compute_obb_corners()` etc. (line ~6026) |
+| DatasetExporter class | `satellite_trail_detector.py:DatasetExporter` (line ~6091) |
+| HITL-verified dataset export | `satellite_trail_detector.py:export_dataset_from_annotations()` (line ~6635) |
+| Video processing | `satellite_trail_detector.py:process_video()` (line ~6796) |
+| ML dataset integration | `satellite_trail_detector.py:process_video()` dataset exporter section (line ~6791) |
+| Main entry point | `satellite_trail_detector.py:main()` (line ~7365) |

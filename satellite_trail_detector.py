@@ -36,6 +36,8 @@ import sys
 import time
 import os
 import json
+import math
+import random
 import multiprocessing
 from pathlib import Path
 from abc import ABC, abstractmethod
@@ -6017,7 +6019,781 @@ def _worker_detect(args):
     return detected_trails, debug_info
 
 
-def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=7, algorithm='default', groundtruth_dir=None, num_workers=0, no_gpu=False, review_mode=False, review_only=False, annotations_path=None, hitl_profile='default', auto_accept=0.9, no_learn=False):
+# ═══════════════════════════════════════════════════════════════════════════════
+# ML Dataset Export — utility functions and DatasetExporter class
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _compute_obb_corners(x1, y1, x2, y2, half_width=8, pad_along=10):
+    """Compute 4 corners of an oriented bounding box around a line segment.
+
+    Returns corners as [(cx1,cy1), (cx2,cy2), (cx3,cy3), (cx4,cy4)]
+    in clockwise order from the 'top-left' of the oriented box.
+
+    Args:
+        x1, y1, x2, y2: Line endpoint coordinates.
+        half_width: Perpendicular half-width of the box in pixels.
+        pad_along: Padding added along the line direction in pixels.
+    """
+    dx = x2 - x1
+    dy = y2 - y1
+    length = math.sqrt(dx * dx + dy * dy)
+    if length < 1e-6:
+        return [(x1, y1)] * 4
+
+    # Unit vectors along and perpendicular to the trail
+    ux, uy = dx / length, dy / length
+    nx, ny = -uy, ux  # perpendicular (rotated 90 degrees CCW)
+
+    # Four corners: start-side then end-side, clockwise
+    return [
+        (x1 - ux * pad_along + nx * half_width,
+         y1 - uy * pad_along + ny * half_width),
+        (x2 + ux * pad_along + nx * half_width,
+         y2 + uy * pad_along + ny * half_width),
+        (x2 + ux * pad_along - nx * half_width,
+         y2 + uy * pad_along - ny * half_width),
+        (x1 - ux * pad_along - nx * half_width,
+         y1 - uy * pad_along - ny * half_width),
+    ]
+
+
+def _trail_to_polygon(x1, y1, x2, y2, half_width, frame_w, frame_h):
+    """Return normalized polygon coordinates for a trail segment.
+
+    Returns a flat list [x1, y1, x2, y2, x3, y3, x4, y4] with values
+    clamped to [0, 1], suitable for YOLO segment format.
+    """
+    corners = _compute_obb_corners(x1, y1, x2, y2, half_width)
+    normalized = []
+    for cx, cy in corners:
+        normalized.append(max(0.0, min(1.0, cx / frame_w)))
+        normalized.append(max(0.0, min(1.0, cy / frame_h)))
+    return normalized
+
+
+def _compute_phash(frame_gray, hash_size=8):
+    """Compute a simple perceptual hash using downscaled median threshold.
+
+    Returns a compact byte array (hash_size * hash_size / 8 bytes).
+    No external dependencies beyond OpenCV and NumPy.
+    """
+    small = cv2.resize(frame_gray, (hash_size, hash_size),
+                       interpolation=cv2.INTER_AREA)
+    median = np.median(small)
+    return np.packbits((small > median).flatten())
+
+
+def _hamming_distance(h1, h2):
+    """Hamming distance between two perceptual hash byte arrays."""
+    return int(np.unpackbits(np.bitwise_xor(h1, h2)).sum())
+
+
+class DatasetExporter:
+    """Manages ML dataset export with format support, splitting, and dedup.
+
+    Supports four annotation formats:
+        aabb    — Standard YOLO axis-aligned bounding boxes
+        obb     — YOLO OBB (oriented bounding boxes) with 4 corner points
+        segment — YOLO instance segmentation polygons
+        coco    — COCO JSON format (bbox + optional segmentation)
+
+    Features:
+        - Train/val/test splitting with temporal-episode grouping to prevent
+          data leakage from near-identical consecutive frames.
+        - Perceptual-hash-based near-duplicate filtering.
+        - Configurable frame skip interval.
+        - Negative (background) sample export for hard-negative mining.
+        - Dataset statistics and health report.
+    """
+
+    # Default OBB half-width covers 3-5px trail mask + margin
+    DEFAULT_HALF_WIDTH = 8
+
+    def __init__(self, dataset_dir, video_stem, frame_w, frame_h, fps,
+                 fmt='aabb', split_ratios=(0.7, 0.2, 0.1),
+                 skip_frames=0, dedup_threshold=5, negative_ratio=0.2,
+                 image_format='jpg', image_quality=95, seed=42,
+                 freeze_duration=1.0):
+        self.dataset_dir = Path(dataset_dir)
+        self.video_stem = video_stem
+        self.frame_w = frame_w
+        self.frame_h = frame_h
+        self.fps = fps
+        self.fmt = fmt
+        self.split_ratios = tuple(split_ratios)
+        self.skip_frames = skip_frames
+        self.dedup_threshold = dedup_threshold
+        self.negative_ratio = negative_ratio
+        self.image_format = image_format
+        self.image_quality = image_quality
+        self.seed = seed
+        self.freeze_duration = freeze_duration
+
+        # Episode gap: frames further apart than this start a new episode
+        self._episode_gap = max(1, int(freeze_duration * fps)) + 2
+
+        # State
+        self._entries = []           # (frame_idx, img_name, label_lines, dominant_class)
+        self._negative_entries = []  # (frame_idx, img_name)
+        self._last_export_frame = -9999
+        self._recent_hashes = deque(maxlen=30)
+        self._positive_count = 0
+        self._negative_count = 0
+        self._class_counts = {'satellite': 0, 'airplane': 0}
+        # For bbox statistics
+        self._bbox_widths = []
+        self._bbox_heights = []
+
+        # Create staging directories
+        (self.dataset_dir / 'images').mkdir(parents=True, exist_ok=True)
+        (self.dataset_dir / 'labels').mkdir(parents=True, exist_ok=True)
+
+    # ── Frame filtering ──────────────────────────────────────────────
+
+    def should_export_frame(self, frame_idx, frame_gray):
+        """Check skip interval and perceptual-hash dedup.
+
+        Returns True if the frame should be exported.
+        """
+        # Skip interval check
+        if self.skip_frames > 0:
+            if (frame_idx - self._last_export_frame) < self.skip_frames:
+                return False
+
+        # Perceptual hash dedup check
+        if self.dedup_threshold > 0:
+            h = _compute_phash(frame_gray)
+            for prev_h in self._recent_hashes:
+                if _hamming_distance(h, prev_h) < self.dedup_threshold:
+                    return False
+            self._recent_hashes.append(h)
+
+        return True
+
+    # ── Positive frame export ────────────────────────────────────────
+
+    def export_frame(self, frame_idx, frame, detected_trails):
+        """Export one frame with its detections as image + label file."""
+        ext = 'png' if self.image_format == 'png' else 'jpg'
+        img_name = f"{self.video_stem}_f{frame_idx:06d}.{ext}"
+
+        # Write image
+        img_path = self.dataset_dir / 'images' / img_name
+        if ext == 'png':
+            cv2.imwrite(str(img_path), frame)
+        else:
+            cv2.imwrite(str(img_path), frame,
+                        [cv2.IMWRITE_JPEG_QUALITY, self.image_quality])
+
+        # Build label lines
+        label_lines = []
+        per_frame_class = {'satellite': 0, 'airplane': 0}
+
+        for trail_type, det_info in detected_trails:
+            cls_id = 0 if trail_type == 'satellite' else 1
+            per_frame_class[trail_type] += 1
+
+            if self.fmt == 'obb':
+                line_pts = det_info.get('line')
+                if line_pts:
+                    lx1, ly1, lx2, ly2 = line_pts
+                else:
+                    bx0, by0, bx1, by1 = det_info['bbox']
+                    lx1, ly1, lx2, ly2 = bx0, (by0 + by1) / 2, bx1, (by0 + by1) / 2
+                corners = _compute_obb_corners(lx1, ly1, lx2, ly2,
+                                               self.DEFAULT_HALF_WIDTH)
+                coords = []
+                for cx, cy in corners:
+                    coords.append(max(0.0, min(1.0, cx / self.frame_w)))
+                    coords.append(max(0.0, min(1.0, cy / self.frame_h)))
+                label_lines.append(
+                    f"{cls_id} " + " ".join(f"{c:.6f}" for c in coords))
+
+            elif self.fmt == 'segment':
+                line_pts = det_info.get('line')
+                if line_pts:
+                    lx1, ly1, lx2, ly2 = line_pts
+                else:
+                    bx0, by0, bx1, by1 = det_info['bbox']
+                    lx1, ly1, lx2, ly2 = bx0, (by0 + by1) / 2, bx1, (by0 + by1) / 2
+                poly = _trail_to_polygon(lx1, ly1, lx2, ly2,
+                                         self.DEFAULT_HALF_WIDTH,
+                                         self.frame_w, self.frame_h)
+                label_lines.append(
+                    f"{cls_id} " + " ".join(f"{c:.6f}" for c in poly))
+
+            else:  # aabb (default)
+                bx0, by0, bx1, by1 = det_info['bbox']
+                xc = ((bx0 + bx1) / 2) / self.frame_w
+                yc = ((by0 + by1) / 2) / self.frame_h
+                bw = (bx1 - bx0) / self.frame_w
+                bh = (by1 - by0) / self.frame_h
+                label_lines.append(
+                    f"{cls_id} {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}")
+                self._bbox_widths.append(bw)
+                self._bbox_heights.append(bh)
+
+            self._class_counts[trail_type] += 1
+
+            # Track bbox stats for obb/segment too (use AABB of the corners)
+            if self.fmt in ('obb', 'segment'):
+                bx0, by0, bx1, by1 = det_info['bbox']
+                self._bbox_widths.append((bx1 - bx0) / self.frame_w)
+                self._bbox_heights.append((by1 - by0) / self.frame_h)
+
+        # Write label file
+        lbl_name = img_name.rsplit('.', 1)[0] + '.txt'
+        label_path = self.dataset_dir / 'labels' / lbl_name
+        label_path.write_text('\n'.join(label_lines) + '\n')
+
+        # Track for splitting
+        dominant = max(per_frame_class, key=per_frame_class.get)
+        self._entries.append((frame_idx, img_name, label_lines, dominant))
+        self._last_export_frame = frame_idx
+        self._positive_count += 1
+
+    # ── Negative frame export ────────────────────────────────────────
+
+    def maybe_export_negative(self, frame_idx, frame, frame_gray):
+        """Conditionally export a frame with no detections as a negative sample."""
+        if self.negative_ratio <= 0:
+            return
+        # Export enough negatives to maintain the target ratio
+        target = int(self._positive_count * self.negative_ratio)
+        if self._negative_count >= target:
+            return
+        if not self.should_export_frame(frame_idx, frame_gray):
+            return
+
+        ext = 'png' if self.image_format == 'png' else 'jpg'
+        img_name = f"{self.video_stem}_f{frame_idx:06d}.{ext}"
+
+        img_path = self.dataset_dir / 'images' / img_name
+        if ext == 'png':
+            cv2.imwrite(str(img_path), frame)
+        else:
+            cv2.imwrite(str(img_path), frame,
+                        [cv2.IMWRITE_JPEG_QUALITY, self.image_quality])
+
+        # Empty label file
+        lbl_name = img_name.rsplit('.', 1)[0] + '.txt'
+        (self.dataset_dir / 'labels' / lbl_name).write_text('')
+
+        self._negative_entries.append((frame_idx, img_name))
+        self._negative_count += 1
+
+    # ── Finalization ─────────────────────────────────────────────────
+
+    def finalize(self):
+        """Run train/val/test split, reorganize files, write configs, print stats."""
+        total_entries = len(self._entries) + len(self._negative_entries)
+        if total_entries == 0:
+            print("\nNo detections found — dataset directory is empty.")
+            return
+
+        # Build and split episodes
+        episodes = self._build_episodes()
+        splits = self._split_episodes(episodes)
+
+        # Reorganize files into split subdirectories
+        split_counts = {}
+        split_class_counts = {}
+        split_negative_counts = {}
+        for split_name in ('train', 'val', 'test'):
+            ep_list = splits.get(split_name, [])
+            if not ep_list:
+                split_counts[split_name] = 0
+                split_class_counts[split_name] = {'satellite': 0, 'airplane': 0}
+                split_negative_counts[split_name] = 0
+                continue
+
+            split_img_dir = self.dataset_dir / split_name / 'images'
+            split_lbl_dir = self.dataset_dir / split_name / 'labels'
+            split_img_dir.mkdir(parents=True, exist_ok=True)
+            split_lbl_dir.mkdir(parents=True, exist_ok=True)
+
+            count = 0
+            cls_counts = {'satellite': 0, 'airplane': 0}
+            neg_count = 0
+            for episode in ep_list:
+                for frame_idx, img_name, label_lines, dom_class in episode:
+                    src_img = self.dataset_dir / 'images' / img_name
+                    lbl_name = img_name.rsplit('.', 1)[0] + '.txt'
+                    src_lbl = self.dataset_dir / 'labels' / lbl_name
+                    if src_img.exists():
+                        os.rename(str(src_img),
+                                  str(split_img_dir / img_name))
+                    if src_lbl.exists():
+                        os.rename(str(src_lbl),
+                                  str(split_lbl_dir / lbl_name))
+                    count += 1
+                    if dom_class == 'background':
+                        neg_count += 1
+                    else:
+                        # Count annotations from label lines
+                        for line in label_lines:
+                            parts = line.strip().split()
+                            if parts:
+                                cid = int(parts[0])
+                                if cid == 0:
+                                    cls_counts['satellite'] += 1
+                                else:
+                                    cls_counts['airplane'] += 1
+
+            split_counts[split_name] = count
+            split_class_counts[split_name] = cls_counts
+            split_negative_counts[split_name] = neg_count
+
+        # Remove empty staging directories
+        for subdir in ('images', 'labels'):
+            d = self.dataset_dir / subdir
+            if d.exists():
+                try:
+                    if not any(d.iterdir()):
+                        d.rmdir()
+                except OSError:
+                    pass
+
+        # Write data.yaml
+        self._write_data_yaml(split_counts)
+
+        # Write COCO JSON if format is coco
+        if self.fmt == 'coco':
+            self._export_coco_json(splits)
+
+        # Print statistics report
+        self._print_statistics(split_counts, split_class_counts,
+                               split_negative_counts)
+
+    # ── Episode building ─────────────────────────────────────────────
+
+    def _build_episodes(self):
+        """Group frames into temporal episodes for leakage-free splitting.
+
+        Consecutive frames within ``_episode_gap`` of each other belong to the
+        same episode.  All frames in an episode are assigned to the same split.
+        """
+        # Merge positive and negative entries, sorted by frame index
+        all_entries = []
+        for entry in self._entries:
+            all_entries.append(entry)  # (frame_idx, img_name, label_lines, dom_class)
+        for frame_idx, img_name in self._negative_entries:
+            all_entries.append((frame_idx, img_name, [], 'background'))
+
+        all_entries.sort(key=lambda x: x[0])
+
+        episodes = []
+        current = []
+        for entry in all_entries:
+            if current and (entry[0] - current[-1][0]) > self._episode_gap:
+                episodes.append(current)
+                current = []
+            current.append(entry)
+        if current:
+            episodes.append(current)
+
+        return episodes
+
+    def _split_episodes(self, episodes):
+        """Assign episodes to train/val/test with class stratification."""
+        rng = random.Random(self.seed)
+
+        # Classify each episode by its dominant positive class
+        sat_eps, air_eps, neg_eps = [], [], []
+        for ep in episodes:
+            classes = [e[3] for e in ep if e[3] != 'background']
+            if not classes:
+                neg_eps.append(ep)
+            elif classes.count('satellite') >= classes.count('airplane'):
+                sat_eps.append(ep)
+            else:
+                air_eps.append(ep)
+
+        def _assign(eps_list):
+            rng.shuffle(eps_list)
+            n = len(eps_list)
+            n_train = max(1, round(n * self.split_ratios[0])) if n > 0 else 0
+            n_val = max(0, round(n * self.split_ratios[1])) if n > 1 else 0
+            # Guard: don't exceed total
+            if n_train + n_val > n:
+                n_val = max(0, n - n_train)
+            return (eps_list[:n_train],
+                    eps_list[n_train:n_train + n_val],
+                    eps_list[n_train + n_val:])
+
+        splits = {'train': [], 'val': [], 'test': []}
+        for group in (sat_eps, air_eps, neg_eps):
+            if not group:
+                continue
+            tr, va, te = _assign(group)
+            splits['train'].extend(tr)
+            splits['val'].extend(va)
+            splits['test'].extend(te)
+
+        return splits
+
+    # ── data.yaml generation ─────────────────────────────────────────
+
+    def _write_data_yaml(self, split_counts):
+        """Write a YOLOv8-compatible data.yaml with task type and metadata."""
+        task_map = {'aabb': 'detect', 'obb': 'obb', 'segment': 'segment',
+                    'coco': 'detect'}
+        task = task_map.get(self.fmt, 'detect')
+
+        lines = ["path: .\n"]
+        if split_counts.get('train', 0) > 0:
+            lines.append("train: train/images\n")
+        if split_counts.get('val', 0) > 0:
+            lines.append("val: val/images\n")
+        if split_counts.get('test', 0) > 0:
+            lines.append("test: test/images\n")
+        lines.append(f"\ntask: {task}\n")
+        lines.append("\nnames:\n  0: satellite\n  1: airplane\n")
+
+        # Metadata comment block
+        total_imgs = sum(split_counts.values())
+        total_ann = self._class_counts['satellite'] + self._class_counts['airplane']
+        lines.append(f"\n# Mnemosky dataset metadata\n")
+        lines.append(f"# resolution: {self.frame_w}x{self.frame_h}\n")
+        lines.append(f"# total_images: {total_imgs}\n")
+        lines.append(f"# total_annotations: {total_ann}\n")
+        lines.append(f"# satellites: {self._class_counts['satellite']}\n")
+        lines.append(f"# airplanes: {self._class_counts['airplane']}\n")
+        lines.append(f"# negative_samples: {self._negative_count}\n")
+        lines.append(f"# created: {datetime.now(timezone.utc).isoformat()}\n")
+
+        yaml_path = self.dataset_dir / 'data.yaml'
+        yaml_path.write_text(''.join(lines))
+
+    # ── COCO JSON export ─────────────────────────────────────────────
+
+    def _export_coco_json(self, splits):
+        """Write per-split COCO-format annotation JSON files."""
+        for split_name in ('train', 'val', 'test'):
+            ep_list = splits.get(split_name, [])
+            if not ep_list:
+                continue
+
+            coco = {
+                'info': {
+                    'description': f'Mnemosky {split_name} dataset',
+                    'version': '1.0',
+                    'year': datetime.now().year,
+                    'contributor': 'Mnemosky',
+                    'date_created': datetime.now(timezone.utc).isoformat(),
+                },
+                'licenses': [],
+                'categories': [
+                    {'id': 0, 'name': 'satellite', 'supercategory': 'trail'},
+                    {'id': 1, 'name': 'airplane', 'supercategory': 'trail'},
+                ],
+                'images': [],
+                'annotations': [],
+            }
+
+            img_id = 0
+            ann_id = 0
+            for episode in ep_list:
+                for frame_idx, img_name, label_lines, dom_class in episode:
+                    img_id += 1
+                    coco['images'].append({
+                        'id': img_id,
+                        'file_name': img_name,
+                        'width': self.frame_w,
+                        'height': self.frame_h,
+                        'frame_index': frame_idx,
+                    })
+
+                    for lbl_line in label_lines:
+                        parts = lbl_line.strip().split()
+                        if not parts:
+                            continue
+                        ann_id += 1
+                        cls_id = int(parts[0])
+                        coords = [float(x) for x in parts[1:]]
+
+                        if self.fmt in ('aabb', 'coco') and len(coords) == 4:
+                            xc, yc, bw, bh = coords
+                            # Denormalize to pixel COCO bbox [x, y, w, h]
+                            px = (xc - bw / 2) * self.frame_w
+                            py = (yc - bh / 2) * self.frame_h
+                            pw = bw * self.frame_w
+                            ph = bh * self.frame_h
+                            bbox = [round(px, 1), round(py, 1),
+                                    round(pw, 1), round(ph, 1)]
+                            area = pw * ph
+                            seg = []
+                        elif len(coords) == 8:
+                            # OBB or segment — 4 corners normalized
+                            xs = [coords[i] * self.frame_w for i in range(0, 8, 2)]
+                            ys = [coords[i] * self.frame_h for i in range(1, 8, 2)]
+                            px, py = min(xs), min(ys)
+                            pw, ph = max(xs) - px, max(ys) - py
+                            bbox = [round(px, 1), round(py, 1),
+                                    round(pw, 1), round(ph, 1)]
+                            area = pw * ph
+                            # Segmentation as polygon
+                            seg_pts = []
+                            for i in range(4):
+                                seg_pts.extend([round(xs[i], 1),
+                                                round(ys[i], 1)])
+                            seg = [seg_pts]
+                        else:
+                            continue
+
+                        coco['annotations'].append({
+                            'id': ann_id,
+                            'image_id': img_id,
+                            'category_id': cls_id,
+                            'bbox': bbox,
+                            'area': round(area, 1),
+                            'segmentation': seg,
+                            'iscrowd': 0,
+                        })
+
+            json_path = self.dataset_dir / split_name / 'annotations.json'
+            with open(json_path, 'w') as f:
+                json.dump(coco, f, indent=2)
+
+    # ── Statistics report ────────────────────────────────────────────
+
+    def _print_statistics(self, split_counts, split_class_counts,
+                          split_negative_counts):
+        """Print a dataset summary with class balance and health warnings."""
+        total_imgs = sum(split_counts.values())
+        total_ann = self._class_counts['satellite'] + self._class_counts['airplane']
+        sat = self._class_counts['satellite']
+        air = self._class_counts['airplane']
+
+        fmt_label = {'aabb': 'YOLOv8', 'obb': 'YOLOv8-OBB',
+                     'segment': 'YOLOv8-Seg', 'coco': 'COCO JSON'}
+
+        print(f"\n{'=' * 50}")
+        print(f"  ML Dataset Summary")
+        print(f"{'─' * 50}")
+        print(f"  Format:       {fmt_label.get(self.fmt, self.fmt)}")
+        print(f"  Location:     {self.dataset_dir}")
+        print(f"  Resolution:   {self.frame_w}x{self.frame_h}")
+        print(f"  Images:       {total_imgs}")
+        print(f"  Annotations:  {total_ann} "
+              f"({sat} satellite, {air} airplane)")
+        print(f"  Negatives:    {self._negative_count}")
+
+        # Split breakdown
+        print(f"\n  Split Breakdown:")
+        for s in ('train', 'val', 'test'):
+            cnt = split_counts.get(s, 0)
+            if cnt == 0:
+                continue
+            sc = split_class_counts.get(s, {})
+            nc = split_negative_counts.get(s, 0)
+            s_sat = sc.get('satellite', 0)
+            s_air = sc.get('airplane', 0)
+            pct = 100 * cnt / total_imgs if total_imgs else 0
+            print(f"    {s:5s}: {cnt:5d} images ({pct:4.1f}%)  "
+                  f"[sat={s_sat}, air={s_air}, neg={nc}]")
+
+        # BBox statistics
+        if self._bbox_widths:
+            ws = np.array(self._bbox_widths)
+            hs = np.array(self._bbox_heights)
+            print(f"\n  BBox Statistics (normalized):")
+            print(f"    Width:  min={ws.min():.4f}  max={ws.max():.4f}  "
+                  f"mean={ws.mean():.4f}  std={ws.std():.4f}")
+            print(f"    Height: min={hs.min():.4f}  max={hs.max():.4f}  "
+                  f"mean={hs.mean():.4f}  std={hs.std():.4f}")
+
+        # Warnings
+        warnings = []
+        if sat > 0 and air > 0:
+            ratio = max(sat, air) / min(sat, air)
+            if ratio > 3.0:
+                majority = 'satellite' if sat > air else 'airplane'
+                warnings.append(
+                    f"Class imbalance: {majority} has {ratio:.1f}x more "
+                    f"annotations than the other class")
+        if self._negative_count == 0 and self.negative_ratio > 0:
+            warnings.append(
+                "No negative samples exported (all frames had detections)")
+        if total_ann > 0 and total_imgs > 0:
+            ann_per_img = total_ann / (total_imgs - self._negative_count) \
+                if (total_imgs - self._negative_count) > 0 else 0
+            if ann_per_img > 5:
+                warnings.append(
+                    f"High annotation density ({ann_per_img:.1f}/image) — "
+                    f"check for false positives")
+
+        if warnings:
+            print(f"\n  Warnings:")
+            for w in warnings:
+                print(f"    * {w}")
+
+        print(f"\n  Class map:    0=satellite, 1=airplane")
+        print(f"{'=' * 50}")
+
+
+def export_dataset_from_annotations(input_path, annotations_path,
+                                    dataset_dir_override=None,
+                                    output_path=None,
+                                    fmt='aabb',
+                                    split_ratios=(0.7, 0.2, 0.1),
+                                    skip_frames=1,
+                                    dedup_threshold=0,
+                                    negative_ratio=0.0,
+                                    image_format='jpg',
+                                    image_quality=95,
+                                    freeze_duration=1.0):
+    """Export a dataset from an existing HITL-verified annotation file.
+
+    Only confirmed detections (and user-drawn missed annotations) are included.
+    This bypasses full video processing and produces the highest-quality labels
+    from human-reviewed data.
+
+    Args:
+        input_path: Path to the original video file.
+        annotations_path: Path to the Mnemosky annotation JSON file.
+        dataset_dir_override: Explicit dataset output directory (optional).
+        output_path: Fallback for deriving the dataset directory name.
+        fmt: Annotation format ('aabb', 'obb', 'segment', 'coco').
+        split_ratios: Train/val/test split ratios.
+        skip_frames: Frame skip interval (default 1 = no skip).
+        dedup_threshold: Perceptual hash dedup threshold (default 0 = off).
+        negative_ratio: Ratio of negative samples (default 0).
+        image_format: Image format ('jpg' or 'png').
+        image_quality: JPEG quality (1-100).
+        freeze_duration: Used for episode gap calculation.
+    """
+    # Load annotation database
+    with open(annotations_path, 'r') as f:
+        ann_data = json.load(f)
+
+    categories = {c['id']: c['name'] for c in ann_data.get('categories', [])}
+    images_by_id = {img['id']: img for img in ann_data.get('images', [])}
+
+    # Collect confirmed annotations grouped by image_id
+    confirmed = {}  # image_id -> list of (trail_type, det_info)
+    for ann in ann_data.get('annotations', []):
+        ext = ann.get('mnemosky_ext', {})
+        if ext.get('status') != 'confirmed':
+            continue
+        img_id = ann['image_id']
+        cat_name = categories.get(ann['category_id'], 'satellite')
+        # Convert COCO bbox [x, y, w, h] to internal (x_min, y_min, x_max, y_max)
+        bx, by, bw, bh = ann['bbox']
+        bbox = (bx, by, bx + bw, by + bh)
+        # Reconstruct detection_info from annotation metadata
+        meta = ext.get('detection_meta', {})
+        det_info = {
+            'bbox': bbox,
+            'angle': meta.get('angle', 0),
+            'center': tuple(meta.get('center', ((bx + bw / 2), (by + bh / 2)))),
+            'length': meta.get('length', math.sqrt(bw * bw + bh * bh)),
+            'avg_brightness': meta.get('avg_brightness', 0),
+            'max_brightness': meta.get('max_brightness', 0),
+            'line': tuple(meta.get('line', (bx, by + bh / 2, bx + bw, by + bh / 2))),
+        }
+        confirmed.setdefault(img_id, []).append((cat_name, det_info))
+
+    # Also include missed annotations (user-drawn false negatives)
+    for missed in ann_data.get('missed_annotations', []):
+        img_id = missed['image_id']
+        cat_name = categories.get(missed['category_id'], 'satellite')
+        bx, by, bw, bh = missed['bbox']
+        bbox = (bx, by, bx + bw, by + bh)
+        det_info = {
+            'bbox': bbox,
+            'angle': 0,
+            'center': (bx + bw / 2, by + bh / 2),
+            'length': math.sqrt(bw * bw + bh * bh),
+            'avg_brightness': 0,
+            'max_brightness': 0,
+            'line': (bx, by + bh / 2, bx + bw, by + bh / 2),
+        }
+        confirmed.setdefault(img_id, []).append((cat_name, det_info))
+
+    if not confirmed:
+        print("No confirmed annotations found in the annotation file.")
+        return
+
+    # Determine frame indices to extract
+    frame_indices = {}
+    for img_id, trails in confirmed.items():
+        img_info = images_by_id.get(img_id)
+        if img_info and 'frame_index' in img_info:
+            frame_indices[img_info['frame_index']] = (img_id, trails)
+
+    if not frame_indices:
+        print("No frame indices found in the annotation database images.")
+        return
+
+    # Open video
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        print(f"Error: Could not open video: {input_path}")
+        return
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # Set up DatasetExporter
+    if dataset_dir_override:
+        ds_dir = dataset_dir_override
+    elif output_path:
+        out_p = Path(output_path)
+        ds_dir = str(out_p.parent / (out_p.stem + '_dataset'))
+    else:
+        ds_dir = str(Path(input_path).with_suffix('') / '_hitl_dataset')
+
+    exporter = DatasetExporter(
+        dataset_dir=ds_dir,
+        video_stem=Path(input_path).stem,
+        frame_w=width, frame_h=height, fps=fps,
+        fmt=fmt,
+        split_ratios=split_ratios,
+        skip_frames=skip_frames,
+        dedup_threshold=dedup_threshold,
+        negative_ratio=negative_ratio,
+        image_format=image_format,
+        image_quality=image_quality,
+        freeze_duration=freeze_duration,
+    )
+
+    fmt_label = {'aabb': 'YOLOv8', 'obb': 'YOLOv8-OBB',
+                 'segment': 'YOLOv8-Seg', 'coco': 'COCO JSON'}
+    print(f"Exporting HITL-verified dataset from {annotations_path}")
+    print(f"  Format: {fmt_label.get(fmt, fmt)}")
+    print(f"  Confirmed annotations: {sum(len(v) for v in confirmed.values())}")
+    print(f"  Frames to extract: {len(frame_indices)}")
+    print(f"  Output: {ds_dir}")
+
+    sorted_frames = sorted(frame_indices.keys())
+    exported = 0
+
+    for target_frame in sorted_frames:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        img_id, trails = frame_indices[target_frame]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if exporter.should_export_frame(target_frame, gray):
+            exporter.export_frame(target_frame, frame, trails)
+            exported += 1
+
+        if exported % 10 == 0:
+            print(f"\r  Exported {exported}/{len(sorted_frames)} frames",
+                  end="", flush=True)
+
+    cap.release()
+    print(f"\r  Exported {exported}/{len(sorted_frames)} frames")
+
+    exporter.finalize()
+
+
+def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=7, algorithm='default', groundtruth_dir=None, num_workers=0, no_gpu=False, review_mode=False, review_only=False, annotations_path=None, hitl_profile='default', auto_accept=0.9, no_learn=False, dataset_format='aabb', dataset_split=(0.7, 0.2, 0.1), dataset_skip=0, dataset_dedup=5, dataset_negatives=0.2, dataset_image_format='jpg', dataset_image_quality=95, dataset_dir_override=None):
     """
     Process video to detect and highlight satellite and airplane trails.
 
@@ -6048,6 +6824,15 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
             is used as a reference background — stars, vignetting, and sky
             gradients are removed perfectly, leaving only transient trails.
             Set to 0 to disable temporal integration.
+        dataset_format: Annotation format for dataset export ('aabb', 'obb',
+            'segment', 'coco'). Default: 'aabb'.
+        dataset_split: Train/val/test split ratios as a 3-tuple. Default: (0.7, 0.2, 0.1).
+        dataset_skip: Export every Nth frame (0 = auto fps/2). Default: 0.
+        dataset_dedup: Perceptual hash dedup threshold (0 = off). Default: 5.
+        dataset_negatives: Negative sample ratio relative to positives. Default: 0.2.
+        dataset_image_format: Image format for export ('jpg' or 'png'). Default: 'jpg'.
+        dataset_image_quality: JPEG quality 1-100. Default: 95.
+        dataset_dir_override: Explicit dataset output directory (optional).
     """
     # Validate input
     input_path = Path(input_path)
@@ -6173,17 +6958,30 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     # ── HITL review mode: collect detections per frame ────────────
     detections_by_frame = {} if review_mode else None
 
-    # ── YOLO dataset setup ────────────────────────────────────────
-    dataset_dir = None
-    dataset_images = 0
-    dataset_annotations = {'satellite': 0, 'airplane': 0}
+    # ── ML dataset setup ───────────────────────────────────────────
+    dataset_exporter = None
     if save_dataset:
         out_p = Path(output_path)
-        dataset_dir = out_p.parent / (out_p.stem + '_dataset')
-        (dataset_dir / 'images').mkdir(parents=True, exist_ok=True)
-        (dataset_dir / 'labels').mkdir(parents=True, exist_ok=True)
-        video_stem = Path(input_path).stem
-        print(f"Dataset export enabled → {dataset_dir}")
+        ds_dir = dataset_dir_override or str(
+            out_p.parent / (out_p.stem + '_dataset'))
+        auto_skip = max(1, int(fps / 2)) if dataset_skip == 0 else dataset_skip
+        dataset_exporter = DatasetExporter(
+            dataset_dir=ds_dir,
+            video_stem=Path(input_path).stem,
+            frame_w=width, frame_h=height, fps=fps,
+            fmt=dataset_format,
+            split_ratios=dataset_split,
+            skip_frames=auto_skip,
+            dedup_threshold=dataset_dedup,
+            negative_ratio=dataset_negatives,
+            image_format=dataset_image_format,
+            image_quality=dataset_image_quality,
+            freeze_duration=freeze_duration,
+        )
+        fmt_label = {'aabb': 'YOLOv8', 'obb': 'YOLOv8-OBB',
+                     'segment': 'YOLOv8-Seg', 'coco': 'COCO JSON'}
+        print(f"Dataset export enabled → {ds_dir} "
+              f"(format={fmt_label.get(dataset_format, dataset_format)})")
 
     # Track frozen regions: list of (frozen_region, bbox, trail_type, frames_remaining)
     frozen_regions = []
@@ -6388,25 +7186,16 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
                             })
                             break  # Only create one panel per detection
 
-            # ── YOLO dataset export (one image + label per frame with detections)
-            if dataset_dir is not None:
-                img_name = f"{video_stem}_f{fc:06d}.jpg"
-                cv2.imwrite(str(dataset_dir / 'images' / img_name), frame,
-                            [cv2.IMWRITE_JPEG_QUALITY, 95])
-                label_lines = []
-                frame_h, frame_w = frame.shape[:2]
-                for trail_type_d, det_info_d in detected_trails:
-                    cls_id = 0 if trail_type_d == 'satellite' else 1
-                    bx0, by0, bx1, by1 = det_info_d['bbox']
-                    xc = ((bx0 + bx1) / 2) / frame_w
-                    yc = ((by0 + by1) / 2) / frame_h
-                    bw = (bx1 - bx0) / frame_w
-                    bh = (by1 - by0) / frame_h
-                    label_lines.append(f"{cls_id} {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}")
-                    dataset_annotations[trail_type_d] += 1
-                label_path = dataset_dir / 'labels' / img_name.replace('.jpg', '.txt')
-                label_path.write_text('\n'.join(label_lines) + '\n')
-                dataset_images += 1
+            # ── ML dataset export (positive frame) ─────────────────────
+            if dataset_exporter is not None:
+                gray_for_hash = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                if dataset_exporter.should_export_frame(fc, gray_for_hash):
+                    dataset_exporter.export_frame(fc, frame, detected_trails)
+        else:
+            # ── ML dataset export (negative / background frame) ────────
+            if dataset_exporter is not None:
+                gray_for_hash = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                dataset_exporter.maybe_export_negative(fc, frame, gray_for_hash)
 
         # Apply all active frozen regions to the output frame
         active_regions = []
@@ -6492,33 +7281,9 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     print(f"Total trails detected: {satellites_detected + airplanes_detected}")
     print(f"Output saved to: {output_path}")
 
-    # ── YOLO dataset finalisation ─────────────────────────────────
-    if dataset_dir is not None and dataset_images > 0:
-        # Write data.yaml for Ultralytics / YOLO training
-        yaml_path = dataset_dir / 'data.yaml'
-        yaml_path.write_text(
-            "path: .\n"
-            "train: images\n"
-            "val: images\n"
-            "\n"
-            "names:\n"
-            "  0: satellite\n"
-            "  1: airplane\n"
-        )
-        total_ann = dataset_annotations['satellite'] + dataset_annotations['airplane']
-        sat_ann = dataset_annotations['satellite']
-        air_ann = dataset_annotations['airplane']
-        print(f"\n{'=' * 42}")
-        print(f"  ML Dataset Summary")
-        print(f"{'─' * 42}")
-        print(f"  Format:       YOLOv8")
-        print(f"  Location:     {dataset_dir}")
-        print(f"  Images:       {dataset_images}")
-        print(f"  Annotations:  {total_ann} ({sat_ann} satellite, {air_ann} airplane)")
-        print(f"  Class map:    0=satellite, 1=airplane")
-        print(f"{'=' * 42}")
-    elif dataset_dir is not None:
-        print("\nNo detections found — dataset directory is empty.")
+    # ── ML dataset finalisation ──────────────────────────────────
+    if dataset_exporter is not None:
+        dataset_exporter.finalize()
 
     # ── HITL Review Mode ──────────────────────────────────────────
     if review_mode or review_only:
@@ -6705,6 +7470,73 @@ Notes:
     )
 
     parser.add_argument(
+        '--dataset-format',
+        choices=['aabb', 'obb', 'segment', 'coco'],
+        default='aabb',
+        help='Dataset annotation format: aabb (axis-aligned bbox, default), '
+             'obb (oriented bbox — ideal for thin trails), '
+             'segment (instance segmentation polygon), '
+             'coco (COCO JSON with bbox + segmentation)'
+    )
+
+    parser.add_argument(
+        '--dataset-split',
+        nargs=3, type=float, default=[0.7, 0.2, 0.1],
+        metavar=('TRAIN', 'VAL', 'TEST'),
+        help='Train/val/test split ratios (default: 0.7 0.2 0.1). '
+             'Uses temporal-episode grouping to prevent data leakage.'
+    )
+
+    parser.add_argument(
+        '--dataset-skip',
+        type=int, default=0,
+        help='Export every Nth frame with detections. '
+             '0 = auto (fps/2, i.e. one frame per 0.5s). '
+             '1 = export all frames (no skip).'
+    )
+
+    parser.add_argument(
+        '--dataset-dedup',
+        type=int, default=5,
+        help='Perceptual hash dedup threshold (Hamming distance 0-64). '
+             '0 = disable dedup. Default: 5.'
+    )
+
+    parser.add_argument(
+        '--dataset-negatives',
+        type=float, default=0.2,
+        help='Ratio of negative (no-detection) samples to include relative to '
+             'positive samples. 0 = no negatives. Default: 0.2'
+    )
+
+    parser.add_argument(
+        '--dataset-image-format',
+        choices=['jpg', 'png'], default='jpg',
+        help='Image format for dataset export (default: jpg)'
+    )
+
+    parser.add_argument(
+        '--dataset-image-quality',
+        type=int, default=95,
+        help='JPEG quality for dataset images, 1-100 (default: 95). '
+             'Ignored when --dataset-image-format is png.'
+    )
+
+    parser.add_argument(
+        '--dataset-dir',
+        type=str, default=None,
+        help='Explicit dataset output directory (overrides default '
+             '<output_stem>_dataset/)'
+    )
+
+    parser.add_argument(
+        '--dataset-from-annotations',
+        type=str, default=None,
+        help='Export dataset from an existing HITL-verified annotation file '
+             '(only confirmed detections). Bypasses video processing.'
+    )
+
+    parser.add_argument(
         '--exposure-time',
         type=float,
         default=13.0,
@@ -6832,6 +7664,24 @@ Notes:
                     preprocessing_params[key] = learned[key]
             print(f"Loaded learned parameters from profile: {args.hitl_profile}")
 
+    # Handle --dataset-from-annotations: export from HITL-verified annotations
+    if args.dataset_from_annotations:
+        export_dataset_from_annotations(
+            input_path=args.input,
+            annotations_path=args.dataset_from_annotations,
+            dataset_dir_override=args.dataset_dir,
+            output_path=args.output,
+            fmt=args.dataset_format,
+            split_ratios=tuple(args.dataset_split),
+            skip_frames=args.dataset_skip,
+            dedup_threshold=args.dataset_dedup,
+            negative_ratio=args.dataset_negatives,
+            image_format=args.dataset_image_format,
+            image_quality=args.dataset_image_quality,
+            freeze_duration=args.freeze_duration,
+        )
+        return
+
     process_video(
         args.input,
         args.output,
@@ -6859,6 +7709,14 @@ Notes:
         hitl_profile=args.hitl_profile,
         auto_accept=args.auto_accept,
         no_learn=args.no_learn,
+        dataset_format=args.dataset_format,
+        dataset_split=tuple(args.dataset_split),
+        dataset_skip=args.dataset_skip,
+        dataset_dedup=args.dataset_dedup,
+        dataset_negatives=args.dataset_negatives,
+        dataset_image_format=args.dataset_image_format,
+        dataset_image_quality=args.dataset_image_quality,
+        dataset_dir_override=args.dataset_dir,
     )
 
 
