@@ -471,6 +471,376 @@ class _NNBackend:
         }
 
 
+# ── Documentation overlay shared infrastructure ──────────────────────────
+# Used by all three preview windows (preprocessing, radon, NN) to provide
+# interactive multi-page documentation accessed via easter eggs.
+
+_DOC_SECRET_WORD = "blackbox"
+
+# Preprocessing preview doc pages
+_PREPROC_DOC_PAGES = [
+    {
+        'title': 'The Pipeline',
+        'content': [
+            ('Frame -> Grayscale -> CLAHE -> Blur -> Canny -> Hough -> Classify', 'diagram'),
+            ('', 'blank'),
+            ('Each step transforms the image to extract satellite and airplane trails:', 'primary'),
+            ('', 'blank'),
+            ('Grayscale      Convert colour frame to single-channel intensity', 'primary'),
+            ('CLAHE          Boost dim features without blowing out bright stars', 'primary'),
+            ('Blur           Smooth noise while preserving linear edges', 'primary'),
+            ('Canny          Detect edges (brightness transitions)', 'primary'),
+            ('Hough          Find straight lines in the edge map', 'primary'),
+            ('Classify       Brightness, colour, smoothness, contrast analysis', 'primary'),
+            ('', 'blank'),
+            ('A supplementary Matched Filter stage catches trails too dim for edges.', 'dim'),
+            ('Each panel below shows one of these intermediate stages.', 'dim'),
+        ],
+        'konami_only': False,
+    },
+    {
+        'title': 'The Panels',
+        'content': [
+            ('ORIGINAL', 'accent'),
+            ('  Your raw input frame. Click start+end to mark trail examples.', 'primary'),
+            ('  Marked trails build a signal envelope that adapts thresholds.', 'dim'),
+            ('', 'blank'),
+            ('CLAHE', 'accent'),
+            ('  Contrast-Limited Adaptive Histogram Equalization.', 'primary'),
+            ('  Boosts dim features in dark sky without saturating bright stars.', 'primary'),
+            ('  The clip limit controls enhancement aggressiveness.', 'dim'),
+            ('', 'blank'),
+            ('MF RESPONSE', 'accent'),
+            ('  Directional matched filter SNR heatmap. Bright = linear features.', 'primary'),
+            ('  Magenta lines = detections above the SNR threshold.', 'primary'),
+            ('  Uses temporal reference (multi-frame) when available.', 'dim'),
+            ('', 'blank'),
+            ('EDGES', 'accent'),
+            ('  Canny edge detection. Cyan overlay = edges fed into Hough lines.', 'primary'),
+        ],
+        'konami_only': False,
+    },
+    {
+        'title': 'The Sliders',
+        'content': [
+            ('CLAHE Clip', 'accent'),
+            ('  How aggressively to boost contrast.', 'primary'),
+            ('  Lower = subtle  |  Higher = punchy but may amplify noise', 'dim'),
+            ('', 'blank'),
+            ('Blur Kernel / Sigma', 'accent'),
+            ('  Gaussian smoothing reduces noise and small-scale texture.', 'primary'),
+            ('  Higher = smoother = fewer false edges, but may blur thin trails', 'dim'),
+            ('', 'blank'),
+            ('Canny Low / High', 'accent'),
+            ('  Edge detection sensitivity. Two thresholds with hysteresis.', 'primary'),
+            ('  Lower = more edges = more candidates (and more noise)', 'dim'),
+            ('', 'blank'),
+            ('MF SNR', 'accent'),
+            ('  Matched filter signal-to-noise threshold.', 'primary'),
+            ('  Lower = catches dimmer trails but more false positives', 'dim'),
+            ('  Higher = only bright, obvious trails pass', 'dim'),
+        ],
+        'konami_only': False,
+    },
+]
+
+# Radon preview doc pages
+_RADON_DOC_PAGES = [
+    {
+        'title': 'The Radon Pipeline',
+        'content': [
+            ('Frame -> BG Sub -> Star Mask -> [LSD + Radon] -> PCF -> Merge', 'diagram'),
+            ('', 'blank'),
+            ('Two independent detection paths complement each other:', 'primary'),
+            ('', 'blank'),
+            ('LSD Path (Line Segment Detector)', 'accent'),
+            ('  A-contrario algorithm finding statistically significant segments.', 'primary'),
+            ('  Fast, good for brighter trails with clear edges.', 'dim'),
+            ('', 'blank'),
+            ('Radon Path (Integral Transform)', 'accent'),
+            ('  Projects the image at N angles. A straight line concentrates', 'primary'),
+            ('  into a single bright peak in the sinogram. Catches very dim', 'primary'),
+            ('  trails by integrating signal along full trail length.', 'primary'),
+            ('', 'blank'),
+            ('Both paths feed into the Perpendicular Cross Filter (PCF) which', 'dim'),
+            ('rejects false positives via trail cross-section asymmetry.', 'dim'),
+        ],
+        'konami_only': False,
+    },
+    {
+        'title': 'The Panels',
+        'content': [
+            ('ORIGINAL', 'accent'),
+            ('  Input frame with detection overlays.', 'primary'),
+            ('', 'blank'),
+            ('RESIDUAL', 'accent'),
+            ('  Star-cleaned residual. Red = masked star pixels.', 'primary'),
+            ('  Only trail signal remains after BG subtraction + star removal.', 'dim'),
+            ('', 'blank'),
+            ('SINOGRAM', 'accent'),
+            ('  Radon transform output. Each column = one projection angle.', 'primary'),
+            ('  Bright spots = linear features. Circles = detected peaks.', 'primary'),
+            ('', 'blank'),
+            ('LSD LINES', 'accent'),
+            ('  Line Segment Detector output. Green = significant segments.', 'primary'),
+            ('  Uses the Helmholtz principle (unlikely from noise alone).', 'dim'),
+            ('', 'blank'),
+            ('DETECTIONS', 'accent'),
+            ('  Final result: Green=PCF ok | Amber=raw Radon | Red=rejected', 'primary'),
+        ],
+        'konami_only': False,
+    },
+    {
+        'title': 'The Sliders',
+        'content': [
+            ('Radon SNR', 'accent'),
+            ('  Min signal-to-noise ratio in sinogram. Lower = more sensitive.', 'primary'),
+            ('', 'blank'),
+            ('PCF Ratio', 'accent'),
+            ('  Cross-filter strictness. Real trails are brighter along their', 'primary'),
+            ('  length than across. Higher = stricter FP rejection.', 'dim'),
+            ('', 'blank'),
+            ('Star Mask sigma', 'accent'),
+            ('  Star removal aggressiveness (in noise sigma units).', 'primary'),
+            ('  Lower = masks more stars but may eat trail pixels near stars.', 'dim'),
+            ('', 'blank'),
+            ('LSD Significance', 'accent'),
+            ('  Detection threshold (log10 NFA). Lower = dimmer segments.', 'primary'),
+            ('', 'blank'),
+            ('PCF Kernel', 'accent'),
+            ('  Cross-section sampling width. Match to trail PSF width.', 'primary'),
+            ('', 'blank'),
+            ('Min Length', 'accent'),
+            ('  Minimum trail length (px). Shorter = more trails + more noise.', 'primary'),
+        ],
+        'konami_only': False,
+    },
+    {
+        'title': 'Developer Internals',
+        'content': [
+            ('THE RADON TRANSFORM', 'heading'),
+            ('  Projects the image along N angles. A line at angle theta', 'primary'),
+            ('  maps to a peak at (theta, offset) in the sinogram.', 'primary'),
+            ('  sinogram[s,theta] = integral of f(x,y) along line (s,theta)', 'diagram'),
+            ('', 'blank'),
+            ('SNR CALCULATION', 'heading'),
+            ('  SNR = sinogram / (noise_sigma * sqrt(N_pixels))', 'diagram'),
+            ('  sqrt(N) from CLT: longer projections have more noise,', 'primary'),
+            ('  so normalization accounts for projection length.', 'primary'),
+            ('', 'blank'),
+            ('PCF GEOMETRY', 'heading'),
+            ('  Samples brightness parallel vs perpendicular to trail.', 'primary'),
+            ('  Real trails: ratio >> 1. Stars/noise: ratio ~ 1.', 'primary'),
+            ('', 'blank'),
+            ('MULTI-FRAME ACCUMULATION', 'heading'),
+            ('  Stacks 2-4 cleaned residuals before Radon transform.', 'primary'),
+            ('  SNR boost = sqrt(N_frames). 4 frames -> 2x improvement.', 'dim'),
+            ('', 'blank'),
+            ('TEMPORAL TRACKER', 'heading'),
+            ('  Detections must appear in >=2 of last 4 frames.', 'primary'),
+            ('  Tracklets (3+ frames) get high-confidence tags.', 'dim'),
+        ],
+        'konami_only': True,
+    },
+]
+
+# NN preview doc pages
+_NN_DOC_PAGES = [
+    {
+        'title': 'Neural Network Detection',
+        'content': [
+            ('Frame -> Model Inference -> NMS -> Class Mapping -> Detections', 'diagram'),
+            ('', 'blank'),
+            ('Runs a trained object detection model (YOLOv8/v11, ONNX, etc.)', 'primary'),
+            ('to find satellite and airplane trails in each frame.', 'primary'),
+            ('', 'blank'),
+            ('Three backends are supported:', 'primary'),
+            ('  ultralytics   Primary. Auto-installed. GPU support.', 'accent'),
+            ('  cv2dnn        OpenCV DNN. Zero extra deps. ONNX/TF.', 'accent'),
+            ('  onnxruntime   ONNX Runtime. Broad HW acceleration.', 'accent'),
+            ('', 'blank'),
+            ('Class IDs mapped to satellite/airplane via --nn-class-map.', 'dim'),
+            ('Hybrid mode (--nn-hybrid) merges NN + classical results.', 'dim'),
+        ],
+        'konami_only': False,
+    },
+    {
+        'title': 'The Sliders',
+        'content': [
+            ('Confidence', 'accent'),
+            ('  Minimum model confidence to keep a detection.', 'primary'),
+            ('  Lower = more detections (recall) but more false positives.', 'dim'),
+            ('  Higher = only high-confidence detections (precision).', 'dim'),
+            ('', 'blank'),
+            ('NMS IoU', 'accent'),
+            ('  Non-Maximum Suppression overlap threshold.', 'primary'),
+            ('  Controls how aggressively overlapping boxes are merged.', 'primary'),
+            ('  Lower = more aggressive merging (fewer duplicates).', 'dim'),
+            ('  Higher = less merging (may keep overlapping boxes).', 'dim'),
+        ],
+        'konami_only': False,
+    },
+]
+
+
+def _draw_doc_overlay(canvas, page_index, pages, konami_unlocked=False):
+    """Draw interactive documentation overlay on the canvas.
+
+    Renders a semi-transparent dark overlay with a centered content card
+    showing documentation text. Supports multi-page navigation.
+
+    Args:
+        canvas: OpenCV BGR canvas (modified in-place).
+        page_index: Current page (0-based).
+        pages: List of page dicts (title, content, konami_only).
+        konami_unlocked: Whether secret bonus pages are visible.
+
+    Returns:
+        Dict with click regions for mouse interaction:
+        {
+            'card': (x, y, w, h),
+            'prev_arrow': (x, y, w, h) or None,
+            'next_arrow': (x, y, w, h) or None,
+        }
+    """
+    h, w = canvas.shape[:2]
+
+    # Theme (same as preview windows)
+    BG_PANEL = (42, 42, 42)
+    BORDER = (58, 58, 58)
+    TEXT_PRIMARY = (210, 210, 210)
+    TEXT_DIM = (120, 120, 120)
+    ACCENT = (200, 255, 80)
+    ACCENT_DIM = (100, 170, 50)
+
+    # Semi-transparent overlay (85% black)
+    overlay = np.zeros_like(canvas)
+    cv2.addWeighted(canvas, 0.15, overlay, 0.85, 0, canvas)
+
+    # Filter visible pages
+    visible = [p for p in pages
+               if not p.get('konami_only') or konami_unlocked]
+    n_pages = len(visible)
+    if n_pages == 0:
+        return {'card': (0, 0, 0, 0), 'prev_arrow': None, 'next_arrow': None}
+    page_index = max(0, min(page_index, n_pages - 1))
+    page = visible[page_index]
+
+    # Content card dimensions
+    card_w = int(w * 0.70)
+    card_h = int(h * 0.82)
+    card_x = (w - card_w) // 2
+    card_y = (h - card_h) // 2
+
+    # Card background + border
+    cv2.rectangle(canvas, (card_x, card_y),
+                  (card_x + card_w, card_y + card_h), BG_PANEL, -1)
+    cv2.rectangle(canvas, (card_x, card_y),
+                  (card_x + card_w, card_y + card_h), BORDER, 1)
+
+    # Title bar
+    ty = card_y + 30
+    cv2.putText(canvas, "HOW IT WORKS", (card_x + 20, ty),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, ACCENT, 1, cv2.LINE_AA)
+
+    # Page indicator + close hint
+    pg_txt = f"{page_index + 1}/{n_pages}"
+    cv2.putText(canvas, pg_txt, (card_x + card_w - 60, ty),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, TEXT_DIM, 1, cv2.LINE_AA)
+    cv2.putText(canvas, "ESC to close  |  A/D navigate",
+                (card_x + card_w - 290, ty),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.30, TEXT_DIM, 1, cv2.LINE_AA)
+
+    # Separator
+    cv2.line(canvas, (card_x + 20, ty + 10),
+             (card_x + card_w - 20, ty + 10), BORDER, 1)
+
+    # Page title
+    pty = ty + 40
+    cv2.putText(canvas, page['title'], (card_x + 20, pty),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, ACCENT, 1, cv2.LINE_AA)
+
+    # Content lines
+    cy = pty + 28
+    line_h = 19
+    max_cy = card_y + card_h - 60  # leave room for nav dots
+    for text, style in page['content']:
+        if cy > max_cy:
+            break
+        if style == 'blank' or text == '':
+            cy += line_h // 2
+            continue
+        color_map = {
+            'accent': ACCENT,
+            'heading': ACCENT,
+            'diagram': ACCENT_DIM,
+            'dim': TEXT_DIM,
+            'primary': TEXT_PRIMARY,
+        }
+        color = color_map.get(style, TEXT_PRIMARY)
+        scale = 0.42 if style == 'heading' else 0.37
+        thick = 1
+        cv2.putText(canvas, text, (card_x + 30, cy),
+                    cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick,
+                    cv2.LINE_AA)
+        cy += line_h
+
+    # Navigation arrows
+    arrow_y = card_y + card_h - 28
+    prev_region = None
+    next_region = None
+    if page_index > 0:
+        cv2.putText(canvas, "< PREV (A)", (card_x + 20, arrow_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, ACCENT_DIM, 1,
+                    cv2.LINE_AA)
+        prev_region = (card_x + 10, arrow_y - 18, 120, 28)
+    if page_index < n_pages - 1:
+        cv2.putText(canvas, "NEXT (D) >",
+                    (card_x + card_w - 120, arrow_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, ACCENT_DIM, 1,
+                    cv2.LINE_AA)
+        next_region = (card_x + card_w - 130, arrow_y - 18, 130, 28)
+
+    # Page dots
+    dot_y = arrow_y - 22
+    dot_spacing = 14
+    total_w = n_pages * dot_spacing
+    dot_x0 = card_x + (card_w - total_w) // 2
+    for i in range(n_pages):
+        dx = dot_x0 + i * dot_spacing + 6
+        if i == page_index:
+            cv2.circle(canvas, (dx, dot_y), 4, ACCENT, -1)
+        else:
+            cv2.circle(canvas, (dx, dot_y), 3, TEXT_DIM, 1)
+
+    return {
+        'card': (card_x, card_y, card_w, card_h),
+        'prev_arrow': prev_region,
+        'next_arrow': next_region,
+    }
+
+
+def _doc_compute_title_bbox(text, x, y, scale=0.52):
+    """Compute bounding box of a text string for hit testing."""
+    (tw, th), baseline = cv2.getTextSize(
+        text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+    return (x, y - th, tw, th + baseline)
+
+
+def _doc_point_in_rect(px, py, rect):
+    """Check if point (px, py) is inside rect (x, y, w, h)."""
+    rx, ry, rw, rh = rect
+    return rx <= px <= rx + rw and ry <= py <= ry + rh
+
+
+def _doc_tag_bbox(text, x, y, scale=0.38):
+    """Compute the bounding box that _draw_tag would produce."""
+    (tw, th), _ = cv2.getTextSize(
+        text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+    pad_x, pad_y = 6, 4
+    return (x, y - th - pad_y, tw + pad_x * 2, th + pad_y * 2)
+
+
 def show_preprocessing_preview(video_path, initial_params=None):
     """
     Show an interactive preview window for tuning preprocessing parameters.
@@ -670,6 +1040,19 @@ def show_preprocessing_preview(video_path, initial_params=None):
     # when the frame changes.
     _TEMPORAL_N = 3   # Frames to each side for temporal median (total = 2N+1 = 7)
     temporal_ref_cache = {'frame_idx': -1, 'diff_image': None, 'noise_map': None}
+
+    # ── Documentation overlay state ───────────────────────────────────
+    doc_state = {
+        'visible': False,
+        'page': 0,
+        'konami_unlocked': False,
+        'key_buffer': [],
+        'flash_timer': 0,
+        'title_hovered': False,
+        'regions': None,       # click regions from _draw_doc_overlay
+        'tag_regions': [],     # [(bbox, page_index), ...] for right-click
+    }
+    doc_pages = _PREPROC_DOC_PAGES
 
     # ── Pre-computed MF kernel bank ──────────────────────────────────
     # 36 angles (5-deg steps) × 2 kernel lengths = 72 kernels.
@@ -1111,13 +1494,18 @@ def show_preprocessing_preview(video_path, initial_params=None):
             if 0 <= mx < orig_w and 0 <= my < orig_h:
                 cv2.line(canvas, p1, (mx, my), TRAIL_RUBBER, 1, cv2.LINE_AA)
 
-        # Panel tags
+        # Panel tags (with bbox tracking for right-click doc access)
         tag_y, tag_x = 18, 8
+        _tag_regions = []   # [(bbox, doc_page_index), ...]
         trail_count_str = f"  [{len(marked_trails)}/{MAX_TRAILS}]" if marked_trails or pending_click[0] else ""
-        _draw_tag(canvas, "ORIGINAL" + trail_count_str, tag_x, tag_y, BG_DARK, TEXT_DIM if not trail_count_str else TRAIL_MARK)
+        orig_tag_text = "ORIGINAL" + trail_count_str
+        _draw_tag(canvas, orig_tag_text, tag_x, tag_y, BG_DARK, TEXT_DIM if not trail_count_str else TRAIL_MARK)
+        _tag_regions.append((_doc_tag_bbox(orig_tag_text, tag_x, tag_y), 1))
         clip_val = p['clahe_clip_limit'] / 10.0
-        _draw_tag(canvas, f"CLAHE  clip {clip_val:.1f}  tile {p['clahe_tile_size']}",
+        clahe_tag_text = f"CLAHE  clip {clip_val:.1f}  tile {p['clahe_tile_size']}"
+        _draw_tag(canvas, clahe_tag_text,
                   tag_x, bot_y + tag_y, BG_DARK, ACCENT)
+        _tag_regions.append((_doc_tag_bbox(clahe_tag_text, tag_x, bot_y + tag_y), 1))
         mf_snr_val = p['mf_snr_threshold'] / 10.0
         mf_line_count = len(mf_lines)
         is_temporal = temporal_ref_cache['diff_image'] is not None
@@ -1127,16 +1515,27 @@ def show_preprocessing_preview(video_path, initial_params=None):
             mf_tag += f"  [{mf_line_count}]"
         _draw_tag(canvas, mf_tag,
                   small_w + gap + tag_x, bot_y + tag_y, BG_DARK, ACCENT_MF)
-        _draw_tag(canvas, f"EDGES  {p['canny_low']}-{p['canny_high']}",
+        _tag_regions.append((_doc_tag_bbox(mf_tag, small_w + gap + tag_x, bot_y + tag_y), 1))
+        edges_tag_text = f"EDGES  {p['canny_low']}-{p['canny_high']}"
+        _draw_tag(canvas, edges_tag_text,
                   2 * (small_w + gap) + tag_x, bot_y + tag_y, BG_DARK, ACCENT_CYAN)
+        _tag_regions.append((_doc_tag_bbox(edges_tag_text, 2 * (small_w + gap) + tag_x, bot_y + tag_y), 1))
+        doc_state['tag_regions'] = _tag_regions
 
         # ── Sidebar ──────────────────────────────────────────────────
         sb_x = orig_w
         _fill_rect(canvas, sb_x, 0, sidebar_w, canvas_h - status_bar_h, BG_SIDEBAR)
         _draw_border(canvas, sb_x, 0, sidebar_w, canvas_h - status_bar_h, BORDER)
 
-        # Title
-        _put_text(canvas, "MNEMOSKY", sb_x + 14, 24, ACCENT, 0.52, 1)
+        # Title (with hover hint for doc overlay)
+        _title_x, _title_y = sb_x + 14, 24
+        _title_bbox = _doc_compute_title_bbox("MNEMOSKY", _title_x, _title_y, 0.52)
+        doc_state['title_bbox'] = _title_bbox
+        if doc_state['title_hovered']:
+            _put_text(canvas, "MNEMOSKY", _title_x, _title_y, (230, 255, 140), 0.52, 1)
+            _put_text(canvas, "(?)", _title_x + _title_bbox[2] + 4, _title_y, ACCENT_DIM, 0.36)
+        else:
+            _put_text(canvas, "MNEMOSKY", _title_x, _title_y, ACCENT, 0.52, 1)
         _put_text(canvas, "Preprocessing", sb_x + 14, 46, TEXT_HEADING, 0.40)
         cv2.line(canvas, (sb_x + 14, 56), (sb_x + sidebar_w - 14, 56), BORDER, 1)
 
@@ -1283,6 +1682,16 @@ def show_preprocessing_preview(video_path, initial_params=None):
 
         slider_regions = new_regions
 
+        # "UNLOCKED" flash on status bar when secret word is typed
+        if doc_state['flash_timer'] and time.time() - doc_state['flash_timer'] < 2.0:
+            _put_text(canvas, "UNLOCKED", canvas_w // 2 - 40, sb_y + 16, ACCENT, 0.40, 1)
+
+        # ── Documentation overlay ─────────────────────────────────────
+        if doc_state['visible']:
+            doc_state['regions'] = _draw_doc_overlay(
+                canvas, doc_state['page'], doc_pages,
+                doc_state['konami_unlocked'])
+
         return canvas
 
     # ── Mouse callback for slider interaction ────────────────────────
@@ -1304,8 +1713,41 @@ def show_preprocessing_preview(video_path, initial_params=None):
         if event == cv2.EVENT_MOUSEMOVE:
             mouse_pos[0] = x
             mouse_pos[1] = y
+            # Title hover detection
+            if doc_state.get('title_bbox'):
+                was_hovered = doc_state['title_hovered']
+                doc_state['title_hovered'] = _doc_point_in_rect(
+                    x, y, doc_state['title_bbox'])
+                if doc_state['title_hovered'] != was_hovered:
+                    pass  # dirty flag picks up change
+
+        # When doc overlay is visible, handle overlay clicks only
+        if doc_state['visible']:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                regions = doc_state.get('regions')
+                if regions:
+                    # Check prev/next arrows
+                    if regions['prev_arrow'] and _doc_point_in_rect(x, y, regions['prev_arrow']):
+                        if doc_state['page'] > 0:
+                            doc_state['page'] -= 1
+                        return
+                    if regions['next_arrow'] and _doc_point_in_rect(x, y, regions['next_arrow']):
+                        vis = [p for p in doc_pages if not p.get('konami_only') or doc_state['konami_unlocked']]
+                        if doc_state['page'] < len(vis) - 1:
+                            doc_state['page'] += 1
+                        return
+                    # Click outside card dismisses overlay
+                    if not _doc_point_in_rect(x, y, regions['card']):
+                        doc_state['visible'] = False
+                        return
+            return  # Don't process slider/trail clicks when overlay open
 
         if event == cv2.EVENT_LBUTTONDOWN:
+            # Check MNEMOSKY title click → toggle doc overlay
+            if doc_state.get('title_bbox') and _doc_point_in_rect(x, y, doc_state['title_bbox']):
+                doc_state['visible'] = not doc_state['visible']
+                doc_state['page'] = 0
+                return
             # Check if click is inside the Original panel (left column)
             if 0 <= x < orig_w and 0 <= y < orig_h:
                 # Map panel coordinates → source frame coordinates
@@ -1325,6 +1767,13 @@ def show_preprocessing_preview(video_path, initial_params=None):
             else:
                 # Click is outside Original panel → slider interaction
                 _update_slider_from_x(x, y)
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            # Right-click on panel tags → open doc overlay to that page
+            for tag_bbox, page_idx in doc_state.get('tag_regions', []):
+                if _doc_point_in_rect(x, y, tag_bbox):
+                    doc_state['visible'] = True
+                    doc_state['page'] = page_idx
+                    return
         elif event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON):
             if dragging['idx'] >= 0:
                 x_start, x_end, _, v_min, v_max, key = slider_regions[dragging['idx']]
@@ -1395,6 +1844,8 @@ def show_preprocessing_preview(video_path, initial_params=None):
             _pending_state,
             _mouse_for_key,
             len(marked_trails),
+            doc_state['visible'], doc_state['page'],
+            doc_state['title_hovered'], doc_state['konami_unlocked'],
         )
 
         needs_preproc = (preproc_key != _prev_preproc_key)
@@ -1420,6 +1871,47 @@ def show_preprocessing_preview(video_path, initial_params=None):
                 first_render = False
 
         key = cv2.waitKey(30) & 0xFF
+
+        # ── Secret word tracking (always active) ─────────────────────
+        if key != 255 and 97 <= key <= 122:  # a-z lowercase
+            doc_state['key_buffer'].append(chr(key))
+            doc_state['key_buffer'] = doc_state['key_buffer'][-len(_DOC_SECRET_WORD):]
+            if ''.join(doc_state['key_buffer']) == _DOC_SECRET_WORD:
+                doc_state['konami_unlocked'] = True
+                doc_state['visible'] = True
+                vis = [p for p in doc_pages if not p.get('konami_only') or True]
+                doc_state['page'] = len(vis) - 1
+                doc_state['flash_timer'] = time.time()
+                _prev_display_key = None  # force redraw
+                continue
+
+        # ── Doc overlay key handling (intercept before normal keys) ───
+        if doc_state['visible']:
+            if key == 27:  # ESC closes overlay, not the window
+                doc_state['visible'] = False
+                _prev_display_key = None
+            elif key in (ord('a'), ord('A')):  # prev page
+                if doc_state['page'] > 0:
+                    doc_state['page'] -= 1
+                    _prev_display_key = None
+            elif key in (ord('d'), ord('D')):  # next page
+                vis = [p for p in doc_pages if not p.get('konami_only') or doc_state['konami_unlocked']]
+                if doc_state['page'] < len(vis) - 1:
+                    doc_state['page'] += 1
+                    _prev_display_key = None
+            # Swallow all other keys when overlay is open
+            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                print("Preview window closed. Using default parameters.")
+                cap.release()
+                return None
+            continue
+
+        # ── ? key toggles doc overlay ─────────────────────────────────
+        if key == 63:  # ? (Shift+/)
+            doc_state['visible'] = True
+            doc_state['page'] = 0
+            _prev_display_key = None
+            continue
 
         if key == 27:  # ESC
             print("Preview cancelled. Using default parameters.")
@@ -1684,6 +2176,19 @@ def show_radon_preview(video_path, initial_params=None):
     dragging = {'idx': -1}
     slider_regions = []
     mouse_pos = [0, 0]
+
+    # ── Documentation overlay state ───────────────────────────────────
+    doc_state = {
+        'visible': False,
+        'page': 0,
+        'konami_unlocked': False,
+        'key_buffer': [],
+        'flash_timer': 0,
+        'title_hovered': False,
+        'regions': None,
+        'tag_regions': [],
+    }
+    doc_pages = _RADON_DOC_PAGES
 
     # ── Window setup ────────────────────────────────────────────────
     window_name = "Mnemosky  -  Radon Pipeline Debug"
@@ -2093,37 +2598,44 @@ def show_radon_preview(video_path, initial_params=None):
                 panel[:ph_actual, :pw_actual]
             _draw_border(canvas, px, py, pw, ph, BORDER)
 
-        # ── Panel tags ──────────────────────────────────────────────
+        # ── Panel tags (with bbox tracking for right-click doc access) ─
         tag_y_off, tag_x_off = 18, 8
+        _tag_regions = []
         _draw_tag(canvas, "ORIGINAL", tag_x_off, tag_y_off,
                   BG_DARK, TEXT_DIM)
+        _tag_regions.append((_doc_tag_bbox("ORIGINAL", tag_x_off, tag_y_off), 1))
 
         n_stars = int(np.sum(_radon_cache['star_mask'])) if _radon_cache['star_mask'] is not None else 0
         star_pct = n_stars / max(1, src_h * src_w) * 100
-        _draw_tag(canvas,
-                  f"RESIDUAL  stars {star_pct:.1f}%",
+        res_tag = f"RESIDUAL  stars {star_pct:.1f}%"
+        _draw_tag(canvas, res_tag,
                   tag_x_off, bot_y + tag_y_off, BG_DARK, ACCENT_RESIDUAL)
+        _tag_regions.append((_doc_tag_bbox(res_tag, tag_x_off, bot_y + tag_y_off), 1))
 
         n_peaks = len(_radon_cache['peak_coords'])
         snr_v = p['radon_snr_threshold'] / 10.0
-        _draw_tag(canvas,
-                  f"SINOGRAM  SNR>={snr_v:.1f}  [{n_peaks}]",
+        sino_tag = f"SINOGRAM  SNR>={snr_v:.1f}  [{n_peaks}]"
+        _draw_tag(canvas, sino_tag,
                   small_w + gap + tag_x_off, bot_y + tag_y_off,
                   BG_DARK, ACCENT_SINOGRAM)
+        _tag_regions.append((_doc_tag_bbox(sino_tag, small_w + gap + tag_x_off, bot_y + tag_y_off), 1))
 
         n_lsd = len(_radon_cache['lsd_segments'])
         eps_v = (p['lsd_log_eps'] - 20) / 10.0
-        _draw_tag(canvas,
-                  f"LSD  eps={eps_v:.1f}  [{n_lsd}]",
+        lsd_tag = f"LSD  eps={eps_v:.1f}  [{n_lsd}]"
+        _draw_tag(canvas, lsd_tag,
                   2 * (small_w + gap) + tag_x_off, bot_y + tag_y_off,
                   BG_DARK, ACCENT_LSD)
+        _tag_regions.append((_doc_tag_bbox(lsd_tag, 2 * (small_w + gap) + tag_x_off, bot_y + tag_y_off), 1))
 
         n_conf = len(_radon_cache['pcf_confirmed'])
         n_rej = len(_radon_cache['pcf_rejected'])
-        _draw_tag(canvas,
-                  f"DETECTIONS  {n_conf} ok  {n_rej} rej",
+        det_tag = f"DETECTIONS  {n_conf} ok  {n_rej} rej"
+        _draw_tag(canvas, det_tag,
                   3 * (small_w + gap) + tag_x_off, bot_y + tag_y_off,
                   BG_DARK, ACCENT_DET_PCF)
+        _tag_regions.append((_doc_tag_bbox(det_tag, 3 * (small_w + gap) + tag_x_off, bot_y + tag_y_off), 1))
+        doc_state['tag_regions'] = _tag_regions
 
         # ── Sidebar ─────────────────────────────────────────────────
         sb_x = orig_w
@@ -2132,8 +2644,15 @@ def show_radon_preview(video_path, initial_params=None):
         _draw_border(canvas, sb_x, 0, sidebar_w,
                      canvas_h - status_bar_h, BORDER)
 
-        # Title
-        _put_text(canvas, "MNEMOSKY", sb_x + 14, 24, ACCENT, 0.52, 1)
+        # Title (with hover hint for doc overlay)
+        _title_x, _title_y = sb_x + 14, 24
+        _title_bbox = _doc_compute_title_bbox("MNEMOSKY", _title_x, _title_y, 0.52)
+        doc_state['title_bbox'] = _title_bbox
+        if doc_state['title_hovered']:
+            _put_text(canvas, "MNEMOSKY", _title_x, _title_y, (230, 255, 140), 0.52, 1)
+            _put_text(canvas, "(?)", _title_x + _title_bbox[2] + 4, _title_y, (100, 170, 50), 0.36)
+        else:
+            _put_text(canvas, "MNEMOSKY", _title_x, _title_y, ACCENT, 0.52, 1)
         _put_text(canvas, "Radon Debug", sb_x + 14, 46,
                   TEXT_HEADING, 0.40)
         cv2.line(canvas, (sb_x + 14, 56),
@@ -2250,6 +2769,17 @@ def show_radon_preview(video_path, initial_params=None):
              frame_v_min, frame_v_max, 'frame_idx'))
 
         slider_regions = new_regions
+
+        # "UNLOCKED" flash on status bar
+        if doc_state['flash_timer'] and time.time() - doc_state['flash_timer'] < 2.0:
+            _put_text(canvas, "UNLOCKED", canvas_w // 2 - 40, sb_y + 16, ACCENT, 0.40, 1)
+
+        # ── Documentation overlay ─────────────────────────────────────
+        if doc_state['visible']:
+            doc_state['regions'] = _draw_doc_overlay(
+                canvas, doc_state['page'], doc_pages,
+                doc_state['konami_unlocked'])
+
         return canvas
 
     # ── Mouse callback ──────────────────────────────────────────────
@@ -2269,9 +2799,43 @@ def show_radon_preview(video_path, initial_params=None):
         if event == cv2.EVENT_MOUSEMOVE:
             mouse_pos[0] = x
             mouse_pos[1] = y
+            # Title hover detection
+            if doc_state.get('title_bbox'):
+                doc_state['title_hovered'] = _doc_point_in_rect(
+                    x, y, doc_state['title_bbox'])
+
+        # When doc overlay is visible, handle overlay clicks only
+        if doc_state['visible']:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                regions = doc_state.get('regions')
+                if regions:
+                    if regions['prev_arrow'] and _doc_point_in_rect(x, y, regions['prev_arrow']):
+                        if doc_state['page'] > 0:
+                            doc_state['page'] -= 1
+                        return
+                    if regions['next_arrow'] and _doc_point_in_rect(x, y, regions['next_arrow']):
+                        vis = [p for p in doc_pages if not p.get('konami_only') or doc_state['konami_unlocked']]
+                        if doc_state['page'] < len(vis) - 1:
+                            doc_state['page'] += 1
+                        return
+                    if not _doc_point_in_rect(x, y, regions['card']):
+                        doc_state['visible'] = False
+                        return
+            return
 
         if event == cv2.EVENT_LBUTTONDOWN:
+            # Check MNEMOSKY title click
+            if doc_state.get('title_bbox') and _doc_point_in_rect(x, y, doc_state['title_bbox']):
+                doc_state['visible'] = not doc_state['visible']
+                doc_state['page'] = 0
+                return
             _update_slider_from_x(x, y)
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            for tag_bbox, page_idx in doc_state.get('tag_regions', []):
+                if _doc_point_in_rect(x, y, tag_bbox):
+                    doc_state['visible'] = True
+                    doc_state['page'] = page_idx
+                    return
         elif event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON):
             if dragging['idx'] >= 0:
                 x_start, x_end, _, v_min, v_max, key = \
@@ -2327,6 +2891,8 @@ def show_radon_preview(video_path, initial_params=None):
             params['radon_snr_threshold'], params['pcf_ratio_threshold'],
             params['star_mask_sigma'], params['lsd_log_eps'],
             params['pcf_kernel_len'], params['min_streak_length'],
+            doc_state['visible'], doc_state['page'],
+            doc_state['title_hovered'], doc_state['konami_unlocked'],
         )
 
         needs_redraw = (cache_key != _prev_cache_key) or first_render
@@ -2342,6 +2908,45 @@ def show_radon_preview(video_path, initial_params=None):
                 first_render = False
 
         key = cv2.waitKey(30) & 0xFF
+
+        # ── Secret word tracking (always active) ─────────────────────
+        if key != 255 and 97 <= key <= 122:
+            doc_state['key_buffer'].append(chr(key))
+            doc_state['key_buffer'] = doc_state['key_buffer'][-len(_DOC_SECRET_WORD):]
+            if ''.join(doc_state['key_buffer']) == _DOC_SECRET_WORD:
+                doc_state['konami_unlocked'] = True
+                doc_state['visible'] = True
+                vis = [p for p in doc_pages if not p.get('konami_only') or True]
+                doc_state['page'] = len(vis) - 1
+                doc_state['flash_timer'] = time.time()
+                _prev_cache_key = None
+                continue
+
+        # ── Doc overlay key handling ──────────────────────────────────
+        if doc_state['visible']:
+            if key == 27:
+                doc_state['visible'] = False
+                _prev_cache_key = None
+            elif key in (ord('a'), ord('A')):
+                if doc_state['page'] > 0:
+                    doc_state['page'] -= 1
+                    _prev_cache_key = None
+            elif key in (ord('d'), ord('D')):
+                vis = [p for p in doc_pages if not p.get('konami_only') or doc_state['konami_unlocked']]
+                if doc_state['page'] < len(vis) - 1:
+                    doc_state['page'] += 1
+                    _prev_cache_key = None
+            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                print("Radon preview window closed. Using default parameters.")
+                cap.release()
+                return None
+            continue
+
+        if key == 63:  # ? (Shift+/)
+            doc_state['visible'] = True
+            doc_state['page'] = 0
+            _prev_cache_key = None
+            continue
 
         if key == 27:  # ESC
             print("Radon preview cancelled. Using default parameters.")
@@ -2539,11 +3144,61 @@ def show_nn_preview(video_path, nn_params=None):
     # ── Mouse state ──────────────────────────────────────────────────
     mouse_state = {'x': 0, 'y': 0, 'down': False, 'active_slider': None}
 
+    # ── Documentation overlay state ───────────────────────────────────
+    doc_state = {
+        'visible': False,
+        'page': 0,
+        'konami_unlocked': False,
+        'key_buffer': [],
+        'flash_timer': 0,
+        'title_hovered': False,
+        'regions': None,
+        'tag_regions': [],
+        'title_bbox': None,
+    }
+    doc_pages = _NN_DOC_PAGES
+
     def _mouse_callback(event, x, y, flags, _):
         mouse_state['x'] = x
         mouse_state['y'] = y
+
+        # Title hover detection
+        if event == cv2.EVENT_MOUSEMOVE and doc_state.get('title_bbox'):
+            doc_state['title_hovered'] = _doc_point_in_rect(
+                x, y, doc_state['title_bbox'])
+
+        # When doc overlay is visible, handle overlay clicks only
+        if doc_state['visible']:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                regions = doc_state.get('regions')
+                if regions:
+                    if regions['prev_arrow'] and _doc_point_in_rect(x, y, regions['prev_arrow']):
+                        if doc_state['page'] > 0:
+                            doc_state['page'] -= 1
+                        return
+                    if regions['next_arrow'] and _doc_point_in_rect(x, y, regions['next_arrow']):
+                        vis = [p for p in doc_pages if not p.get('konami_only') or doc_state['konami_unlocked']]
+                        if doc_state['page'] < len(vis) - 1:
+                            doc_state['page'] += 1
+                        return
+                    if not _doc_point_in_rect(x, y, regions['card']):
+                        doc_state['visible'] = False
+                        return
+            return
+
         if event == cv2.EVENT_LBUTTONDOWN:
+            # Check MNEMOSKY title click
+            if doc_state.get('title_bbox') and _doc_point_in_rect(x, y, doc_state['title_bbox']):
+                doc_state['visible'] = not doc_state['visible']
+                doc_state['page'] = 0
+                return
             mouse_state['down'] = True
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            for tag_bbox, page_idx in doc_state.get('tag_regions', []):
+                if _doc_point_in_rect(x, y, tag_bbox):
+                    doc_state['visible'] = True
+                    doc_state['page'] = page_idx
+                    return
         elif event == cv2.EVENT_LBUTTONUP:
             mouse_state['down'] = False
             mouse_state['active_slider'] = None
@@ -2599,16 +3254,27 @@ def show_nn_preview(video_path, nn_params=None):
             oy = (FRAME_H - disp_h) // 2
             canvas[oy:oy + disp_h, ox:ox + disp_w] = disp_resized
 
-        # Panel tag
-        _draw_tag(canvas, f"NN DETECTIONS  [{sat_count}S {plane_count}A]",
-                  8, 18, BG_DARK, ACCENT)
+        # Panel tag (with bbox tracking for right-click doc access)
+        nn_tag_text = f"NN DETECTIONS  [{sat_count}S {plane_count}A]"
+        _draw_tag(canvas, nn_tag_text, 8, 18, BG_DARK, ACCENT)
+        doc_state['tag_regions'] = [(_doc_tag_bbox(nn_tag_text, 8, 18), 0)]
 
         # ── Sidebar ──────────────────────────────────────────────────
         sb_x = FRAME_W
         _fill_rect(canvas, sb_x, 0, SIDEBAR_W, WIN_H - STATUS_H, BG_SIDEBAR)
         cv2.line(canvas, (sb_x, 0), (sb_x, WIN_H - STATUS_H), BORDER, 1)
 
-        sy = 20
+        # Title (with hover hint for doc overlay)
+        _title_x, _title_y = sb_x + 12, 18
+        _title_bbox = _doc_compute_title_bbox("MNEMOSKY", _title_x, _title_y, 0.45)
+        doc_state['title_bbox'] = _title_bbox
+        if doc_state['title_hovered']:
+            _put_text(canvas, "MNEMOSKY", _title_x, _title_y, (230, 255, 140), 0.45, 1)
+            _put_text(canvas, "(?)", _title_x + _title_bbox[2] + 4, _title_y, ACCENT_DIM, 0.32)
+        else:
+            _put_text(canvas, "MNEMOSKY", _title_x, _title_y, ACCENT, 0.45, 1)
+
+        sy = 36
         _put_text(canvas, "MODEL INFO", sb_x + 12, sy, TEXT_HEADING, 0.45, 1)
         sy += 22
 
@@ -2742,9 +3408,52 @@ def show_nn_preview(video_path, nn_params=None):
                         frame = new_frame
                         need_redraw = True
 
+        # "UNLOCKED" flash on status bar
+        if doc_state['flash_timer'] and time.time() - doc_state['flash_timer'] < 2.0:
+            _put_text(canvas, "UNLOCKED", WIN_W // 2 - 40, bar_y + 14, ACCENT, 0.40, 1)
+
+        # ── Documentation overlay ─────────────────────────────────────
+        if doc_state['visible']:
+            doc_state['regions'] = _draw_doc_overlay(
+                canvas, doc_state['page'], doc_pages,
+                doc_state['konami_unlocked'])
+
         # ── Display ──────────────────────────────────────────────────
         cv2.imshow(window_name, canvas)
         key = cv2.waitKey(30) & 0xFF
+
+        # ── Secret word tracking (always active) ─────────────────────
+        if key != 255 and 97 <= key <= 122:
+            doc_state['key_buffer'].append(chr(key))
+            doc_state['key_buffer'] = doc_state['key_buffer'][-len(_DOC_SECRET_WORD):]
+            if ''.join(doc_state['key_buffer']) == _DOC_SECRET_WORD:
+                doc_state['konami_unlocked'] = True
+                doc_state['visible'] = True
+                vis = [p for p in doc_pages if not p.get('konami_only') or True]
+                doc_state['page'] = len(vis) - 1
+                doc_state['flash_timer'] = time.time()
+                continue
+
+        # ── Doc overlay key handling ──────────────────────────────────
+        if doc_state['visible']:
+            if key == 27:
+                doc_state['visible'] = False
+            elif key in (ord('a'), ord('A')):
+                if doc_state['page'] > 0:
+                    doc_state['page'] -= 1
+            elif key in (ord('d'), ord('D')):
+                vis = [p for p in doc_pages if not p.get('konami_only') or doc_state['konami_unlocked']]
+                if doc_state['page'] < len(vis) - 1:
+                    doc_state['page'] += 1
+            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                cap.release()
+                return None
+            continue
+
+        if key == 63:  # ? (Shift+/)
+            doc_state['visible'] = True
+            doc_state['page'] = 0
+            continue
 
         if key in (32, 13):  # SPACE or ENTER — accept
             cv2.destroyWindow(window_name)
