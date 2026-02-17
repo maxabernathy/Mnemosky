@@ -56,6 +56,12 @@ try:
 except Exception:
     _HAS_CUDA = False
 
+# CUDA median filter availability (requires OpenCV contrib with CUDA support)
+try:
+    _HAS_CUDA_MEDIAN = _HAS_CUDA and hasattr(cv2.cuda, 'createMedianFilter')
+except Exception:
+    _HAS_CUDA_MEDIAN = False
+
 
 def show_preprocessing_preview(video_path, initial_params=None):
     """
@@ -6221,7 +6227,10 @@ class RadonStreakDetector(SatelliteTrailDetector):
         sinogram = np.zeros((diag, num_angles), dtype=np.float32)
         center = (diag / 2.0, diag / 2.0)
 
-        # GPU-accelerated path: upload padded image once
+        # GPU-accelerated path: upload padded image once, reduce on GPU
+        # to avoid downloading the full diag×diag rotated image per angle.
+        # cv2.cuda.reduce sums columns on-device, so we only download a
+        # 1×diag row per angle (~700× less data than the full image).
         if self._use_gpu:
             try:
                 gpu_padded = cv2.cuda_GpuMat()
@@ -6233,8 +6242,10 @@ class RadonStreakDetector(SatelliteTrailDetector):
                         flags=cv2.INTER_NEAREST,
                         borderMode=cv2.BORDER_CONSTANT,
                         borderValue=(0,))
-                    rotated = gpu_rotated.download()
-                    sinogram[:, i] = np.sum(rotated, axis=0)
+                    # Sum columns on GPU (axis 0 = reduce rows → 1×diag result)
+                    gpu_col_sum = cv2.cuda.reduce(
+                        gpu_rotated, 0, cv2.REDUCE_SUM, dtype=cv2.CV_32F)
+                    sinogram[:, i] = gpu_col_sum.download().ravel()
                 return sinogram.astype(np.float64), angles
             except Exception:
                 self._use_gpu = False
@@ -6381,9 +6392,9 @@ class RadonStreakDetector(SatelliteTrailDetector):
     def _perpendicular_cross_filter(self, residual, candidates, kernel_length=None):
         """Apply perpendicular cross filtering to reject false positives.
 
-        Uses local patch sampling (not full-frame filter2D) for speed.
-        For each candidate, samples brightness along the line direction
-        and perpendicular to it, then compares the mean responses.
+        Uses vectorized NumPy sampling for speed.  For each candidate,
+        samples brightness along the line direction and perpendicular to
+        it, then compares the mean responses.
 
         Args:
             residual: Background-subtracted float64 image
@@ -6397,8 +6408,14 @@ class RadonStreakDetector(SatelliteTrailDetector):
             kernel_length = self.pcf_kernel_length
         half_w = kernel_length // 2
 
+        if not candidates:
+            return []
+
         confirmed = []
         h, w = residual.shape
+
+        # Pre-compute the kernel offset array once (shared across candidates)
+        d_offsets = np.arange(-half_w, half_w + 1, dtype=np.float64)
 
         for x1, y1, x2, y2, score in candidates:
             dx = x2 - x1
@@ -6413,58 +6430,84 @@ class RadonStreakDetector(SatelliteTrailDetector):
 
             # Sample at several points along the trail
             num_samples = max(5, min(20, int(length / 10)))
-            par_sum = 0.0
-            perp_sum = 0.0
-            count = 0
 
-            for i in range(num_samples):
-                t = (i + 1) / (num_samples + 1)
-                cx = x1 + t * dx
-                cy = y1 + t * dy
+            # Vectorized: generate all sample center points at once
+            t_vals = np.arange(1, num_samples + 1, dtype=np.float64) / (num_samples + 1)
+            cx_arr = x1 + t_vals * dx  # (num_samples,)
+            cy_arr = y1 + t_vals * dy
 
-                # Parallel: average brightness along the trail direction (local)
-                par_val = 0.0
-                par_n = 0
-                for d in range(-half_w, half_w + 1):
-                    px = int(round(cx + d * ux))
-                    py = int(round(cy + d * uy))
-                    if 0 <= py < h and 0 <= px < w:
-                        par_val += residual[py, px]
-                        par_n += 1
+            # Parallel sampling coordinates: center + d * (ux, uy)
+            # Shape: (num_samples, kernel_size) via broadcasting
+            par_px = np.round(cx_arr[:, None] + d_offsets[None, :] * ux).astype(np.intp)
+            par_py = np.round(cy_arr[:, None] + d_offsets[None, :] * uy).astype(np.intp)
 
-                # Perpendicular: average brightness across the trail
-                perp_val = 0.0
-                perp_n = 0
-                for d in range(-half_w, half_w + 1):
-                    px = int(round(cx + d * nx))
-                    py = int(round(cy + d * ny))
-                    if 0 <= py < h and 0 <= px < w:
-                        perp_val += residual[py, px]
-                        perp_n += 1
+            # Perpendicular sampling coordinates: center + d * (nx, ny)
+            perp_px = np.round(cx_arr[:, None] + d_offsets[None, :] * nx).astype(np.intp)
+            perp_py = np.round(cy_arr[:, None] + d_offsets[None, :] * ny).astype(np.intp)
 
-                if par_n > 0 and perp_n > 0:
-                    par_sum += par_val / par_n
-                    perp_sum += perp_val / perp_n
-                    count += 1
+            # Bounds masks
+            par_valid = (par_py >= 0) & (par_py < h) & (par_px >= 0) & (par_px < w)
+            perp_valid = (perp_py >= 0) & (perp_py < h) & (perp_px >= 0) & (perp_px < w)
 
-            if count == 0:
+            # Clamp coordinates for safe indexing (invalid positions will be
+            # zeroed out via the mask)
+            par_py_c = np.clip(par_py, 0, h - 1)
+            par_px_c = np.clip(par_px, 0, w - 1)
+            perp_py_c = np.clip(perp_py, 0, h - 1)
+            perp_px_c = np.clip(perp_px, 0, w - 1)
+
+            # Fancy-index all values at once
+            par_vals = residual[par_py_c, par_px_c]   # (num_samples, kernel_size)
+            perp_vals = residual[perp_py_c, perp_px_c]
+            par_vals[~par_valid] = 0.0
+            perp_vals[~perp_valid] = 0.0
+
+            # Per-sample means (only counting valid pixels)
+            par_counts = par_valid.sum(axis=1)    # (num_samples,)
+            perp_counts = perp_valid.sum(axis=1)
+            both_valid = (par_counts > 0) & (perp_counts > 0)
+
+            if not np.any(both_valid):
                 continue
 
-            mean_par = par_sum / count
-            mean_perp = perp_sum / count
+            par_means = np.zeros(num_samples, dtype=np.float64)
+            perp_means = np.zeros(num_samples, dtype=np.float64)
+            par_means[both_valid] = par_vals[both_valid].sum(axis=1) / par_counts[both_valid]
+            perp_means[both_valid] = perp_vals[both_valid].sum(axis=1) / perp_counts[both_valid]
 
-            # Real streaks: perpendicular cross-section is peaked (high),
-            # parallel profile is also high.  Stars have similar response
-            # in both directions.  We want perp (across trail) to be
-            # significantly higher than par (along trail with offset).
-            # Actually for a streak, the perpendicular profile peaks at
-            # center and the parallel profile is flat — so we test if
-            # the perpendicular center value exceeds the parallel spread.
+            mean_par = par_means[both_valid].mean()
+            mean_perp = perp_means[both_valid].mean()
+
             ratio = mean_perp / (abs(mean_par) + 1e-10)
             if ratio >= self.pcf_ratio_threshold:
                 confirmed.append((x1, y1, x2, y2, score))
 
         return confirmed
+
+    # ── GPU-accelerated median blur ─────────────────────────────────
+
+    def _median_blur_gpu(self, gray_u8, kernel_size):
+        """Run medianBlur on GPU if available, otherwise fall back to CPU.
+
+        Args:
+            gray_u8: Grayscale uint8 image.
+            kernel_size: Odd kernel size for median filter.
+
+        Returns:
+            Median-blurred uint8 image.
+        """
+        if self._use_gpu and _HAS_CUDA_MEDIAN:
+            try:
+                gpu_img = cv2.cuda_GpuMat()
+                gpu_img.upload(gray_u8)
+                median_filter = cv2.cuda.createMedianFilter(
+                    gpu_img.type(), kernel_size)
+                gpu_result = median_filter.apply(gpu_img)
+                return gpu_result.download()
+            except Exception:
+                # Permanent fallback — disable for this instance
+                self._use_gpu = False
+        return cv2.medianBlur(gray_u8, kernel_size)
 
     # ── Dual-threshold star masking ─────────────────────────────────
 
@@ -6484,13 +6527,13 @@ class RadonStreakDetector(SatelliteTrailDetector):
         """
         img = gray_frame.astype(np.float64)
 
-        # Background estimation
+        # Background estimation (GPU-accelerated median blur when available)
         bg_kernel = min(51, max(3, min(img.shape) // 8))
         if bg_kernel % 2 == 0:
             bg_kernel += 1
-        bg = cv2.medianBlur(gray_frame.astype(np.uint8) if img.max() <= 255
-                            else np.clip(img, 0, 255).astype(np.uint8),
-                            bg_kernel).astype(np.float64)
+        gray_u8 = (gray_frame.astype(np.uint8) if img.max() <= 255
+                    else np.clip(img, 0, 255).astype(np.uint8))
+        bg = self._median_blur_gpu(gray_u8, bg_kernel).astype(np.float64)
         residual = img - bg
 
         # High threshold: identify bright stars (configurable sigma)
@@ -6554,7 +6597,7 @@ class RadonStreakDetector(SatelliteTrailDetector):
             bg_kernel = min(51, max(3, min(h, w) // 8))
             if bg_kernel % 2 == 0:
                 bg_kernel += 1
-            bg = cv2.medianBlur(gray, bg_kernel).astype(np.float64)
+            bg = self._median_blur_gpu(gray, bg_kernel).astype(np.float64)
             residual = gray.astype(np.float64) - bg
             flat = residual.ravel()
             mad = np.median(np.abs(flat - np.median(flat)))
