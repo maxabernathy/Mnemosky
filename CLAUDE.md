@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-**Mnemosky** is a satellite and airplane trail detector for MP4 videos. It uses classical computer vision techniques to identify and classify celestial trails in night sky footage, distinguishing between satellites (smooth, uniform trails) and airplanes (dotted patterns with bright navigation lights). Detected trails can optionally be exported as a YOLO-format ML dataset for training object detection models.
+**Mnemosky** is a satellite and airplane trail detector for MP4 videos. It uses classical computer vision techniques and optionally neural network models to identify and classify celestial trails in night sky footage, distinguishing between satellites (smooth, uniform trails) and airplanes (dotted patterns with bright navigation lights). Detected trails can optionally be exported as a YOLO-format ML dataset for training object detection models, which can then be fed back into the NN detection pipeline for real-time inference.
 
 Preprocessing adjustments
 
@@ -44,6 +44,10 @@ This is a single-file Python application with no additional modules or packages.
 pip install opencv-python numpy
 # Optional: scipy improves Radon NMS quality (falls back to cv2.dilate if absent)
 pip install scipy
+# Optional: neural network backends for --algorithm nn (auto-installed on first use)
+pip install ultralytics       # Primary NN backend (YOLOv8/v11)
+pip install onnxruntime       # Alternative ONNX backend
+# cv2.dnn is included with opencv-python (no extra install needed)
 ```
 
 ## Architecture
@@ -61,7 +65,14 @@ pip install scipy
    - Implements `preprocess_frame()`, `detect_lines()`, `detect_point_features()`
    - Note: `classify_trail()` is not implemented (incomplete class)
 
-3. **`SatelliteTrailDetector`** - Main detector class with sensitivity presets
+3. **`_NNBackend`** - Unified neural network inference wrapper
+   - Supports three backends: `ultralytics` (YOLOv8/v11), `cv2dnn` (OpenCV DNN), `onnxruntime` (ONNX Runtime)
+   - Lazy import — backend package only loaded when selected; auto-install prompt for pip packages
+   - `predict(frame)` → list of `{bbox, class_id, class_name, confidence}` dicts
+   - `_parse_yolo_output()` handles both YOLOv5 (5+C) and YOLOv8 (4+C) output layouts
+   - GPU/CPU device selection per backend; respects `--no-gpu`
+
+4. **`SatelliteTrailDetector`** - Main detector class with sensitivity presets
    - Provides `low`, `medium`, `high` sensitivity configurations
    - Contains full two-stage detection pipeline: primary (Canny + Hough) and supplementary (directional matched filter for very dim trails)
    - `classify_trail()` — core classification with star false-positive suppression and spatial spread checks
@@ -71,9 +82,18 @@ pip install scipy
    - `_apply_signal_envelope()` — dynamically adapts thresholds from user-marked trail examples
    - Supports custom preprocessing parameters via `preprocessing_params` argument
 
+5. **`NeuralNetDetector`** (extends SatelliteTrailDetector) - Neural network model-based detector
+   - Uses `_NNBackend` for inference (ultralytics, cv2dnn, or onnxruntime)
+   - `detect_trails()` runs model → maps class IDs to trail types → computes post-hoc detection_info
+   - `_bbox_to_detection_info()` synthesizes angle, brightness, line, contrast from model bboxes
+   - `_merge_nn_classical()` for hybrid mode (NN + classical pipeline results merged)
+   - Deferred backend loading: `_NNBackend` created on first `detect_trails()` call (pickle-safe for workers)
+   - Configurable class mapping: `{'satellite': [0], 'airplane': [1]}` (multi-class supported)
+   - Adds `nn_confidence` field to detection_info dicts
+
 ### HITL (Human-in-the-Loop) Classes
 
-4. **`AnnotationDatabase`** - COCO-compatible annotation database with correction tracking
+7. **`AnnotationDatabase`** - COCO-compatible annotation database with correction tracking
    - Stores images, annotations (with `mnemosky_ext` metadata), missed annotations, corrections, sessions
    - `add_detection()` converts internal bbox `(x_min, y_min, x_max, y_max)` to COCO `[x, y, w, h]`
    - `add_missed()` for user-drawn false negatives
@@ -83,7 +103,7 @@ pip install scipy
    - `export_coco()` strips Mnemosky extensions for pure COCO format
    - `undo_last_correction()` reverts the last action
 
-5. **`ParameterAdapter`** - Two-tier parameter learning from human corrections
+8. **`ParameterAdapter`** - Two-tier parameter learning from human corrections
    - **Tier 1 (EMA)**: Each correction nudges relevant parameters via exponential moving average with decaying learning rate (`base_lr=0.3`, `decay_rate=0.1`)
    - **Tier 2 (batch)**: Coordinate-wise golden section search over 13 optimizable parameters, minimizing weighted FP/FN/misclassification loss
    - `CORRECTION_RULES` maps `(action, trail_type)` to parameter adjustments with diagnostic lambdas
@@ -91,7 +111,7 @@ pip install scipy
    - `compute_confidence()` — pseudo-confidence score for active learning prioritization
    - `save_profile()` / `load_profile()` persist learned parameters to `~/.mnemosky/learned_params.json`
 
-6. **`ReviewUI`** - Interactive OpenCV review window for correcting detections
+9. **`ReviewUI`** - Interactive OpenCV review window for correcting detections
    - Single window with dark-grey/fluorescent-accent theme (matches preview GUI)
    - Main frame view (left) + 280px sidebar with detection cards, session stats, controls hint
    - 56px bottom status bar with frame slider and learn/save buttons
@@ -104,6 +124,8 @@ pip install scipy
 
 - `show_preprocessing_preview()` - Interactive GUI for tuning preprocessing parameters (CLAHE, blur, Canny). Asymmetric layout: large Original panel (left column, ~58% width) + CLAHE/Blur/Edges stacked vertically (right column), sidebar with custom-drawn sliders and trail example thumbnails, full-width frame slider in status bar. Sleek dark-grey theme with fluorescent accent highlights (single window, no external trackbar window).
 - `show_radon_preview()` - Interactive GUI for tuning the Radon detection pipeline (Radon SNR, PCF ratio, star mask sigma, LSD significance, PCF kernel, min length). Same dark-grey/fluorescent theme. Four diagnostic panels: Residual (star-cleaned), Sinogram (SNR heatmap with peaks), LSD Lines, and Detections (PCF-confirmed vs rejected). Activated by `--preview` with `--algorithm radon`.
+- `show_nn_preview()` - Interactive GUI for tuning neural network detection parameters (confidence, NMS IoU). Same dark-grey/fluorescent theme. Main frame panel with detection overlays, sidebar with model info card, sliders, class mapping, confidence bars, inference FPS. Activated by `--preview` with `--algorithm nn`.
+- `load_config()` / `save_config()` - Application-wide config persistence to `~/.mnemosky/config.json`. Stores all algorithm parameters (default, radon, nn), model paths, backend choice. Deep-merges user config with defaults.
 - `_worker_init()` / `_worker_detect()` - Multiprocessing worker functions for parallel frame detection
 - `process_video()` - Main video processing pipeline (handles I/O, frame iteration, output, optional YOLO dataset export, parallel dispatch)
 - `main()` - CLI entry point with argument parsing
@@ -344,6 +366,27 @@ python satellite_trail_detector.py input.mp4 output.mp4 --algorithm radon
 # Radon algorithm with ground truth calibration
 python satellite_trail_detector.py input.mp4 output.mp4 --algorithm radon --groundtruth ./groundtruth
 
+# Neural network algorithm (requires a trained model)
+python satellite_trail_detector.py input.mp4 output.mp4 --algorithm nn --model trail_detector.pt
+
+# NN with ONNX model via OpenCV DNN backend (no extra deps)
+python satellite_trail_detector.py input.mp4 output.mp4 --algorithm nn --model trail_detector.onnx --nn-backend cv2dnn
+
+# NN with custom confidence/NMS thresholds
+python satellite_trail_detector.py input.mp4 output.mp4 --algorithm nn --model trail_detector.pt --confidence 0.5 --nms-iou 0.3
+
+# NN hybrid mode: merge NN + classical pipeline for maximum recall
+python satellite_trail_detector.py input.mp4 output.mp4 --algorithm nn --model trail_detector.pt --nn-hybrid
+
+# NN with custom class mapping (e.g. multi-class model)
+python satellite_trail_detector.py input.mp4 output.mp4 --algorithm nn --model trail_detector.pt --nn-class-map '{"satellite": [0, 2], "airplane": [1, 3]}'
+
+# NN preview (interactive tuning of confidence/NMS before processing)
+python satellite_trail_detector.py input.mp4 output.mp4 --algorithm nn --model trail_detector.pt --preview
+
+# Save current parameters to config file for future runs
+python satellite_trail_detector.py input.mp4 output.mp4 --algorithm nn --model trail_detector.pt --save-config
+
 # Filter detection type
 python satellite_trail_detector.py input.mp4 output.mp4 --detect-type satellites
 python satellite_trail_detector.py input.mp4 output.mp4 --detect-type airplanes
@@ -529,6 +572,14 @@ class CustomDetectionAlgorithm(BaseDetectionAlgorithm):
 
 23. **Radon debug preview**: `show_radon_preview()` provides an interactive GUI for tuning the 6 most important Radon pipeline parameters before processing. Triggered by `--preview` when `--algorithm radon` is active; the default `show_preprocessing_preview()` is used otherwise. The preview displays 4 diagnostic panels (Residual, Sinogram, LSD Lines, Detections) showing intermediate pipeline stages. Accepted parameters flow through `process_video()` → `RadonStreakDetector` via the `radon_params` dict and `_apply_radon_preview_params()`. The tunable parameters are: `radon_snr_threshold`, `pcf_ratio_threshold`, `star_mask_sigma` (stored as `_star_mask_sigma`), `lsd_log_eps` (stored as `_lsd_log_eps`), `pcf_kernel_length`, and `satellite_min_length`.
 
+24. **Neural network detection (`--algorithm nn`)**: The `NeuralNetDetector` class uses a trained object detection model (YOLOv8/v11, ONNX, etc.) for trail detection. Three backends are supported via `_NNBackend`: `ultralytics` (primary, auto-installed), `cv2dnn` (zero extra deps, ONNX/TF/Darknet), and `onnxruntime` (broad acceleration). Backend imports are lazy — only loaded when the `nn` algorithm is selected. The model class IDs are mapped to satellite/airplane via `class_map` (configurable, default `{satellite:[0], airplane:[1]}`). Detection results are converted to the standard `detection_info` format via `_bbox_to_detection_info()` which estimates trail angle, length, brightness, and contrast from the model bbox. Hybrid mode (`--nn-hybrid`) runs both NN and classical pipeline, merging results. Workers each load their own model instance (not pickled).
+
+25. **Application config system**: `~/.mnemosky/config.json` stores all algorithm parameters, model paths, backend choice, and general settings. Loaded via `load_config()`, saved via `save_config()`. CLI arguments override config values. `--save-config` persists current CLI parameters. The config coexists with the existing `learned_params.json` (HITL profiles) — they serve different purposes.
+
+26. **NN preview GUI**: `show_nn_preview()` provides an interactive GUI for tuning confidence and NMS IoU thresholds with live model inference on video frames. Same dark-grey/fluorescent theme. Main frame panel shows detection overlays; sidebar has model info card, parameter sliders, class mapping, per-detection confidence bars, and inference FPS stats. Triggered by `--preview` when `--algorithm nn` is active. Tuned parameters flow through `process_video()` → `NeuralNetDetector` via `nn_params`.
+
+27. **NN backend auto-install**: When a backend is not installed and the user selects it, `_ensure_nn_backend()` attempts `pip install` automatically. Falls back to a manual install hint on failure. Backend availability is cached in `_NN_BACKENDS_CHECKED` dict.
+
 ## Common Tasks
 
 ### Adding a new sensitivity preset
@@ -564,8 +615,13 @@ Add to the `main()` function's argument parser, then handle in `process_video()`
 
 | Component | Location |
 |-----------|----------|
-| Preprocessing preview | `satellite_trail_detector.py:show_preprocessing_preview()` (line ~57) |
-| Radon debug preview | `satellite_trail_detector.py:show_radon_preview()` (line ~1103) |
+| Config system | `satellite_trail_detector.py:load_config()` / `save_config()` (line ~163) |
+| Config defaults | `satellite_trail_detector.py:_DEFAULT_CONFIG` (line ~132) |
+| NN backend abstraction | `satellite_trail_detector.py:_NNBackend` (line ~221) |
+| NN backend lazy import | `satellite_trail_detector.py:_check_nn_backend()` / `_ensure_nn_backend()` (line ~66) |
+| Preprocessing preview | `satellite_trail_detector.py:show_preprocessing_preview()` (line ~475) |
+| Radon debug preview | `satellite_trail_detector.py:show_radon_preview()` (line ~1517) |
+| NN detection preview | `satellite_trail_detector.py:show_nn_preview()` (line ~2411) |
 | HITL safety bounds | `satellite_trail_detector.py:PARAMETER_SAFETY_BOUNDS` (line ~1207) |
 | HITL correction rules | `satellite_trail_detector.py:CORRECTION_RULES` (line ~1224) |
 | Annotation database | `satellite_trail_detector.py:AnnotationDatabase` (line ~1296) |
@@ -588,7 +644,10 @@ Add to the `main()` function's argument parser, then handle in `process_video()`
 | Radon transform (+ GPU) | `satellite_trail_detector.py:RadonStreakDetector._radon_transform()` (line ~5300) |
 | Perpendicular cross filter | `satellite_trail_detector.py:RadonStreakDetector._perpendicular_cross_filter()` (line ~5475) |
 | Radon detect_trails | `satellite_trail_detector.py:RadonStreakDetector.detect_trails()` (line ~5610) |
-| Worker functions | `satellite_trail_detector.py:_worker_init()` / `_worker_detect()` (line ~5828) |
+| NeuralNetDetector class | `satellite_trail_detector.py:NeuralNetDetector` (line ~7570) |
+| NN detect_trails | `satellite_trail_detector.py:NeuralNetDetector.detect_trails()` (line ~7570) |
+| NN param helper | `satellite_trail_detector.py:_apply_nn_params()` (line ~7570) |
+| Worker functions | `satellite_trail_detector.py:_worker_init()` / `_worker_detect()` (line ~7930) |
 | Dataset utility functions | `satellite_trail_detector.py:_compute_obb_corners()` etc. (line ~6026) |
 | DatasetExporter class | `satellite_trail_detector.py:DatasetExporter` (line ~6091) |
 | HITL-verified dataset export | `satellite_trail_detector.py:export_dataset_from_annotations()` (line ~6635) |
