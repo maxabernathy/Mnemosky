@@ -62,6 +62,414 @@ try:
 except Exception:
     _HAS_CUDA_MEDIAN = False
 
+# ── Neural network backend availability (lazy — import deferred to first use) ─
+_NN_BACKENDS_CHECKED = {}  # name -> bool (cached after first probe)
+
+
+def _check_nn_backend(name):
+    """Check if a neural network backend is importable (cached)."""
+    if name in _NN_BACKENDS_CHECKED:
+        return _NN_BACKENDS_CHECKED[name]
+    available = False
+    if name == 'ultralytics':
+        try:
+            from ultralytics import YOLO  # noqa: F401
+            available = True
+        except ImportError:
+            pass
+    elif name == 'cv2dnn':
+        available = hasattr(cv2, 'dnn')
+    elif name == 'onnxruntime':
+        try:
+            import onnxruntime  # noqa: F401
+            available = True
+        except ImportError:
+            pass
+    _NN_BACKENDS_CHECKED[name] = available
+    return available
+
+
+def _ensure_nn_backend(name):
+    """Ensure backend is available; attempt auto-install for pip packages.
+
+    Returns True if the backend is ready to use, False otherwise.
+    Prints user-friendly install instructions on failure.
+    """
+    if _check_nn_backend(name):
+        return True
+    # Attempt auto-install for pip-installable backends
+    pkg_map = {
+        'ultralytics': 'ultralytics',
+        'onnxruntime': 'onnxruntime',
+    }
+    pkg = pkg_map.get(name)
+    if pkg is None:
+        print(f"Error: backend '{name}' is not available and cannot be auto-installed.")
+        return False
+    print(f"Backend '{name}' not found. Attempting: pip install {pkg} ...")
+    try:
+        import subprocess
+        subprocess.check_call(
+            [sys.executable, '-m', 'pip', 'install', pkg, '-q'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Re-check
+        _NN_BACKENDS_CHECKED.pop(name, None)
+        if _check_nn_backend(name):
+            print(f"  Installed '{pkg}' successfully.")
+            return True
+    except Exception as e:
+        print(f"  Auto-install failed: {e}")
+    print(f"Please install manually:  pip install {pkg}")
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Application-wide config  (~/.mnemosky/config.json)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_MNEMOSKY_DIR = Path.home() / '.mnemosky'
+
+_DEFAULT_CONFIG = {
+    'version': 1,
+    'algorithms': {
+        'default': {
+            'sensitivity': 'medium',
+        },
+        'radon': {
+            'sensitivity': 'medium',
+            'radon_snr_threshold': 3.0,
+            'pcf_ratio_threshold': 2.0,
+            'star_mask_sigma': 5.0,
+            'lsd_log_eps': 1.0,
+            'pcf_kernel_length': 31,
+            'satellite_min_length': 50,
+        },
+        'nn': {
+            'model_path': None,
+            'backend': 'ultralytics',
+            'confidence': 0.25,
+            'nms_iou': 0.45,
+            'device': 'auto',
+            'class_map': {'satellite': [0], 'airplane': [1]},
+            'input_size': 640,
+            'half_precision': False,
+        },
+    },
+}
+
+_CONFIG_PATH = _MNEMOSKY_DIR / 'config.json'
+
+
+def load_config(path=None):
+    """Load application config from JSON, merging with defaults.
+
+    Missing keys are filled from ``_DEFAULT_CONFIG``.  Unknown keys
+    in the file are preserved (forward-compatible).
+
+    Args:
+        path: Optional override for config file path.
+              Default: ``~/.mnemosky/config.json``.
+
+    Returns:
+        Config dict (deep copy — safe to mutate).
+    """
+    import copy
+    config = copy.deepcopy(_DEFAULT_CONFIG)
+    fpath = Path(path) if path else _CONFIG_PATH
+    if fpath.exists():
+        try:
+            with open(fpath, 'r') as f:
+                user = json.load(f)
+            # Deep merge: user values override defaults
+            _deep_merge(config, user)
+        except Exception as e:
+            print(f"Warning: could not load config {fpath}: {e}")
+    return config
+
+
+def save_config(config, path=None):
+    """Save config dict to JSON.
+
+    Creates ``~/.mnemosky/`` directory if needed.
+
+    Args:
+        config: Config dict to save.
+        path: Optional override for config file path.
+    """
+    fpath = Path(path) if path else _CONFIG_PATH
+    fpath.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(fpath, 'w') as f:
+            json.dump(config, f, indent=2, default=str)
+    except Exception as e:
+        print(f"Warning: could not save config {fpath}: {e}")
+
+
+def _deep_merge(base, override):
+    """Recursively merge *override* into *base* (mutates *base*)."""
+    for k, v in override.items():
+        if k in base and isinstance(base[k], dict) and isinstance(v, dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Neural network inference backend  (_NNBackend)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _NNBackend:
+    """Unified interface for neural network inference backends.
+
+    Wraps ultralytics, cv2.dnn, and onnxruntime behind a single
+    ``predict(frame)`` interface.  The backend is selected at construction
+    time; the actual heavy import happens once (lazy), and the model is
+    loaded from disk immediately.
+
+    Attributes:
+        model_path: Resolved absolute path to the model file.
+        backend: Backend name ('ultralytics', 'cv2dnn', 'onnxruntime').
+        confidence: Detection confidence threshold (0-1).
+        nms_iou: NMS IoU threshold (0-1).
+        input_size: Square input resolution for the model.
+        class_names: Dict of {class_id: class_name} from the model metadata.
+    """
+
+    def __init__(self, model_path, backend='ultralytics', device='auto',
+                 confidence=0.25, nms_iou=0.45, input_size=640,
+                 half_precision=False, no_gpu=False):
+        if model_path is None:
+            raise ValueError("model_path is required for neural network backend")
+        self.model_path = str(Path(model_path).resolve())
+        self.backend = backend
+        self.device = 'cpu' if no_gpu else device
+        self.confidence = confidence
+        self.nms_iou = nms_iou
+        self.input_size = input_size
+        self.half_precision = half_precision and self.device != 'cpu'
+        self.class_names = {}
+        self._model = None
+
+        if not Path(self.model_path).exists():
+            raise FileNotFoundError(f"Model file not found: {self.model_path}")
+
+        if not _ensure_nn_backend(backend):
+            raise RuntimeError(f"Backend '{backend}' is not available.")
+
+        self._load_model()
+
+    # ── Model loading ────────────────────────────────────────────────
+
+    def _load_model(self):
+        """Load model using the configured backend."""
+        if self.backend == 'ultralytics':
+            self._load_ultralytics()
+        elif self.backend == 'cv2dnn':
+            self._load_cv2dnn()
+        elif self.backend == 'onnxruntime':
+            self._load_onnxruntime()
+        else:
+            raise ValueError(f"Unknown backend: {self.backend}")
+
+    def _load_ultralytics(self):
+        from ultralytics import YOLO
+        self._model = YOLO(self.model_path)
+        # Extract class names from model metadata
+        if hasattr(self._model, 'names') and self._model.names:
+            self.class_names = dict(self._model.names)
+
+    def _load_cv2dnn(self):
+        ext = Path(self.model_path).suffix.lower()
+        if ext == '.onnx':
+            self._model = cv2.dnn.readNetFromONNX(self.model_path)
+        elif ext in ('.pb', '.pbtxt'):
+            self._model = cv2.dnn.readNetFromTensorflow(self.model_path)
+        elif ext in ('.cfg', '.weights'):
+            self._model = cv2.dnn.readNetFromDarknet(self.model_path)
+        elif ext == '.caffemodel':
+            self._model = cv2.dnn.readNetFromCaffe(self.model_path)
+        else:
+            # Default: try ONNX
+            self._model = cv2.dnn.readNetFromONNX(self.model_path)
+        # GPU backend
+        if self.device != 'cpu' and _HAS_CUDA:
+            self._model.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+            self._model.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+        self.class_names = {}  # cv2.dnn has no metadata API; set via class_map
+
+    def _load_onnxruntime(self):
+        import onnxruntime as ort
+        providers = ['CPUExecutionProvider']
+        if self.device != 'cpu':
+            cuda_available = 'CUDAExecutionProvider' in ort.get_available_providers()
+            if cuda_available:
+                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        self._model = ort.InferenceSession(self.model_path, providers=providers)
+        # Extract class names from ONNX metadata if available
+        meta = self._model.get_modelmeta()
+        if meta and meta.custom_metadata_map:
+            names_str = meta.custom_metadata_map.get('names', '')
+            if names_str:
+                try:
+                    self.class_names = json.loads(
+                        names_str.replace("'", '"'))
+                except Exception:
+                    pass
+
+    # ── Inference ────────────────────────────────────────────────────
+
+    def predict(self, frame):
+        """Run inference on a BGR frame.
+
+        Returns:
+            List of dicts, each with:
+                'bbox': (x_min, y_min, x_max, y_max) in pixel coordinates
+                'class_id': int (model's raw class ID)
+                'class_name': str (model's class label, or '')
+                'confidence': float (0-1)
+        """
+        if self.backend == 'ultralytics':
+            return self._predict_ultralytics(frame)
+        elif self.backend == 'cv2dnn':
+            return self._predict_cv2dnn(frame)
+        elif self.backend == 'onnxruntime':
+            return self._predict_onnxruntime(frame)
+        return []
+
+    def _predict_ultralytics(self, frame):
+        results = self._model(
+            frame, conf=self.confidence, iou=self.nms_iou,
+            imgsz=self.input_size, device=self.device,
+            half=self.half_precision, verbose=False)
+        detections = []
+        if results and len(results) > 0:
+            r = results[0]
+            if r.boxes is not None:
+                boxes = r.boxes
+                for i in range(len(boxes)):
+                    x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy()
+                    conf = float(boxes.conf[i].cpu().numpy())
+                    cls_id = int(boxes.cls[i].cpu().numpy())
+                    detections.append({
+                        'bbox': (float(x1), float(y1), float(x2), float(y2)),
+                        'class_id': cls_id,
+                        'class_name': self.class_names.get(cls_id, ''),
+                        'confidence': conf,
+                    })
+        return detections
+
+    def _predict_cv2dnn(self, frame):
+        h, w = frame.shape[:2]
+        blob = cv2.dnn.blobFromImage(
+            frame, 1 / 255.0, (self.input_size, self.input_size),
+            swapRB=True, crop=False)
+        self._model.setInput(blob)
+        out_names = self._model.getUnconnectedOutLayersNames()
+        outputs = self._model.forward(out_names)
+        return self._parse_yolo_output(outputs, w, h)
+
+    def _predict_onnxruntime(self, frame):
+        h, w = frame.shape[:2]
+        # Preprocess: resize, normalize, HWC→CHW, add batch
+        img = cv2.resize(frame, (self.input_size, self.input_size))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = img.astype(np.float32) / 255.0
+        img = np.transpose(img, (2, 0, 1))[np.newaxis, ...]
+        if self.half_precision:
+            img = img.astype(np.float16)
+        input_name = self._model.get_inputs()[0].name
+        outputs = self._model.run(None, {input_name: img})
+        return self._parse_yolo_output(outputs, w, h)
+
+    def _parse_yolo_output(self, outputs, orig_w, orig_h):
+        """Parse raw YOLO output tensor(s) into detection dicts.
+
+        Handles the two common YOLO output layouts:
+          - YOLOv8 transposed: (1, 4+num_classes, num_detections)
+          - YOLOv5/legacy:     (1, num_detections, 5+num_classes)
+        """
+        detections = []
+        output = outputs[0]
+        if output.ndim == 3:
+            output = output[0]  # drop batch dim
+        rows, cols = output.shape
+
+        # Detect layout: if cols > rows → transposed YOLOv8 format
+        if cols > rows:
+            output = output.T
+            rows, cols = output.shape
+
+        # Determine if layout has objectness score (YOLOv5: 5+C) or not (YOLOv8: 4+C)
+        # YOLOv8: cols = 4 + num_classes (no objectness)
+        # YOLOv5: cols = 5 + num_classes (col 4 is objectness)
+        has_obj = cols >= 6 and (cols - 5) >= 1
+        if has_obj:
+            # YOLOv5 layout: [cx, cy, w, h, obj_conf, cls0, cls1, ...]
+            num_classes = cols - 5
+        else:
+            # YOLOv8 layout: [cx, cy, w, h, cls0, cls1, ...]
+            num_classes = cols - 4
+
+        if num_classes <= 0:
+            return detections
+
+        scale_x = orig_w / self.input_size
+        scale_y = orig_h / self.input_size
+
+        boxes, confidences, class_ids = [], [], []
+
+        for i in range(rows):
+            if has_obj:
+                obj_conf = output[i, 4]
+                cls_scores = output[i, 5:5 + num_classes]
+                scores = cls_scores * obj_conf
+            else:
+                scores = output[i, 4:4 + num_classes]
+
+            max_score = float(np.max(scores))
+            if max_score < self.confidence:
+                continue
+
+            cls_id = int(np.argmax(scores))
+            cx, cy, bw, bh = output[i, :4]
+            x1 = (cx - bw / 2) * scale_x
+            y1 = (cy - bh / 2) * scale_y
+            x2 = (cx + bw / 2) * scale_x
+            y2 = (cy + bh / 2) * scale_y
+
+            boxes.append([int(x1), int(y1), int(x2 - x1), int(y2 - y1)])
+            confidences.append(max_score)
+            class_ids.append(cls_id)
+
+        # NMS
+        if boxes:
+            indices = cv2.dnn.NMSBoxes(boxes, confidences, self.confidence,
+                                       self.nms_iou)
+            if len(indices) > 0:
+                indices = indices.flatten()
+                for idx in indices:
+                    bx, by, bw, bh = boxes[idx]
+                    detections.append({
+                        'bbox': (float(bx), float(by),
+                                 float(bx + bw), float(by + bh)),
+                        'class_id': class_ids[idx],
+                        'class_name': self.class_names.get(class_ids[idx], ''),
+                        'confidence': confidences[idx],
+                    })
+
+        return detections
+
+    def get_model_info(self):
+        """Return dict with model metadata for display."""
+        return {
+            'model_path': self.model_path,
+            'backend': self.backend,
+            'device': self.device,
+            'input_size': self.input_size,
+            'class_names': self.class_names,
+            'half_precision': self.half_precision,
+        }
+
 
 def show_preprocessing_preview(video_path, initial_params=None):
     """
@@ -1993,6 +2401,384 @@ def show_radon_preview(video_path, initial_params=None):
         # Check if window was closed
         if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
             print("Radon preview window closed. Using default parameters.")
+            cap.release()
+            return None
+
+    cap.release()
+    return None
+
+
+def show_nn_preview(video_path, nn_params=None):
+    """Show interactive preview for tuning neural network detection parameters.
+
+    Uses the same dark-grey/fluorescent-accent theme as other preview windows.
+    Shows live model detections with adjustable confidence/NMS thresholds.
+
+    Layout:
+    - Left column (~65%): Frame with detection overlays (GOLD=satellite, ORANGE=airplane)
+    - Right sidebar (~35%): Model info card, sliders for confidence and NMS IoU,
+      class mapping display, inference stats (FPS, detection count)
+    - Bottom status bar: frame slider
+
+    Controls:
+    - Click and drag sliders in the sidebar to adjust parameters
+    - SPACE or ENTER to accept current settings
+    - ESC to cancel and use default settings
+    - R to reset to defaults
+    - N/P to jump forward/back 1 second
+    - M to type a new model path (typed into status bar, ENTER to confirm)
+
+    Args:
+        video_path: Path to the input video file
+        nn_params: Dict with NN parameters (model_path, backend, confidence, etc.)
+
+    Returns:
+        Dict with tuned nn parameters, or None if cancelled.
+    """
+    if nn_params is None or nn_params.get('model_path') is None:
+        print("Error: --model is required for NN preview.")
+        return None
+
+    # ── Theme colours (BGR) — shared with other previews ─────────────
+    BG_DARK = (30, 30, 30)
+    BG_PANEL = (42, 42, 42)
+    BG_SIDEBAR = (36, 36, 36)
+    BORDER = (58, 58, 58)
+    TEXT_PRIMARY = (210, 210, 210)
+    TEXT_DIM = (120, 120, 120)
+    TEXT_HEADING = (180, 180, 180)
+    ACCENT = (200, 255, 80)           # Fluorescent green-yellow
+    ACCENT_DIM = (100, 170, 50)
+    SLIDER_TRACK = (50, 50, 50)
+    SLIDER_FILL = (200, 255, 80)
+    SLIDER_THUMB = (240, 255, 160)
+    COLOR_SATELLITE = (0, 185, 255)   # GOLD (BGR)
+    COLOR_AIRPLANE = (0, 140, 255)    # ORANGE (BGR)
+    COLOR_CONF_BAR = (80, 200, 80)    # Green for confidence bars
+
+    def _fill_rect(img, x, y, w, h, color):
+        cv2.rectangle(img, (int(x), int(y)),
+                      (int(x + w), int(y + h)), color, -1)
+
+    def _put_text(img, text, x, y, color, scale=0.42, thickness=1):
+        cv2.putText(img, str(text), (int(x), int(y)),
+                    cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+
+    def _draw_tag(img, text, x, y, bg_color, text_color, scale=0.38):
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+        pad_x, pad_y = 6, 3
+        _fill_rect(img, x, y - th - pad_y, tw + pad_x * 2, th + pad_y * 2, bg_color)
+        _put_text(img, text, x + pad_x, y - 1, text_color, scale)
+
+    # ── Parameters (stored as ints for slider precision) ─────────────
+    # Confidence: 5-95 (÷100 → 0.05-0.95)
+    # NMS IoU:    10-90 (÷100 → 0.10-0.90)
+    params = {
+        'confidence': int(nn_params.get('confidence', 0.25) * 100),
+        'nms_iou': int(nn_params.get('nms_iou', 0.45) * 100),
+    }
+    defaults = dict(params)
+
+    # Slider definitions: (key, label, min_val, max_val, step)
+    slider_defs = [
+        ('confidence', 'Confidence', 5, 95, 5),
+        ('nms_iou', 'NMS IoU', 10, 90, 5),
+    ]
+
+    # Open video
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        print(f"Error: Could not open video for NN preview: {video_path}")
+        return None
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    current_frame_idx = 0
+
+    ret, frame = cap.read()
+    if not ret:
+        cap.release()
+        return None
+
+    # Load model backend for live inference
+    try:
+        backend = _NNBackend(
+            model_path=nn_params['model_path'],
+            backend=nn_params['backend'],
+            device=nn_params.get('device', 'auto'),
+            confidence=nn_params.get('confidence', 0.25),
+            nms_iou=nn_params.get('nms_iou', 0.45),
+            input_size=nn_params.get('input_size', 640),
+            half_precision=nn_params.get('half_precision', False),
+            no_gpu=nn_params.get('device') == 'cpu',
+        )
+        model_info = backend.get_model_info()
+    except Exception as e:
+        print(f"Error loading model for NN preview: {e}")
+        cap.release()
+        return None
+
+    # Build class_id → trail_type mapping
+    class_map = nn_params.get('class_map', {'satellite': [0], 'airplane': [1]})
+    cls_to_type = {}
+    for ttype, cids in class_map.items():
+        for cid in cids:
+            cls_to_type[cid] = ttype
+
+    # ── Canvas layout ────────────────────────────────────────────────
+    WIN_W, WIN_H = 1280, 780
+    STATUS_H = 56
+    SIDEBAR_W = 280
+    FRAME_W = WIN_W - SIDEBAR_W
+    FRAME_H = WIN_H - STATUS_H
+
+    window_name = 'Mnemosky - NN Detection Preview'
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, WIN_W, WIN_H)
+
+    # ── Mouse state ──────────────────────────────────────────────────
+    mouse_state = {'x': 0, 'y': 0, 'down': False, 'active_slider': None}
+
+    def _mouse_callback(event, x, y, flags, _):
+        mouse_state['x'] = x
+        mouse_state['y'] = y
+        if event == cv2.EVENT_LBUTTONDOWN:
+            mouse_state['down'] = True
+        elif event == cv2.EVENT_LBUTTONUP:
+            mouse_state['down'] = False
+            mouse_state['active_slider'] = None
+
+    cv2.setMouseCallback(window_name, _mouse_callback)
+
+    # ── Main preview loop ────────────────────────────────────────────
+    need_redraw = True
+    last_detections = []
+    inference_ms = 0.0
+
+    while True:
+        if need_redraw:
+            # Update backend parameters from sliders
+            backend.confidence = params['confidence'] / 100.0
+            backend.nms_iou = params['nms_iou'] / 100.0
+
+            # Run inference
+            t0 = time.time()
+            raw_dets = backend.predict(frame)
+            inference_ms = (time.time() - t0) * 1000.0
+            last_detections = raw_dets
+            need_redraw = False
+
+        # ── Build canvas ─────────────────────────────────────────────
+        canvas = np.full((WIN_H, WIN_W, 3), BG_DARK[0], dtype=np.uint8)
+
+        # Main frame panel with detection overlays
+        disp = frame.copy()
+        sat_count, plane_count = 0, 0
+        for det in last_detections:
+            ttype = cls_to_type.get(det['class_id'])
+            if ttype is None:
+                continue
+            x1, y1, x2, y2 = [int(v) for v in det['bbox']]
+            color = COLOR_SATELLITE if ttype == 'satellite' else COLOR_AIRPLANE
+            cv2.rectangle(disp, (x1, y1), (x2, y2), color, 2)
+            label = f"{ttype[:3].upper()} {det['confidence']:.0%}"
+            cv2.putText(disp, label, (x1, max(y1 - 6, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+            if ttype == 'satellite':
+                sat_count += 1
+            else:
+                plane_count += 1
+
+        # Scale frame to fit panel
+        fh, fw = disp.shape[:2]
+        scale = min(FRAME_W / fw, FRAME_H / fh)
+        disp_w, disp_h = int(fw * scale), int(fh * scale)
+        if disp_w > 0 and disp_h > 0:
+            disp_resized = cv2.resize(disp, (disp_w, disp_h))
+            ox = (FRAME_W - disp_w) // 2
+            oy = (FRAME_H - disp_h) // 2
+            canvas[oy:oy + disp_h, ox:ox + disp_w] = disp_resized
+
+        # Panel tag
+        _draw_tag(canvas, f"NN DETECTIONS  [{sat_count}S {plane_count}A]",
+                  8, 18, BG_DARK, ACCENT)
+
+        # ── Sidebar ──────────────────────────────────────────────────
+        sb_x = FRAME_W
+        _fill_rect(canvas, sb_x, 0, SIDEBAR_W, WIN_H - STATUS_H, BG_SIDEBAR)
+        cv2.line(canvas, (sb_x, 0), (sb_x, WIN_H - STATUS_H), BORDER, 1)
+
+        sy = 20
+        _put_text(canvas, "MODEL INFO", sb_x + 12, sy, TEXT_HEADING, 0.45, 1)
+        sy += 22
+
+        # Model path (truncated)
+        mpath = Path(nn_params['model_path']).name
+        _put_text(canvas, f"  {mpath}", sb_x + 8, sy, TEXT_PRIMARY, 0.36)
+        sy += 18
+        _put_text(canvas, f"  Backend: {nn_params['backend']}", sb_x + 8, sy, TEXT_DIM, 0.34)
+        sy += 16
+        _put_text(canvas, f"  Device: {model_info.get('device', '?')}", sb_x + 8, sy, TEXT_DIM, 0.34)
+        sy += 16
+        _put_text(canvas, f"  Input: {nn_params.get('input_size', 640)}px", sb_x + 8, sy, TEXT_DIM, 0.34)
+        sy += 16
+        num_classes = len(model_info.get('class_names', {}))
+        _put_text(canvas, f"  Classes: {num_classes}", sb_x + 8, sy, TEXT_DIM, 0.34)
+        sy += 24
+
+        # Draw sliders
+        slider_margin = 14
+        slider_track_w = SIDEBAR_W - 2 * slider_margin - 24
+        slider_rects = {}
+
+        for skey, slabel, smin, smax, sstep in slider_defs:
+            # Label + value
+            real_val = params[skey] / 100.0
+            _put_text(canvas, f"{slabel}: {real_val:.2f}", sb_x + slider_margin, sy,
+                      ACCENT, 0.38, 1)
+            sy += 18
+
+            # Track
+            tx = sb_x + slider_margin + 12
+            track_y = sy
+            _fill_rect(canvas, tx, track_y, slider_track_w, 8, SLIDER_TRACK)
+
+            # Fill
+            frac = (params[skey] - smin) / max(1, smax - smin)
+            fill_w = int(frac * slider_track_w)
+            _fill_rect(canvas, tx, track_y, fill_w, 8, SLIDER_FILL)
+
+            # Thumb
+            thumb_x = tx + fill_w
+            cv2.circle(canvas, (int(thumb_x), int(track_y + 4)), 7,
+                       SLIDER_THUMB, -1)
+
+            slider_rects[skey] = (tx, track_y - 8, slider_track_w, 24,
+                                  smin, smax, sstep)
+            sy += 28
+
+        # Class mapping
+        sy += 8
+        _put_text(canvas, "CLASS MAP", sb_x + 12, sy, TEXT_HEADING, 0.45, 1)
+        sy += 20
+        for ttype, cids in class_map.items():
+            color = COLOR_SATELLITE if ttype == 'satellite' else COLOR_AIRPLANE
+            _put_text(canvas, f"  {cids} -> {ttype}", sb_x + 8, sy, color, 0.34)
+            sy += 16
+
+        # Confidence histogram of current detections
+        sy += 16
+        _put_text(canvas, "DETECTIONS", sb_x + 12, sy, TEXT_HEADING, 0.45, 1)
+        sy += 20
+
+        conf_threshold = params['confidence'] / 100.0
+        for det in last_detections[:8]:  # max 8 shown
+            ttype = cls_to_type.get(det['class_id'], '?')
+            cname = det.get('class_name', '')
+            label = cname or ttype[:3]
+            conf = det['confidence']
+            bar_w = int((conf) * (SIDEBAR_W - 60))
+            color = COLOR_SATELLITE if ttype == 'satellite' else COLOR_AIRPLANE
+            _fill_rect(canvas, sb_x + 45, sy - 8, bar_w, 12, color)
+            _put_text(canvas, f"{label}", sb_x + 8, sy, TEXT_PRIMARY, 0.32)
+            _put_text(canvas, f"{conf:.0%}", sb_x + 45 + bar_w + 4, sy,
+                      TEXT_DIM, 0.30)
+            sy += 16
+
+        # Stats
+        sy = WIN_H - STATUS_H - 60
+        _put_text(canvas, f"Inference: {inference_ms:.0f}ms "
+                  f"({1000.0 / max(1, inference_ms):.0f} FPS)",
+                  sb_x + 12, sy, ACCENT, 0.36)
+        sy += 18
+        _put_text(canvas, f"Detections: {len(last_detections)}", sb_x + 12, sy,
+                  TEXT_PRIMARY, 0.36)
+        sy += 18
+        _put_text(canvas, "SPACE/ENTER=Accept  ESC=Cancel  R=Reset",
+                  sb_x + 8, sy, TEXT_DIM, 0.28)
+
+        # ── Status bar with frame slider ─────────────────────────────
+        bar_y = WIN_H - STATUS_H
+        _fill_rect(canvas, 0, bar_y, WIN_W, STATUS_H, BG_PANEL)
+        cv2.line(canvas, (0, bar_y), (WIN_W, bar_y), BORDER, 1)
+
+        # Frame slider
+        fs_x, fs_y = 60, bar_y + 28
+        fs_w = WIN_W - 120
+        _fill_rect(canvas, fs_x, fs_y - 3, fs_w, 6, SLIDER_TRACK)
+        if total_frames > 1:
+            frac = current_frame_idx / max(1, total_frames - 1)
+            fill_w = int(frac * fs_w)
+            _fill_rect(canvas, fs_x, fs_y - 3, fill_w, 6, SLIDER_FILL)
+            cv2.circle(canvas, (fs_x + fill_w, fs_y), 6, SLIDER_THUMB, -1)
+
+        _put_text(canvas, f"Frame {current_frame_idx}/{total_frames}",
+                  fs_x, bar_y + 14, TEXT_PRIMARY, 0.35)
+
+        # ── Handle slider interaction ────────────────────────────────
+        if mouse_state['down']:
+            mx, my = mouse_state['x'], mouse_state['y']
+
+            # Check parameter sliders
+            for skey, (rx, ry, rw, rh, smin, smax, sstep) in slider_rects.items():
+                if rx <= mx <= rx + rw and ry <= my <= ry + rh:
+                    frac = max(0.0, min(1.0, (mx - rx) / max(1, rw)))
+                    raw = smin + frac * (smax - smin)
+                    snapped = round(raw / sstep) * sstep
+                    snapped = max(smin, min(smax, snapped))
+                    if params[skey] != int(snapped):
+                        params[skey] = int(snapped)
+                        need_redraw = True
+
+            # Check frame slider
+            if fs_x <= mx <= fs_x + fs_w and bar_y + 10 <= my <= bar_y + 46:
+                frac = max(0.0, min(1.0, (mx - fs_x) / max(1, fs_w)))
+                new_idx = int(frac * max(1, total_frames - 1))
+                if new_idx != current_frame_idx:
+                    current_frame_idx = new_idx
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_idx)
+                    ret, new_frame = cap.read()
+                    if ret:
+                        frame = new_frame
+                        need_redraw = True
+
+        # ── Display ──────────────────────────────────────────────────
+        cv2.imshow(window_name, canvas)
+        key = cv2.waitKey(30) & 0xFF
+
+        if key in (32, 13):  # SPACE or ENTER — accept
+            cv2.destroyWindow(window_name)
+            cap.release()
+            return {
+                'confidence': params['confidence'] / 100.0,
+                'nms_iou': params['nms_iou'] / 100.0,
+            }
+        elif key == 27:  # ESC — cancel
+            cv2.destroyWindow(window_name)
+            cap.release()
+            return None
+        elif key in (ord('r'), ord('R')):  # Reset
+            params = dict(defaults)
+            need_redraw = True
+        elif key in (ord('n'), ord('N')):  # Next 1s
+            jump = max(1, int(fps))
+            current_frame_idx = min(total_frames - 1, current_frame_idx + jump)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_idx)
+            ret, new_frame = cap.read()
+            if ret:
+                frame = new_frame
+                need_redraw = True
+        elif key in (ord('p'), ord('P')):  # Prev 1s
+            jump = max(1, int(fps))
+            current_frame_idx = max(0, current_frame_idx - jump)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_idx)
+            ret, new_frame = cap.read()
+            if ret:
+                frame = new_frame
+                need_redraw = True
+
+        # Check if window was closed
+        if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
             cap.release()
             return None
 
@@ -6793,6 +7579,347 @@ class RadonStreakDetector(SatelliteTrailDetector):
         return all_merged
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Neural Network Detector — model-based detection via _NNBackend
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class NeuralNetDetector(SatelliteTrailDetector):
+    """Neural network-based satellite and airplane trail detector.
+
+    Uses a trained object detection model (YOLOv8/v11, ONNX, etc.) for
+    primary detection, with optional hybrid fallback to the classical
+    pipeline for additional recall.
+
+    Supports three inference backends:
+      - **ultralytics**: Full YOLOv8/v11 API (auto-installed on first use)
+      - **cv2dnn**: OpenCV DNN module — zero extra deps, supports ONNX
+      - **onnxruntime**: ONNX Runtime — broad acceleration (TensorRT, etc.)
+
+    Detection results are converted to the standard Mnemosky format so all
+    downstream processing (freeze overlays, debug panels, dataset export,
+    HITL review) works identically to the classical algorithms.
+
+    Inherits drawing, debug visualisation, classification and enrichment
+    methods from SatelliteTrailDetector.
+
+    Usage::
+
+        python satellite_trail_detector.py input.mp4 output.mp4 \\
+            --algorithm nn --model trail_detector.pt
+
+        python satellite_trail_detector.py input.mp4 output.mp4 \\
+            --algorithm nn --model trail_detector.onnx --nn-backend cv2dnn
+    """
+
+    def __init__(self, sensitivity='medium', preprocessing_params=None,
+                 skip_aspect_ratio_check=False, signal_envelope=None,
+                 model_path=None, backend='ultralytics', device='auto',
+                 confidence=0.25, nms_iou=0.45, input_size=640,
+                 half_precision=False, class_map=None, hybrid_mode=False,
+                 no_gpu=False):
+        """
+        Args:
+            model_path: Path to model file (.pt, .onnx, .engine, etc.).
+            backend: Inference backend ('ultralytics', 'cv2dnn', 'onnxruntime').
+            device: 'auto', 'cpu', or GPU index string (e.g. '0').
+            confidence: Detection confidence threshold (0-1).
+            nms_iou: NMS IoU threshold (0-1).
+            input_size: Square input resolution for the model.
+            half_precision: Use FP16 inference (GPU only).
+            class_map: Mapping of trail types to model class IDs,
+                e.g. ``{'satellite': [0], 'airplane': [1]}``.
+            hybrid_mode: Also run classical pipeline and merge results.
+            no_gpu: Force CPU inference even if GPU is available.
+        """
+        super().__init__(sensitivity, preprocessing_params,
+                         skip_aspect_ratio_check, signal_envelope)
+
+        self.model_path = model_path
+        self.backend_name = backend
+        self.confidence = confidence
+        self.nms_iou = nms_iou
+        self.input_size = input_size
+        self.half_precision = half_precision
+        self.class_map = class_map or {'satellite': [0], 'airplane': [1]}
+        self.hybrid_mode = hybrid_mode
+        self._no_gpu = no_gpu
+
+        # Invert class_map for fast lookup: model_class_id → trail_type
+        self._class_id_to_type = {}
+        for trail_type, class_ids in self.class_map.items():
+            for cid in class_ids:
+                self._class_id_to_type[cid] = trail_type
+
+        # Deferred backend initialisation (supports multiprocessing — the
+        # _NNBackend object is NOT pickled; each worker recreates it on
+        # first detect_trails() call).
+        self._backend = None
+        self._backend_config = {
+            'model_path': model_path,
+            'backend': backend,
+            'device': device,
+            'confidence': confidence,
+            'nms_iou': nms_iou,
+            'input_size': input_size,
+            'half_precision': half_precision,
+            'no_gpu': no_gpu,
+        }
+
+    def _ensure_backend(self):
+        """Lazy-initialise the inference backend on first use."""
+        if self._backend is None:
+            self._backend = _NNBackend(**self._backend_config)
+
+    # ── Post-hoc detection_info from model bbox ──────────────────────
+
+    def _bbox_to_detection_info(self, bbox, gray, color_frame, nn_confidence):
+        """Convert an NN-predicted bounding box to a standard detection_info dict.
+
+        Estimates trail line, angle, center, length, and brightness metrics
+        from the bounding box region of the grayscale frame.
+
+        Returns:
+            detection_info dict, or None if bbox is degenerate.
+        """
+        x_min, y_min, x_max, y_max = bbox
+        bw = x_max - x_min
+        bh = y_max - y_min
+        if bw < 3 or bh < 3:
+            return None
+
+        fh, fw = gray.shape
+        center = ((x_min + x_max) / 2.0, (y_min + y_max) / 2.0)
+
+        # Estimate trail line from bbox major axis
+        if bw >= bh:
+            line = (x_min, (y_min + y_max) // 2, x_max, (y_min + y_max) // 2)
+            angle = np.degrees(np.arctan2(bh, bw)) % 180
+        else:
+            line = ((x_min + x_max) // 2, y_min, (x_min + x_max) // 2, y_max)
+            angle = (90.0 + np.degrees(np.arctan2(bw, bh))) % 180
+
+        length = float(np.sqrt(bw ** 2 + bh ** 2))
+
+        # Measure brightness within the bbox
+        roi = gray[y_min:y_max, x_min:x_max]
+        if roi.size == 0:
+            return None
+        avg_brightness = float(np.mean(roi))
+        max_brightness = int(np.max(roi))
+        brightness_std = float(np.std(roi))
+
+        # Contrast ratio: trail ROI vs surrounding background
+        pad = max(10, int(length * 0.1))
+        bg_x1, bg_y1 = max(0, x_min - pad), max(0, y_min - pad)
+        bg_x2, bg_y2 = min(fw, x_max + pad), min(fh, y_max + pad)
+        bg_roi = gray[bg_y1:bg_y2, bg_x1:bg_x2]
+        bg_mean = float(np.median(bg_roi)) if bg_roi.size > 0 else 1.0
+        contrast_ratio = avg_brightness / max(1.0, bg_mean)
+
+        # Colour analysis
+        color_roi = color_frame[y_min:y_max, x_min:x_max]
+        if color_roi.size > 0:
+            hsv = cv2.cvtColor(color_roi, cv2.COLOR_BGR2HSV)
+            avg_saturation = float(np.mean(hsv[:, :, 1]))
+        else:
+            avg_saturation = 0.0
+
+        return {
+            'bbox': bbox,
+            'angle': angle,
+            'center': center,
+            'length': length,
+            'avg_brightness': avg_brightness,
+            'max_brightness': max_brightness,
+            'line': line,
+            'contrast_ratio': contrast_ratio,
+            'brightness_std': brightness_std,
+            'avg_saturation': avg_saturation,
+            'has_dotted_pattern': False,
+            'nn_confidence': nn_confidence,
+        }
+
+    # ── Hybrid merge ─────────────────────────────────────────────────
+
+    def _merge_nn_classical(self, nn_trails, classical_trails):
+        """Merge NN and classical detections, preferring NN on overlap.
+
+        For each classical detection whose bbox centre falls inside an
+        existing NN bbox, the classical detection is dropped (the NN
+        version is kept since it has an explicit class prediction).
+        Classical detections that do not overlap are added (the model
+        may have missed them).
+        """
+        if not classical_trails:
+            return nn_trails
+        if not nn_trails:
+            return classical_trails
+
+        nn_bboxes = [info['bbox'] for _, info in nn_trails]
+        merged = list(nn_trails)
+        for trail_type, info in classical_trails:
+            cx = (info['bbox'][0] + info['bbox'][2]) / 2.0
+            cy = (info['bbox'][1] + info['bbox'][3]) / 2.0
+            overlap = False
+            for nb in nn_bboxes:
+                if nb[0] <= cx <= nb[2] and nb[1] <= cy <= nb[3]:
+                    overlap = True
+                    break
+            if not overlap:
+                merged.append((trail_type, info))
+        return merged
+
+    # ── Main detection pipeline ──────────────────────────────────────
+
+    def detect_trails(self, frame, debug_info=None, temporal_context=None,
+                      exposure_time=13.0, fov_degrees=None):
+        """Neural network detection pipeline.
+
+        1. Run model inference → bounding boxes + class predictions
+        2. Map model class IDs to satellite/airplane trail types
+        3. Compute post-hoc detection_info from bboxes
+        4. Optionally merge with classical pipeline results (hybrid mode)
+        5. Merge overlapping detections
+        6. Enrich with photometry, curvature, velocity
+
+        Args / Returns: Same as ``SatelliteTrailDetector.detect_trails()``.
+        """
+        self._ensure_backend()
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        fh, fw = frame.shape[:2]
+
+        # ── Stage 1: Model inference ─────────────────────────────────
+        raw_detections = self._backend.predict(frame)
+
+        # ── Stage 2: Convert to standard format ──────────────────────
+        classified_trails = []
+        all_classifications = []
+
+        for det in raw_detections:
+            trail_type = self._class_id_to_type.get(det['class_id'])
+            if trail_type is None:
+                continue
+
+            x1 = max(0, int(round(det['bbox'][0])))
+            y1 = max(0, int(round(det['bbox'][1])))
+            x2 = min(fw, int(round(det['bbox'][2])))
+            y2 = min(fh, int(round(det['bbox'][3])))
+            bbox = (x1, y1, x2, y2)
+
+            detection_info = self._bbox_to_detection_info(
+                bbox, gray, frame, det['confidence'])
+
+            if debug_info is not None:
+                all_classifications.append({
+                    'line': np.array([[x1, y1, x2, y2]]),
+                    'type': trail_type,
+                    'detection_info': detection_info,
+                    'bbox': bbox,
+                    'nn_confidence': det['confidence'],
+                })
+
+            if detection_info is not None:
+                classified_trails.append((trail_type, detection_info))
+
+        # ── Stage 3: Optional hybrid merge with classical pipeline ───
+        if self.hybrid_mode:
+            classical = super().detect_trails(
+                frame, debug_info=None,
+                temporal_context=temporal_context,
+                exposure_time=exposure_time,
+                fov_degrees=fov_degrees)
+            classified_trails = self._merge_nn_classical(
+                classified_trails, classical)
+
+        # ── Stage 4: Merge overlapping detections ────────────────────
+        satellite_infos = [info for t, info in classified_trails
+                          if t == 'satellite']
+        airplane_infos = [info for t, info in classified_trails
+                         if t == 'airplane']
+
+        satellite_boxes = [info['bbox'] for info in satellite_infos]
+        merged_satellite_boxes = self.merge_overlapping_boxes(satellite_boxes)
+
+        merged_satellite_infos = []
+        for mbox in merged_satellite_boxes:
+            mx = (mbox[0] + mbox[2]) / 2.0
+            my = (mbox[1] + mbox[3]) / 2.0
+            best, best_dist = None, float('inf')
+            for info in satellite_infos:
+                dx = info['center'][0] - mx
+                dy = info['center'][1] - my
+                d = dx * dx + dy * dy
+                if d < best_dist:
+                    best_dist, best = d, info
+            if best:
+                merged_info = dict(best)
+                merged_info['bbox'] = mbox
+                merged_satellite_infos.append(merged_info)
+
+        merged_airplane_infos = self.merge_airplane_detections(airplane_infos)
+
+        # ── Stage 5: Enrich with photometry, curvature, velocity ─────
+        frame_width = frame.shape[1]
+        diff_img = (temporal_context['diff_image']
+                    if temporal_context else None)
+
+        all_merged = (
+            [('satellite', info) for info in merged_satellite_infos] +
+            [('airplane', info) for info in merged_airplane_infos]
+        )
+        do_full = len(all_merged) <= 20
+        for trail_type, info in all_merged:
+            line_arr = np.array([[info['line'][0], info['line'][1],
+                                  info['line'][2], info['line'][3]]])
+            if do_full:
+                info['photometry'] = self._analyze_streak_photometry(
+                    gray, line_arr)
+                info['curvature'] = self._fit_trail_curvature(
+                    gray, line_arr, diff_image=diff_img)
+            else:
+                info['photometry'] = None
+                info['curvature'] = None
+            info['velocity'] = self._estimate_angular_velocity(
+                info['length'], frame_width,
+                exposure_time=exposure_time, fov_degrees=fov_degrees)
+
+        # ── Debug info ───────────────────────────────────────────────
+        if debug_info is not None:
+            debug_info['all_classifications'] = all_classifications
+            debug_info['gray_frame'] = gray
+            debug_info['edges'] = None
+            debug_info['all_lines'] = []
+            debug_info['nn_raw_detections'] = raw_detections
+
+        return all_merged
+
+
+def _apply_nn_params(detector, np_dict):
+    """Apply NN preview parameters to a NeuralNetDetector instance.
+
+    Only updates lightweight scalar parameters; does NOT reload the model.
+    """
+    if 'confidence' in np_dict:
+        detector.confidence = np_dict['confidence']
+        if detector._backend is not None:
+            detector._backend.confidence = np_dict['confidence']
+    if 'nms_iou' in np_dict:
+        detector.nms_iou = np_dict['nms_iou']
+        if detector._backend is not None:
+            detector._backend.nms_iou = np_dict['nms_iou']
+    if 'input_size' in np_dict:
+        detector.input_size = np_dict['input_size']
+        if detector._backend is not None:
+            detector._backend.input_size = np_dict['input_size']
+    if 'class_map' in np_dict:
+        detector.class_map = np_dict['class_map']
+        detector._class_id_to_type = {}
+        for ttype, cids in np_dict['class_map'].items():
+            for cid in cids:
+                detector._class_id_to_type[cid] = ttype
+
+
 # ── Multiprocessing worker for parallel frame detection ────────────────
 
 def _apply_radon_preview_params(detector, rp):
@@ -6816,7 +7943,8 @@ _worker_detector = None
 
 def _worker_init(algorithm, sensitivity, preprocessing_params,
                  skip_aspect_ratio_check, signal_envelope, groundtruth_dir,
-                 use_gpu, radon_params=None, gt_profiles=None):
+                 use_gpu, radon_params=None, nn_params=None,
+                 gt_profiles=None):
     """Create a detector instance in each worker process.
 
     When gt_profiles is provided, skips the expensive _calibrate_from_groundtruth()
@@ -6824,7 +7952,23 @@ def _worker_init(algorithm, sensitivity, preprocessing_params,
     calibration.  This saves ~1-2s per worker at startup.
     """
     global _worker_detector
-    if algorithm == 'radon':
+    if algorithm == 'nn' and nn_params:
+        _worker_detector = NeuralNetDetector(
+            sensitivity, preprocessing_params=preprocessing_params,
+            skip_aspect_ratio_check=skip_aspect_ratio_check,
+            signal_envelope=signal_envelope,
+            model_path=nn_params['model_path'],
+            backend=nn_params['backend'],
+            device='cpu' if not use_gpu else nn_params.get('device', 'auto'),
+            confidence=nn_params['confidence'],
+            nms_iou=nn_params['nms_iou'],
+            input_size=nn_params['input_size'],
+            half_precision=nn_params.get('half_precision', False),
+            class_map=nn_params.get('class_map'),
+            hybrid_mode=nn_params.get('hybrid_mode', False),
+            no_gpu=not use_gpu,
+        )
+    elif algorithm == 'radon':
         # Pass groundtruth_dir=None to skip per-worker calibration;
         # apply the pre-computed profiles instead.
         _worker_detector = RadonStreakDetector(
@@ -7634,7 +8778,7 @@ def export_dataset_from_annotations(input_path, annotations_path,
     exporter.finalize()
 
 
-def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=7, algorithm='default', groundtruth_dir=None, num_workers=0, no_gpu=False, review_mode=False, review_only=False, annotations_path=None, hitl_profile='default', auto_accept=0.9, no_learn=False, dataset_format='aabb', dataset_split=(0.7, 0.2, 0.1), dataset_skip=0, dataset_dedup=5, dataset_negatives=0.2, dataset_image_format='jpg', dataset_image_quality=95, dataset_dir_override=None, radon_params=None):
+def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=7, algorithm='default', groundtruth_dir=None, num_workers=0, no_gpu=False, review_mode=False, review_only=False, annotations_path=None, hitl_profile='default', auto_accept=0.9, no_learn=False, dataset_format='aabb', dataset_split=(0.7, 0.2, 0.1), dataset_skip=0, dataset_dedup=5, dataset_negatives=0.2, dataset_image_format='jpg', dataset_image_quality=95, dataset_dir_override=None, radon_params=None, nn_params=None):
     """
     Process video to detect and highlight satellite and airplane trails.
 
@@ -7767,7 +8911,28 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     
     # Initialize detector (used in sequential mode; parallel mode creates
     # per-worker detectors via _worker_init)
-    if algorithm == 'radon':
+    if algorithm == 'nn' and nn_params:
+        detector = NeuralNetDetector(
+            sensitivity, preprocessing_params=preprocessing_params,
+            skip_aspect_ratio_check=skip_aspect_ratio_check,
+            signal_envelope=signal_envelope,
+            model_path=nn_params['model_path'],
+            backend=nn_params['backend'],
+            device='cpu' if no_gpu else nn_params.get('device', 'auto'),
+            confidence=nn_params['confidence'],
+            nms_iou=nn_params['nms_iou'],
+            input_size=nn_params['input_size'],
+            half_precision=nn_params.get('half_precision', False),
+            class_map=nn_params.get('class_map'),
+            hybrid_mode=nn_params.get('hybrid_mode', False),
+            no_gpu=no_gpu,
+        )
+        backend_label = nn_params['backend']
+        model_label = Path(nn_params['model_path']).name
+        print(f"Algorithm: Neural Network ({backend_label}, model={model_label})")
+        if nn_params.get('hybrid_mode'):
+            print(f"  Hybrid mode: classical pipeline also active")
+    elif algorithm == 'radon':
         detector = RadonStreakDetector(
             sensitivity, preprocessing_params=preprocessing_params,
             skip_aspect_ratio_check=skip_aspect_ratio_check,
@@ -7843,13 +9008,18 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         # Pass pre-computed GT calibration to workers to avoid N redundant
         # _calibrate_from_groundtruth() runs (each loads all PNG files).
         gt_profiles = getattr(detector, 'gt_profiles', None)
+        # Warn about GPU contention with multiple NN workers
+        if algorithm == 'nn' and num_workers > 1 and use_gpu_workers:
+            print(f"Warning: --algorithm nn with {num_workers} GPU workers "
+                  f"may cause VRAM contention. Consider --workers 1 for GPU "
+                  f"or --no-gpu for CPU multi-worker parallelism.")
         pool = multiprocessing.Pool(
             num_workers,
             initializer=_worker_init,
             initargs=(algorithm, sensitivity, preprocessing_params,
                       skip_aspect_ratio_check, signal_envelope,
                       groundtruth_dir, use_gpu_workers, radon_params,
-                      gt_profiles))
+                      nn_params, gt_profiles))
         pending = deque()  # (frame, frame_idx, AsyncResult)
         prefetch = num_workers * 2
         print(f"Parallel workers: {num_workers}" +
@@ -8422,10 +9592,11 @@ Notes:
 
     parser.add_argument(
         '--algorithm', '-a',
-        choices=['default', 'radon'],
+        choices=['default', 'radon', 'nn'],
         default='default',
-        help='Detection algorithm: "default" (Canny+Hough+MF) or '
-             '"radon" (LSD+Radon+PCF — advanced, catches dimmer trails). '
+        help='Detection algorithm: "default" (Canny+Hough+MF), '
+             '"radon" (LSD+Radon+PCF — advanced, catches dimmer trails), '
+             'or "nn" (neural network model — requires --model). '
              'Default: default'
     )
 
@@ -8436,6 +9607,69 @@ Notes:
         help='Path to directory containing ground truth trail patch images (PNG). '
              'Used by the "radon" algorithm to calibrate detection thresholds. '
              'If not specified with --algorithm radon, uses default thresholds.'
+    )
+
+    # --- Neural Network Algorithm ---
+    parser.add_argument(
+        '--model',
+        type=str, default=None,
+        help='Path to neural network model file (.pt, .onnx, .engine). '
+             'Required when --algorithm nn is used. Supports YOLOv8/v11 '
+             'models trained on satellite/airplane trail detection.'
+    )
+
+    parser.add_argument(
+        '--nn-backend',
+        choices=['ultralytics', 'cv2dnn', 'onnxruntime'],
+        default=None,
+        help='Neural network inference backend. Default: auto-detect from '
+             'model file extension (.pt → ultralytics, .onnx → cv2dnn).'
+    )
+
+    parser.add_argument(
+        '--confidence',
+        type=float, default=None,
+        help='Detection confidence threshold for NN algorithm (0-1). '
+             'Default: 0.25 (or value from config file).'
+    )
+
+    parser.add_argument(
+        '--nms-iou',
+        type=float, default=None,
+        help='NMS IoU threshold for NN algorithm (0-1). Default: 0.45.'
+    )
+
+    parser.add_argument(
+        '--nn-input-size',
+        type=int, default=None,
+        help='Model input resolution for NN algorithm. Default: 640.'
+    )
+
+    parser.add_argument(
+        '--nn-class-map',
+        type=str, default=None,
+        help='Class mapping as JSON string, e.g. \'{"satellite": [0], "airplane": [1]}\'. '
+             'Maps Mnemosky trail types to model class IDs.'
+    )
+
+    parser.add_argument(
+        '--nn-hybrid',
+        action='store_true',
+        help='Run NN detection alongside classical pipeline and merge results. '
+             'Improves recall at the cost of speed.'
+    )
+
+    parser.add_argument(
+        '--config',
+        type=str, default=None,
+        help='Path to config file (default: ~/.mnemosky/config.json). '
+             'Stores model paths, backend choice, and all algorithm parameters.'
+    )
+
+    parser.add_argument(
+        '--save-config',
+        action='store_true',
+        help='Save current CLI parameters to config file for future runs.'
     )
 
     _default_workers = min(max(1, (os.cpu_count() or 4) - 1), 8)
@@ -8508,15 +9742,83 @@ Notes:
     if hasattr(args, 'auto_accept') and not (0.0 <= args.auto_accept <= 1.0):
         parser.error("--auto-accept must be in range [0.0, 1.0]")
 
+    # ── Load application config ──────────────────────────────────────
+    config = load_config(args.config)
+    nn_config = config.get('algorithms', {}).get('nn', {})
+
+    # ── Build nn_params if --algorithm nn ────────────────────────────
+    nn_params = None
+    if args.algorithm == 'nn':
+        model_path = args.model or nn_config.get('model_path')
+        if not model_path:
+            parser.error(
+                "--model is required when --algorithm nn is used "
+                "(or set model_path in ~/.mnemosky/config.json)")
+
+        # Auto-detect backend from file extension if not specified
+        backend = args.nn_backend or nn_config.get('backend')
+        if backend is None:
+            ext = Path(model_path).suffix.lower()
+            backend = {'.pt': 'ultralytics', '.onnx': 'cv2dnn',
+                       '.engine': 'ultralytics'}.get(ext, 'ultralytics')
+
+        # Parse class map from JSON string or config
+        class_map = nn_config.get('class_map', {'satellite': [0], 'airplane': [1]})
+        if args.nn_class_map:
+            try:
+                class_map = json.loads(args.nn_class_map)
+            except json.JSONDecodeError as e:
+                parser.error(f"--nn-class-map is not valid JSON: {e}")
+
+        nn_params = {
+            'model_path': str(Path(model_path).resolve()),
+            'backend': backend,
+            'confidence': (args.confidence if args.confidence is not None
+                           else nn_config.get('confidence', 0.25)),
+            'nms_iou': (args.nms_iou if args.nms_iou is not None
+                        else nn_config.get('nms_iou', 0.45)),
+            'input_size': (args.nn_input_size if args.nn_input_size is not None
+                           else nn_config.get('input_size', 640)),
+            'device': 'cpu' if args.no_gpu else nn_config.get('device', 'auto'),
+            'half_precision': nn_config.get('half_precision', False),
+            'class_map': class_map,
+            'hybrid_mode': args.nn_hybrid,
+        }
+
+    # ── Save config if requested ─────────────────────────────────────
+    if args.save_config:
+        if nn_params:
+            config['algorithms']['nn'] = {
+                'model_path': nn_params['model_path'],
+                'backend': nn_params['backend'],
+                'confidence': nn_params['confidence'],
+                'nms_iou': nn_params['nms_iou'],
+                'input_size': nn_params['input_size'],
+                'device': nn_params['device'],
+                'half_precision': nn_params['half_precision'],
+                'class_map': nn_params['class_map'],
+            }
+        config['algorithms']['default']['sensitivity'] = args.sensitivity
+        config['algorithms']['radon']['sensitivity'] = args.sensitivity
+        save_config(config, args.config)
+        print(f"Config saved to {args.config or _CONFIG_PATH}")
+
     # Handle preprocessing preview if requested
     preprocessing_params = None
     signal_envelope = None
     radon_preview_params = None
+    nn_preview_params = None
     if args.preview:
         if args.algorithm == 'radon':
             radon_preview_params = show_radon_preview(args.input)
             if radon_preview_params is None:
                 print("Using default Radon pipeline parameters.")
+        elif args.algorithm == 'nn':
+            nn_preview_params = show_nn_preview(args.input, nn_params=nn_params)
+            if nn_preview_params is not None:
+                nn_params.update(nn_preview_params)
+            else:
+                print("Using default NN pipeline parameters.")
         else:
             preprocessing_params = show_preprocessing_preview(args.input)
             if preprocessing_params is None:
@@ -8591,6 +9893,7 @@ Notes:
         dataset_image_quality=args.dataset_image_quality,
         dataset_dir_override=args.dataset_dir,
         radon_params=radon_preview_params,
+        nn_params=nn_params,
     )
 
 
