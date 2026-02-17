@@ -1764,7 +1764,7 @@ def show_radon_preview(video_path, initial_params=None):
         cleaned[star_mask] = 0.0
 
         # ── Downsample for Radon ────────────────────────────────────
-        max_area = 250000
+        max_area = 500000
         current_area = h * w
         r_scale = min(1.0, np.sqrt(max_area / max(1, current_area)))
         small_h_r = max(64, int(h * r_scale))
@@ -2906,6 +2906,203 @@ class TemporalFrameBuffer:
             'reference': self._reference,
             'buffer_depth': len(self._frames),
         }
+
+
+class DetectionTracker:
+    """Temporal consistency filter and tracklet builder for satellite detections.
+
+    Maintains a sliding window of per-frame detections and applies two
+    post-detection filters:
+
+    1. **Temporal consistency**: A detection is confirmed only if a
+       geometrically consistent detection (similar angle + close position)
+       appears in >= `min_hits` of the last `window` frames.  Single-frame
+       noise transients (cosmic rays, hot pixels, cloud edges) are suppressed.
+
+    2. **Tracklet formation**: Detections linked across 3+ consecutive
+       frames with consistent motion form a *tracklet*.  Tracklet-confirmed
+       trails get a confidence multiplier and a ``tracklet_id`` tag.
+
+    The tracker runs in the main process after detection results arrive
+    (works with both sequential and parallel modes).
+
+    Usage::
+
+        tracker = DetectionTracker(window=4, min_hits=2)
+        for frame_idx, detections in detection_stream:
+            confirmed = tracker.update(frame_idx, detections)
+            # use confirmed detections for drawing / export
+    """
+
+    def __init__(self, window=4, min_hits=2, angle_thresh=10, dist_thresh=30):
+        """
+        Args:
+            window: How many recent frames to keep for consistency check.
+            min_hits: Minimum number of frames (within the window) a detection
+                must appear in to be confirmed.
+            angle_thresh: Max angle difference (degrees) to consider two
+                detections as the same trail across frames.
+            dist_thresh: Max perpendicular distance (pixels) between trail
+                midpoints across frames to consider them the same trail.
+        """
+        self.window = window
+        self.min_hits = min_hits
+        self.angle_thresh = angle_thresh
+        self.dist_thresh = dist_thresh
+
+        # Ring buffer: list of (frame_idx, detections) tuples
+        self._history = []
+
+        # Active tracklets: list of dicts with keys:
+        #   'id', 'detections' (list of (frame_idx, trail_type, info)),
+        #   'last_frame', 'angle', 'center'
+        self._tracklets = []
+        self._next_tracklet_id = 1
+
+    @staticmethod
+    def _trail_angle(info):
+        """Extract angle in [0, 180) from detection info."""
+        if 'angle' in info:
+            return info['angle'] % 180
+        line = info.get('line')
+        if line is not None:
+            import math
+            x1, y1, x2, y2 = line[:4] if len(line) >= 4 else line[0]
+            return math.degrees(math.atan2(y2 - y1, x2 - x1)) % 180
+        return 0.0
+
+    @staticmethod
+    def _trail_center(info):
+        """Extract trail midpoint from detection info."""
+        if 'center' in info:
+            return info['center']
+        b = info['bbox']
+        return ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
+
+    def _is_same_trail(self, info_a, info_b):
+        """Check if two detections (possibly from different frames) describe
+        the same physical trail using angle + perpendicular distance."""
+        a1 = self._trail_angle(info_a)
+        a2 = self._trail_angle(info_b)
+        angle_diff = abs(a1 - a2) % 180
+        angle_diff = min(angle_diff, 180 - angle_diff)
+        if angle_diff > self.angle_thresh:
+            return False
+
+        c1 = self._trail_center(info_a)
+        c2 = self._trail_center(info_b)
+
+        # Perpendicular distance from c2 to the line through c1 at angle a1
+        import math
+        a_rad = math.radians(a1)
+        nx, ny = -math.sin(a_rad), math.cos(a_rad)  # perpendicular
+        perp_dist = abs((c2[0] - c1[0]) * nx + (c2[1] - c1[1]) * ny)
+        return perp_dist < self.dist_thresh
+
+    def _update_tracklets(self, frame_idx, detections):
+        """Link current detections to existing tracklets or start new ones."""
+        matched = set()  # indices into detections that matched a tracklet
+
+        for tracklet in self._tracklets:
+            best_match = None
+            best_dist = float('inf')
+            for i, (trail_type, info) in enumerate(detections):
+                if i in matched:
+                    continue
+                if self._is_same_trail(tracklet['detections'][-1][2], info):
+                    c = self._trail_center(info)
+                    tc = tracklet['center']
+                    dist = (c[0] - tc[0]) ** 2 + (c[1] - tc[1]) ** 2
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_match = i
+
+            if best_match is not None:
+                trail_type, info = detections[best_match]
+                tracklet['detections'].append((frame_idx, trail_type, info))
+                tracklet['last_frame'] = frame_idx
+                tracklet['center'] = self._trail_center(info)
+                tracklet['angle'] = self._trail_angle(info)
+                matched.add(best_match)
+
+        # Start new tracklets for unmatched detections
+        for i, (trail_type, info) in enumerate(detections):
+            if i not in matched:
+                self._tracklets.append({
+                    'id': self._next_tracklet_id,
+                    'detections': [(frame_idx, trail_type, info)],
+                    'last_frame': frame_idx,
+                    'center': self._trail_center(info),
+                    'angle': self._trail_angle(info),
+                })
+                self._next_tracklet_id += 1
+
+        # Expire tracklets not seen for > window frames
+        self._tracklets = [
+            t for t in self._tracklets
+            if frame_idx - t['last_frame'] <= self.window
+        ]
+
+    def update(self, frame_idx, detections):
+        """Add detections for the current frame and return confirmed detections.
+
+        Args:
+            frame_idx: Current frame index (1-based from process_video).
+            detections: List of (trail_type, detection_info) from detect_trails().
+
+        Returns:
+            List of (trail_type, detection_info) — only detections that have
+            temporal support (appeared in >= min_hits recent frames) or belong
+            to tracklets with 3+ frames.  Each confirmed detection_info gets
+            an extra ``'temporal_hits'`` key and optionally ``'tracklet_id'``.
+        """
+        # Store in history ring buffer
+        self._history.append((frame_idx, detections))
+        if len(self._history) > self.window:
+            self._history.pop(0)
+
+        # Update tracklets
+        self._update_tracklets(frame_idx, detections)
+
+        # Not enough history — pass everything through
+        if len(self._history) < 2:
+            return detections
+
+        # Score each current detection by temporal support
+        confirmed = []
+        for trail_type, info in detections:
+            hits = 1  # current frame
+            for past_fidx, past_dets in self._history[:-1]:
+                for _, past_info in past_dets:
+                    if self._is_same_trail(info, past_info):
+                        hits += 1
+                        break
+
+            # Find tracklet for this detection (if any)
+            tracklet_id = None
+            tracklet_len = 0
+            for t in self._tracklets:
+                if (t['last_frame'] == frame_idx and
+                        t['detections'][-1][2] is info):
+                    tracklet_id = t['id']
+                    tracklet_len = len(t['detections'])
+                    break
+
+            # Confirm if: enough temporal hits OR strong tracklet
+            if hits >= self.min_hits or tracklet_len >= 3:
+                enriched_info = dict(info)
+                enriched_info['temporal_hits'] = hits
+                if tracklet_id is not None:
+                    enriched_info['tracklet_id'] = tracklet_id
+                    enriched_info['tracklet_length'] = tracklet_len
+                confirmed.append((trail_type, enriched_info))
+
+            elif trail_type == 'airplane':
+                # Airplanes are bright and distinctive — don't require
+                # temporal confirmation (they'd pass on the first frame anyway)
+                confirmed.append((trail_type, info))
+
+        return confirmed
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -6691,12 +6888,21 @@ class RadonStreakDetector(SatelliteTrailDetector):
         self.radon_num_angles = 90        # 2-degree angular resolution (fast)
         self.radon_max_dim = 480          # Max short-side pixels for Radon input
         self.radon_snr_threshold = 3.0    # SNR threshold in sinogram space
-        self.pcf_ratio_threshold = 2.0    # Parallel / perpendicular ratio
+        self.pcf_ratio_threshold = 2.5    # Parallel / perpendicular ratio (raised from 2.0 to reject star residuals)
         self.pcf_kernel_length = 31       # Matched filter kernel length for PCF
 
         # Overridable from Radon preview (default None = use hardcoded values)
         self._star_mask_sigma = None      # Star mask threshold (default 5.0σ)
         self._lsd_log_eps = None          # LSD significance (default 1.0)
+
+        # Multi-frame residual accumulator for Radon SNR boost.
+        # In sequential mode, accumulates star-subtracted residuals across
+        # frames so the Radon transform sees sqrt(N) better SNR.
+        # In parallel mode (workers > 0), each worker has its own instance
+        # so accumulation doesn't work — Radon runs on single frames.
+        self._residual_buffer = []        # ring buffer of cleaned residuals
+        self._residual_buffer_depth = 4   # how many frames to stack
+        self._residual_star_masks = []    # corresponding star masks
 
         # Ground truth calibration profiles (must come after parameter defaults)
         self.gt_profiles = None
@@ -7104,11 +7310,15 @@ class RadonStreakDetector(SatelliteTrailDetector):
             return []
 
         # Non-maximum suppression: dilate and compare
+        # NMS window (11, 7): 11 pixels in offset covers ~44px full-res
+        # (well within a single trail's sinogram footprint), 7 in angle
+        # covers ~14 degrees (suppresses near-parallel ghost peaks).
+        nms_size = (11, 7)
         if _HAS_SCIPY:
-            local_max = _scipy_maximum_filter(snr_sinogram, size=(5, 5))
+            local_max = _scipy_maximum_filter(snr_sinogram, size=nms_size)
         else:
             # Fallback: use cv2.dilate for NMS
-            kernel_nms = np.ones((5, 5), dtype=np.uint8)
+            kernel_nms = np.ones(nms_size, dtype=np.uint8)
             local_max = cv2.dilate(snr_sinogram, kernel_nms)
         peaks = peak_mask & (snr_sinogram == local_max)
 
@@ -7275,6 +7485,233 @@ class RadonStreakDetector(SatelliteTrailDetector):
 
         return confirmed
 
+    # ── Line-proximity utilities for dedup and merging ────────────
+
+    @staticmethod
+    def _line_angle(x1, y1, x2, y2):
+        """Return line angle in [0, 180) degrees."""
+        import math
+        return math.degrees(math.atan2(y2 - y1, x2 - x1)) % 180
+
+    @staticmethod
+    def _angle_diff(a1, a2):
+        """Absolute angular difference in [0, 90] degrees, handling 180-wrap."""
+        d = abs(a1 - a2) % 180
+        return min(d, 180 - d)
+
+    @staticmethod
+    def _perp_distance_between_lines(line1, line2):
+        """Perpendicular distance from midpoint of line2 to the infinite line through line1."""
+        import math
+        x1, y1, x2, y2 = line1
+        dx, dy = x2 - x1, y2 - y1
+        length = math.sqrt(dx * dx + dy * dy)
+        if length < 1e-6:
+            mx, my = (line2[0] + line2[2]) / 2, (line2[1] + line2[3]) / 2
+            return math.sqrt((mx - x1) ** 2 + (my - y1) ** 2)
+        nx, ny = -dy / length, dx / length  # unit perpendicular
+        mx, my = (line2[0] + line2[2]) / 2, (line2[1] + line2[3]) / 2
+        return abs((mx - x1) * nx + (my - y1) * ny)
+
+    @classmethod
+    def _is_duplicate_line(cls, line1, line2, dist_thresh=20, angle_thresh=15):
+        """Check if two lines describe the same physical trail.
+
+        Uses angle similarity + perpendicular distance between midpoints,
+        far more robust than the old midpoint-in-AABB check.
+
+        Args:
+            line1: (x1, y1, x2, y2)
+            line2: (x1, y1, x2, y2)
+            dist_thresh: Max perpendicular distance in pixels
+            angle_thresh: Max angle difference in degrees
+
+        Returns:
+            True if both lines likely describe the same physical trail.
+        """
+        a1 = cls._line_angle(*line1)
+        a2 = cls._line_angle(*line2)
+        if cls._angle_diff(a1, a2) > angle_thresh:
+            return False
+        # Check perpendicular distance in both directions (symmetric)
+        d1 = cls._perp_distance_between_lines(line1, line2)
+        d2 = cls._perp_distance_between_lines(line2, line1)
+        return min(d1, d2) < dist_thresh
+
+    @classmethod
+    def _merge_collinear_segments(cls, segments, angle_thresh=5, perp_thresh=10, gap_thresh=50):
+        """Merge collinear LSD segments that belong to the same physical trail.
+
+        LSD often splits a long dim trail into 2-5 fragments.  This merges
+        them before classify_trail() so each trail produces one detection.
+
+        Args:
+            segments: List of (x1, y1, x2, y2, nfa) tuples from LSD
+            angle_thresh: Max angle difference (degrees) to consider collinear
+            perp_thresh: Max perpendicular distance (pixels) between segments
+            gap_thresh: Max gap along the line direction (pixels)
+
+        Returns:
+            List of (x1, y1, x2, y2, nfa) tuples with collinear segments merged.
+        """
+        import math
+        if len(segments) <= 1:
+            return segments
+
+        # Build merge groups via union-find
+        n = len(segments)
+        parent = list(range(n))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(i, j):
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[ri] = rj
+
+        # Pre-compute angles and unit vectors
+        angles = []
+        for x1, y1, x2, y2, _ in segments:
+            angles.append(cls._line_angle(x1, y1, x2, y2))
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                if cls._angle_diff(angles[i], angles[j]) > angle_thresh:
+                    continue
+
+                seg_i = segments[i][:4]
+                seg_j = segments[j][:4]
+
+                # Perpendicular distance
+                d1 = cls._perp_distance_between_lines(seg_i, seg_j)
+                d2 = cls._perp_distance_between_lines(seg_j, seg_i)
+                if min(d1, d2) > perp_thresh:
+                    continue
+
+                # Gap along line direction: project all 4 endpoints onto
+                # the average direction vector and check the gap
+                avg_angle = math.radians(angles[i])
+                ux, uy = math.cos(avg_angle), math.sin(avg_angle)
+                projs_i = [seg_i[0] * ux + seg_i[1] * uy,
+                           seg_i[2] * ux + seg_i[3] * uy]
+                projs_j = [seg_j[0] * ux + seg_j[1] * uy,
+                           seg_j[2] * ux + seg_j[3] * uy]
+                gap = max(min(projs_j) - max(projs_i),
+                          min(projs_i) - max(projs_j))
+                if gap > gap_thresh:
+                    continue
+
+                union(i, j)
+
+        # Collect groups and merge each group into a single segment
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for i in range(n):
+            groups[find(i)].append(i)
+
+        merged = []
+        for indices in groups.values():
+            if len(indices) == 1:
+                merged.append(segments[indices[0]])
+                continue
+
+            # Merge: find the two endpoints that are farthest apart
+            # (the overall trail extent), keep the best NFA
+            best_nfa = min(segments[idx][4] for idx in indices)
+            all_points = []
+            for idx in indices:
+                s = segments[idx]
+                all_points.append((s[0], s[1]))
+                all_points.append((s[2], s[3]))
+
+            # Find the pair of points with maximum distance
+            max_dist = 0
+            p_start, p_end = all_points[0], all_points[-1]
+            for a_idx in range(len(all_points)):
+                for b_idx in range(a_idx + 1, len(all_points)):
+                    pa, pb = all_points[a_idx], all_points[b_idx]
+                    d = (pa[0] - pb[0]) ** 2 + (pa[1] - pb[1]) ** 2
+                    if d > max_dist:
+                        max_dist = d
+                        p_start, p_end = pa, pb
+
+            merged.append((p_start[0], p_start[1], p_end[0], p_end[1], best_nfa))
+
+        return merged
+
+    @classmethod
+    def _merge_lines_oriented(cls, detection_infos, angle_thresh=10, perp_thresh=15):
+        """Merge satellite detections using line proximity instead of AABB overlap.
+
+        Replaces merge_overlapping_boxes() for satellite trails in the Radon
+        pipeline.  Two detections merge if their trail lines are nearly
+        collinear (similar angle and close perpendicular distance).
+
+        Args:
+            detection_infos: List of detection_info dicts with 'line', 'angle', etc.
+            angle_thresh: Max angle difference to merge (degrees)
+            perp_thresh: Max perpendicular distance to merge (pixels)
+
+        Returns:
+            List of merged detection_info dicts.
+        """
+        if len(detection_infos) <= 1:
+            return list(detection_infos)
+
+        n = len(detection_infos)
+        parent = list(range(n))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(i, j):
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[ri] = rj
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                info_i, info_j = detection_infos[i], detection_infos[j]
+                if cls._angle_diff(info_i.get('angle', 0),
+                                   info_j.get('angle', 0)) > angle_thresh:
+                    continue
+                line_i = info_i.get('line', info_i['bbox'])
+                line_j = info_j.get('line', info_j['bbox'])
+                d1 = cls._perp_distance_between_lines(line_i, line_j)
+                d2 = cls._perp_distance_between_lines(line_j, line_i)
+                if min(d1, d2) < perp_thresh:
+                    union(i, j)
+
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for i in range(n):
+            groups[find(i)].append(i)
+
+        merged = []
+        for indices in groups.values():
+            # Pick the detection with the longest trail as the representative
+            best_idx = max(indices, key=lambda i: detection_infos[i].get('length', 0))
+            best = dict(detection_infos[best_idx])
+
+            # Expand bbox to encompass all members
+            all_bboxes = [detection_infos[i]['bbox'] for i in indices]
+            best['bbox'] = (
+                min(b[0] for b in all_bboxes),
+                min(b[1] for b in all_bboxes),
+                max(b[2] for b in all_bboxes),
+                max(b[3] for b in all_bboxes),
+            )
+            merged.append(best)
+
+        return merged
+
     # ── GPU-accelerated median blur ─────────────────────────────────
 
     def _median_blur_gpu(self, gray_u8, kernel_size):
@@ -7335,8 +7772,9 @@ class RadonStreakDetector(SatelliteTrailDetector):
         high_thresh = star_sigma * noise_sigma
         star_mask = residual > high_thresh
 
-        # Dilate to cover halos and spikes
-        dilate_size = max(5, int(noise_sigma * 3))
+        # Dilate to cover halos and spikes — cap at 15 to avoid eating
+        # trail pixels near stars on high-noise frames
+        dilate_size = max(5, min(15, int(noise_sigma * 2)))
         if dilate_size % 2 == 0:
             dilate_size += 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
@@ -7419,12 +7857,16 @@ class RadonStreakDetector(SatelliteTrailDetector):
         lsd_segments = self._detect_lines_lsd(
             enhanced,
             min_length=self.params.get('satellite_min_length', 50) * 0.6 * lsd_scale,
-            log_eps=self._lsd_log_eps if self._lsd_log_eps is not None else 1.0
+            log_eps=self._lsd_log_eps if self._lsd_log_eps is not None else 0.0
         )
 
         # Cap LSD segments to prevent classify_trail explosion (4-8ms each).
         # Keep the most significant segments (already sorted by NFA).
         lsd_segments = lsd_segments[:50]
+
+        # Merge collinear LSD fragments before classification — LSD often
+        # splits a long dim trail into 2-5 pieces that would produce duplicates
+        lsd_segments = self._merge_collinear_segments(lsd_segments)
 
         # Convert LSD results to HoughLinesP format, scaling back to full res
         lsd_lines = []
@@ -7448,18 +7890,43 @@ class RadonStreakDetector(SatelliteTrailDetector):
             if trail_type and detection_info:
                 classified_trails.append((trail_type, detection_info))
 
+        # ── Multi-frame residual accumulation (sequential mode only) ──
+        # Accumulate star-subtracted residuals across frames to boost Radon
+        # SNR by sqrt(N).  In parallel mode each worker has its own detector
+        # so the buffer stays empty and we fall back to single-frame Radon.
+        self._residual_buffer.append(cleaned)
+        self._residual_star_masks.append(star_mask)
+        if len(self._residual_buffer) > self._residual_buffer_depth:
+            self._residual_buffer.pop(0)
+            self._residual_star_masks.pop(0)
+
+        if len(self._residual_buffer) >= 2:
+            # Stack: mean of recent residuals with union star mask
+            stacked = np.mean(self._residual_buffer, axis=0).astype(np.float32)
+            combined_mask = self._residual_star_masks[0].copy()
+            for m in self._residual_star_masks[1:]:
+                combined_mask = combined_mask | m
+            stacked[combined_mask] = 0.0
+            radon_input = stacked
+            # Noise reduces by sqrt(N) when averaging N frames
+            radon_noise = noise_sigma / np.sqrt(len(self._residual_buffer))
+        else:
+            radon_input = cleaned
+            radon_noise = noise_sigma
+
         # ── Stage 2: Radon transform detection ──────────────────────
-        # Aggressively downsample: cap total pixel area to ~250k pixels
-        max_area = 250000  # 500x500 equivalent
+        # Downsample: cap total pixel area to ~500k pixels (increased from
+        # 250k to preserve 1-2px trails that were killed by 4x downsample)
+        max_area = 500000  # ~700x700 for 1080p (was 250k / 500x500)
         current_area = h * w
         scale = min(1.0, np.sqrt(max_area / max(1, current_area)))
         small_h, small_w = max(64, int(h * scale)), max(64, int(w * scale))
-        small_cleaned = cv2.resize(cleaned, (small_w, small_h),
-                                   interpolation=cv2.INTER_AREA)
-        small_noise = noise_sigma * scale
+        small_radon = cv2.resize(radon_input, (small_w, small_h),
+                                 interpolation=cv2.INTER_AREA)
+        small_noise = radon_noise * scale
 
         radon_candidates = self._detect_streaks_radon(
-            small_cleaned, small_noise,
+            small_radon, small_noise,
             snr_threshold=self.radon_snr_threshold,
             min_length=max(10, int(self.params.get('satellite_min_length', 50) * scale * 0.5))
         )
@@ -7470,6 +7937,63 @@ class RadonStreakDetector(SatelliteTrailDetector):
             radon_candidates_full.append(
                 (x1 / scale, y1 / scale, x2 / scale, y2 / scale, snr))
 
+        # ── Refine Radon endpoints on full-resolution residual ────
+        # The sinogram FWHM gives a rough length estimate.  Walk along each
+        # candidate line in the full-res cleaned image to find where the
+        # signal actually drops to noise, giving accurate endpoints for
+        # dedup, merge, and bounding box computation.
+        refined_candidates = []
+        for x1, y1, x2, y2, snr in radon_candidates_full:
+            dx, dy = x2 - x1, y2 - y1
+            length = np.sqrt(dx * dx + dy * dy)
+            if length < 5:
+                refined_candidates.append((x1, y1, x2, y2, snr))
+                continue
+
+            ux, uy = dx / length, dy / length
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+
+            # Sample along the line at 1px steps from center outward
+            max_half = int(length * 0.75)  # search up to 1.5x original estimate
+            noise_floor = noise_sigma * 1.5  # signal threshold
+
+            def _find_endpoint(direction):
+                """Walk from center in +/- direction, return last above-noise point."""
+                last_good = 0
+                for step in range(1, max_half + 1):
+                    px = int(round(cx + direction * step * ux))
+                    py = int(round(cy + direction * step * uy))
+                    if 0 <= py < h and 0 <= px < w:
+                        if cleaned[py, px] > noise_floor:
+                            last_good = step
+                        elif step - last_good > 5:
+                            break  # 5px gap → end of trail
+                    else:
+                        break
+                return last_good
+
+            half_fwd = _find_endpoint(1)
+            half_bwd = _find_endpoint(-1)
+
+            # Only use refined endpoints if they give a reasonable length
+            ref_len = half_fwd + half_bwd
+            min_len = self.params.get('satellite_min_length', 50) * scale * 0.4
+            if ref_len >= min_len:
+                rx1 = cx - half_bwd * ux
+                ry1 = cy - half_bwd * uy
+                rx2 = cx + half_fwd * ux
+                ry2 = cy + half_fwd * uy
+                rx1 = np.clip(rx1, 0, w - 1)
+                ry1 = np.clip(ry1, 0, h - 1)
+                rx2 = np.clip(rx2, 0, w - 1)
+                ry2 = np.clip(ry2, 0, h - 1)
+                refined_candidates.append((float(rx1), float(ry1),
+                                           float(rx2), float(ry2), snr))
+            else:
+                refined_candidates.append((x1, y1, x2, y2, snr))
+
+        radon_candidates_full = refined_candidates
+
         # ── Stage 3: Perpendicular cross filtering ──────────────────
         # Apply PCF to both LSD and Radon candidates (on the cleaned residual)
         # LSD candidates that already passed classify_trail are kept as-is;
@@ -7477,16 +8001,23 @@ class RadonStreakDetector(SatelliteTrailDetector):
         pcf_confirmed = self._perpendicular_cross_filter(
             cleaned, radon_candidates_full)
 
-        # Deduplicate: remove Radon candidates that overlap with LSD detections
-        existing_bboxes = [info['bbox'] for _, info in classified_trails]
+        # Deduplicate: remove Radon candidates that match existing LSD
+        # detections using line proximity (angle + perpendicular distance),
+        # far more robust than the old midpoint-in-AABB check.
+        existing_lines = []
+        for _, info in classified_trails:
+            ln = info.get('line')
+            if ln is not None:
+                existing_lines.append(ln)
+            else:
+                # Fallback: use bbox corners as a pseudo-line
+                b = info['bbox']
+                existing_lines.append((b[0], b[1], b[2], b[3]))
         for x1, y1, x2, y2, snr in pcf_confirmed:
-            # Check if this overlaps an existing detection
-            cx = (x1 + x2) / 2
-            cy = (y1 + y2) / 2
+            radon_line = (x1, y1, x2, y2)
             is_duplicate = False
-            for ex_bbox in existing_bboxes:
-                if (ex_bbox[0] <= cx <= ex_bbox[2] and
-                        ex_bbox[1] <= cy <= ex_bbox[3]):
+            for ex_line in existing_lines:
+                if self._is_duplicate_line(radon_line, ex_line):
                     is_duplicate = True
                     break
             if is_duplicate:
@@ -7529,28 +8060,35 @@ class RadonStreakDetector(SatelliteTrailDetector):
         for t, info in classified_trails:
             (satellite_infos if t == 'satellite' else airplane_infos).append(info)
 
-        satellite_boxes = [info['bbox'] for info in satellite_infos]
-        merged_satellite_boxes = self.merge_overlapping_boxes(satellite_boxes)
-
-        merged_satellite_infos = []
-        for mbox in merged_satellite_boxes:
-            mx = (mbox[0] + mbox[2]) / 2
-            my = (mbox[1] + mbox[3]) / 2
-            best = None
-            best_dist = float('inf')
-            for info in satellite_infos:
-                dx = info['center'][0] - mx
-                dy = info['center'][1] - my
-                dist = dx * dx + dy * dy
-                if dist < best_dist:
-                    best_dist = dist
-                    best = info
-            if best:
-                merged_info = dict(best)
-                merged_info['bbox'] = mbox
-                merged_satellite_infos.append(merged_info)
-
+        # Use oriented line-proximity merge for satellites (replaces AABB
+        # merge which fails for diagonal trails — bloated AABBs cause false
+        # merges of parallel trails and missed merges of collinear segments)
+        merged_satellite_infos = self._merge_lines_oriented(satellite_infos)
         merged_airplane_infos = self.merge_airplane_detections(airplane_infos)
+
+        # ── Cross-type dedup: same trail detected as both satellite & airplane
+        # Keep the detection with the longer trail (more context = more reliable)
+        if merged_satellite_infos and merged_airplane_infos:
+            keep_airplanes = []
+            for a_info in merged_airplane_infos:
+                a_line = a_info.get('line', a_info['bbox'])
+                is_dup = False
+                for s_info in merged_satellite_infos:
+                    s_line = s_info.get('line', s_info['bbox'])
+                    if self._is_duplicate_line(a_line, s_line,
+                                               dist_thresh=20, angle_thresh=10):
+                        # Same trail — prefer the longer detection
+                        if a_info.get('length', 0) > s_info.get('length', 0):
+                            # Airplane detection is longer — keep airplane,
+                            # remove the satellite (rare case)
+                            merged_satellite_infos = [
+                                s for s in merged_satellite_infos if s is not s_info]
+                        # else: satellite is longer or equal — drop airplane
+                        is_dup = True
+                        break
+                if not is_dup:
+                    keep_airplanes.append(a_info)
+            merged_airplane_infos = keep_airplanes
 
         # ── Enrich detections ───────────────────────────────────────
         frame_width = frame.shape[1]
@@ -8961,6 +9499,16 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     if fov_degrees:
         print(f"Field of view: {fov_degrees}°")
 
+    # ── Temporal detection tracker (Radon pipeline only) ──────────
+    # Filters out single-frame noise and builds tracklets across frames.
+    # Runs post-detection in the main process — works with both sequential
+    # and parallel modes.
+    detection_tracker = None
+    if algorithm == 'radon':
+        detection_tracker = DetectionTracker(
+            window=4, min_hits=2, angle_thresh=10, dist_thresh=30)
+        print("Temporal detection tracker: active (window=4, min_hits=2)")
+
     frame_count = 0
     satellites_detected = 0
     airplanes_detected = 0
@@ -9140,6 +9688,12 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         elif detect_type == 'airplanes':
             detected_trails = [(t, b) for t, b in detected_trails if t == 'airplane']
         # If detect_type == 'both', no filtering needed
+
+        # Apply temporal consistency filter (Radon pipeline only).
+        # Requires detections to appear in multiple recent frames to confirm,
+        # suppressing single-frame noise.  Also builds tracklets.
+        if detection_tracker is not None:
+            detected_trails = detection_tracker.update(fc, detected_trails)
 
         # Collect detections for HITL review mode
         # fc is 1-based frame_count; store as 0-based index for cap.set()
