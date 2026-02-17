@@ -56,6 +56,12 @@ try:
 except Exception:
     _HAS_CUDA = False
 
+# CUDA median filter availability (requires OpenCV contrib with CUDA support)
+try:
+    _HAS_CUDA_MEDIAN = _HAS_CUDA and hasattr(cv2.cuda, 'createMedianFilter')
+except Exception:
+    _HAS_CUDA_MEDIAN = False
+
 
 def show_preprocessing_preview(video_path, initial_params=None):
     """
@@ -1093,6 +1099,900 @@ def show_preprocessing_preview(video_path, initial_params=None):
         # Check if window was closed
         if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
             print("Preview window closed. Using default parameters.")
+            cap.release()
+            return None
+
+    cap.release()
+    return None
+
+
+def show_radon_preview(video_path, initial_params=None):
+    """Show an interactive preview window for debugging the Radon detection pipeline.
+
+    Uses the same dark-grey/fluorescent-accent theme as the preprocessing preview.
+    All controls — including custom-drawn sliders — live inside a single window.
+    Two-row layout: top row has the Original frame with a parameter sidebar;
+    bottom row has four diagnostic panels (Residual, Sinogram, LSD Lines,
+    Detections) showing the key intermediate stages of the Radon pipeline.
+
+    The six sliders control the most impactful Radon pipeline parameters:
+      - Radon SNR threshold (sinogram peak detection sensitivity)
+      - PCF Ratio (perpendicular cross-filter strictness)
+      - Star Mask sigma (star removal aggressiveness)
+      - LSD Significance (LSD detection strictness via log_eps)
+      - PCF Kernel (PCF sampling half-width)
+      - Min Length (minimum streak length in pixels)
+
+    Controls:
+    - Use Frame slider to navigate to a frame containing trail signal
+    - Click and drag sliders in the sidebar to adjust parameters
+    - Press SPACE or ENTER to accept current settings
+    - Press ESC to cancel and use default settings
+    - Press 'R' to reset to default values
+    - Press 'N' to jump forward 1 second
+    - Press 'P' to jump back 1 second
+
+    Args:
+        video_path: Path to the input video file
+        initial_params: Optional dict with initial parameter values
+
+    Returns:
+        Dict with selected Radon parameters, or None if cancelled.
+    """
+
+    # ── Theme colours (BGR) — shared with preprocessing preview ─────
+    BG_DARK = (30, 30, 30)
+    BG_PANEL = (42, 42, 42)
+    BG_SIDEBAR = (36, 36, 36)
+    BORDER = (58, 58, 58)
+    TEXT_PRIMARY = (210, 210, 210)
+    TEXT_DIM = (120, 120, 120)
+    TEXT_HEADING = (180, 180, 180)
+    ACCENT = (200, 255, 80)           # Fluorescent green-yellow
+    ACCENT_DIM = (100, 170, 50)
+    SLIDER_TRACK = (50, 50, 50)
+    SLIDER_FILL = (200, 255, 80)
+    SLIDER_THUMB = (240, 255, 160)
+
+    # Panel-specific accent colours
+    ACCENT_RESIDUAL = (200, 180, 60)      # Teal for residual panel
+    ACCENT_RESIDUAL_STAR = (60, 60, 180)  # Dim red for star mask overlay
+    ACCENT_SINOGRAM = (50, 160, 255)      # Amber/orange for sinogram
+    ACCENT_SINOGRAM_PEAK = (50, 255, 255) # Bright yellow for peaks
+    ACCENT_LSD = (80, 255, 120)           # Green-yellow for LSD lines
+    ACCENT_DET_RADON = (50, 180, 255)     # Amber for raw Radon candidates
+    ACCENT_DET_PCF = (80, 255, 80)        # Bright green for PCF-confirmed
+    ACCENT_DET_REJECT = (80, 80, 140)     # Dim red for rejected
+
+    # Default parameters (stored as ints for slider precision)
+    defaults = {
+        'radon_snr_threshold': 30,    # ÷10 → 3.0
+        'pcf_ratio_threshold': 20,    # ÷10 → 2.0
+        'star_mask_sigma': 50,        # ÷10 → 5.0
+        'lsd_log_eps': 10,            # ÷10 → 1.0 (range -2.0 to 5.0, stored +20 offset: 0–70)
+        'pcf_kernel_len': 31,         # odd int
+        'min_streak_length': 50,      # int pixels
+    }
+    # lsd_log_eps uses offset encoding: stored = (real + 2.0) * 10
+    # So stored 0 → real -2.0, stored 10 → real -1.0, stored 30 → real 1.0
+    defaults['lsd_log_eps'] = 30      # (1.0 + 2.0) * 10 = 30
+
+    if initial_params:
+        for key in defaults:
+            if key in initial_params:
+                defaults[key] = initial_params[key]
+
+    # Open video
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        print(f"Error: Could not open video for Radon preview: {video_path}")
+        return None
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    # Start at 10% into the video
+    current_frame_idx = max(0, int(total_frames * 0.1))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_idx)
+
+    ret, frame = cap.read()
+    if not ret:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ret, frame = cap.read()
+        current_frame_idx = 0
+        if not ret:
+            print("Error: Could not read any frame from video")
+            cap.release()
+            return None
+
+    src_h, src_w = frame.shape[:2]
+
+    # ── Slider definitions ──────────────────────────────────────────
+    frame_v_min = 0
+    frame_v_max = max(1, total_frames - 1)
+    slider_defs = [
+        ('radon_snr_threshold', 'Radon SNR',  lambda v: f"{v/10:.1f}", 10, 80),
+        ('pcf_ratio_threshold', 'PCF Ratio',   lambda v: f"{v/10:.1f}", 5, 50),
+        ('star_mask_sigma',     'Star Mask σ', lambda v: f"{v/10:.1f}", 20, 100),
+        ('lsd_log_eps',         'LSD Signif.', lambda v: f"{(v - 20)/10:.1f}", 0, 70),
+        ('pcf_kernel_len',      'PCF Kernel',  lambda v: f"{v if v%2==1 else v+1}", 5, 81),
+        ('min_streak_length',   'Min Length',  lambda v: f"{v}px", 10, 200),
+    ]
+
+    params = defaults.copy()
+    params['frame_idx'] = current_frame_idx
+
+    # ── Detect screen size ──────────────────────────────────────────
+    _screen_w, _screen_h = 1920, 1080
+    try:
+        import subprocess as _sp
+        _xdpy = _sp.run(['xdpyinfo'], capture_output=True, text=True, timeout=2)
+        for _line in _xdpy.stdout.split('\n'):
+            if 'dimensions:' in _line:
+                _sw, _sh = _line.split()[1].split('x')
+                _screen_w, _screen_h = int(_sw), int(_sh)
+                break
+    except Exception:
+        try:
+            import subprocess as _sp
+            _xr = _sp.run(['xrandr', '--current'], capture_output=True, text=True, timeout=2)
+            for _line in _xr.stdout.split('\n'):
+                if ' connected ' in _line and 'x' in _line:
+                    import re as _re
+                    _m = _re.search(r'(\d{3,5})x(\d{3,5})', _line)
+                    if _m:
+                        _screen_w, _screen_h = int(_m.group(1)), int(_m.group(2))
+                        break
+        except Exception:
+            pass
+
+    # ── Layout constants (two-row design) ───────────────────────────
+    sidebar_w = max(280, min(380, int(_screen_w * 0.18)))
+    status_bar_h = 56
+    gap = 2
+
+    orig_w = src_w
+    orig_h = src_h
+    _max_orig_w = _screen_w - sidebar_w - 40
+    _max_orig_h = int((_screen_h - status_bar_h - gap - 60) / 1.3)
+    _fit_scale = min(1.0, _max_orig_w / orig_w, _max_orig_h / orig_h)
+    if _fit_scale < 1.0:
+        orig_w = int(orig_w * _fit_scale)
+        orig_h = int(orig_h * _fit_scale)
+
+    # Bottom row: 4 panels side-by-side
+    bottom_h = int(orig_h * 0.3)
+    small_w = (orig_w + sidebar_w - 3 * gap) // 4
+    small_h = bottom_h
+    canvas_w = orig_w + sidebar_w
+    canvas_h = orig_h + gap + bottom_h + status_bar_h
+    slider_row_h = 52
+    slider_pad_x = 20
+    slider_track_h = 5
+    slider_thumb_r = 8
+    slider_section_top = 72
+
+    # Mutable state for mouse interaction
+    dragging = {'idx': -1}
+    slider_regions = []
+    mouse_pos = [0, 0]
+
+    # ── Window setup ────────────────────────────────────────────────
+    window_name = "Mnemosky  -  Radon Pipeline Debug"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    # ── Helper drawing functions ────────────────────────────────────
+
+    def _fill_rect(img, x, y, w, h, color):
+        cv2.rectangle(img, (x, y), (x + w, y + h), color, -1)
+
+    def _draw_border(img, x, y, w, h, color, thickness=1):
+        cv2.rectangle(img, (x, y), (x + w - 1, y + h - 1), color, thickness)
+
+    def _put_text(img, text, x, y, color, scale=0.42, thickness=1):
+        cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    scale, color, thickness, cv2.LINE_AA)
+
+    def _draw_tag(img, text, x, y, bg_color, text_color, scale=0.38):
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+        pad_x, pad_y = 6, 4
+        _fill_rect(img, x, y - th - pad_y, tw + pad_x * 2, th + pad_y * 2, bg_color)
+        _put_text(img, text, x + pad_x, y - 1, text_color, scale)
+
+    # ── Radon pipeline computation ──────────────────────────────────
+
+    # Cache for expensive Radon computation
+    _radon_cache = {
+        'key': None,
+        'residual': None, 'star_mask': None,
+        'sinogram_vis': None, 'peak_coords': None,
+        'lsd_segments': None, 'lsd_enhanced': None,
+        'radon_candidates': None, 'pcf_confirmed': None,
+        'pcf_rejected': None,
+    }
+
+    def compute_radon_pipeline(gray_frm, p):
+        """Run the full Radon pipeline and cache intermediate results."""
+        cache_key = (
+            current_frame_idx,
+            p['radon_snr_threshold'], p['pcf_ratio_threshold'],
+            p['star_mask_sigma'], p['lsd_log_eps'],
+            p['pcf_kernel_len'], p['min_streak_length'],
+        )
+        if _radon_cache['key'] == cache_key:
+            return
+
+        h, w = gray_frm.shape
+        snr_thresh = p['radon_snr_threshold'] / 10.0
+        pcf_ratio = p['pcf_ratio_threshold'] / 10.0
+        star_sigma = p['star_mask_sigma'] / 10.0
+        lsd_eps = (p['lsd_log_eps'] - 20) / 10.0
+        pcf_kern = p['pcf_kernel_len']
+        if pcf_kern % 2 == 0:
+            pcf_kern += 1
+        min_len = p['min_streak_length']
+
+        # ── Background subtraction & noise ──────────────────────────
+        bg_kernel = min(51, max(3, min(h, w) // 8))
+        if bg_kernel % 2 == 0:
+            bg_kernel += 1
+        bg = cv2.medianBlur(gray_frm, bg_kernel).astype(np.float64)
+        residual = gray_frm.astype(np.float64) - bg
+        flat = residual.ravel()
+        mad = np.median(np.abs(flat - np.median(flat)))
+        noise_sigma = max(0.5, mad * 1.4826)
+
+        # ── Star masking (tunable sigma) ────────────────────────────
+        high_thresh = star_sigma * noise_sigma
+        star_mask_raw = residual > high_thresh
+        dilate_size = max(5, int(noise_sigma * 3))
+        if dilate_size % 2 == 0:
+            dilate_size += 1
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (dilate_size, dilate_size))
+        star_mask = cv2.dilate(
+            star_mask_raw.astype(np.uint8), kernel).astype(bool)
+        cleaned = residual.copy()
+        cleaned[star_mask] = 0.0
+
+        # ── Downsample for Radon ────────────────────────────────────
+        max_area = 250000
+        current_area = h * w
+        r_scale = min(1.0, np.sqrt(max_area / max(1, current_area)))
+        small_h_r = max(64, int(h * r_scale))
+        small_w_r = max(64, int(w * r_scale))
+        small_cleaned = cv2.resize(
+            cleaned.astype(np.float32), (small_w_r, small_h_r),
+            interpolation=cv2.INTER_AREA).astype(np.float64)
+        small_noise = noise_sigma * r_scale
+
+        # ── Radon transform ─────────────────────────────────────────
+        num_angles = 90
+        diag = int(np.ceil(np.sqrt(small_h_r**2 + small_w_r**2)))
+        pad_h_r = (diag - small_h_r) // 2
+        pad_w_r = (diag - small_w_r) // 2
+        padded = np.zeros((diag, diag), dtype=np.float32)
+        padded[pad_h_r:pad_h_r + small_h_r,
+               pad_w_r:pad_w_r + small_w_r] = small_cleaned.astype(np.float32)
+
+        angles = np.linspace(0, 180, num_angles, endpoint=False)
+        sinogram = np.zeros((diag, num_angles), dtype=np.float32)
+        center = (diag / 2.0, diag / 2.0)
+
+        for i, theta in enumerate(angles):
+            M = cv2.getRotationMatrix2D(center, -theta, 1.0)
+            rotated = cv2.warpAffine(
+                padded, M, (diag, diag),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            sinogram[:, i] = np.sum(rotated, axis=0)
+        sinogram = sinogram.astype(np.float64)
+
+        # SNR normalisation
+        n_pixels = max(1.0, float(min(small_h_r, small_w_r)))
+        noise_per_proj = small_noise * np.sqrt(n_pixels)
+        snr_sinogram = sinogram / max(1e-10, noise_per_proj)
+
+        # Baseline removal
+        blur_k_s = min(51, max(3, diag // 10))
+        if blur_k_s % 2 == 0:
+            blur_k_s += 1
+        baseline = cv2.GaussianBlur(
+            snr_sinogram.astype(np.float32),
+            (blur_k_s, 1), 0).astype(np.float64)
+        snr_sinogram = snr_sinogram - baseline
+
+        # Peak finding
+        peak_mask_arr = snr_sinogram > snr_thresh
+        peak_coords_list = []
+        radon_candidates = []
+
+        if np.any(peak_mask_arr):
+            if _HAS_SCIPY:
+                local_max = _scipy_maximum_filter(snr_sinogram, size=(5, 5))
+            else:
+                kern_nms = np.ones((5, 5), dtype=np.uint8)
+                local_max = cv2.dilate(
+                    snr_sinogram.astype(np.float32),
+                    kern_nms).astype(np.float64)
+            peaks = peak_mask_arr & (snr_sinogram == local_max)
+            pc = np.argwhere(peaks)
+            if len(pc) > 0:
+                peak_snrs = np.array(
+                    [snr_sinogram[r, c] for r, c in pc])
+                order = np.argsort(peak_snrs)[::-1][:20]
+                pc = pc[order]
+                peak_snrs = peak_snrs[order]
+                peak_coords_list = list(pc)
+
+                # Convert peaks to line segments
+                center_offset = diag / 2.0
+                for idx_p, (off_idx, ang_idx) in enumerate(pc):
+                    theta_p = angles[ang_idx]
+                    offset = float(off_idx) - center_offset
+                    snr_val = peak_snrs[idx_p]
+                    theta_rad = np.radians(theta_p)
+                    cos_t = np.cos(theta_rad)
+                    sin_t = np.sin(theta_rad)
+                    cx = offset * cos_t
+                    cy = offset * sin_t
+                    col_profile = snr_sinogram[:, ang_idx]
+                    half_max = snr_val / 2.0
+                    streak_len_est = float(np.sum(col_profile >= half_max))
+                    if streak_len_est < max(10, int(min_len * r_scale * 0.5)):
+                        continue
+                    half_len = streak_len_est / 2.0
+                    x1 = cx - half_len * (-sin_t)
+                    y1 = cy - half_len * cos_t
+                    x2 = cx + half_len * (-sin_t)
+                    y2 = cy + half_len * cos_t
+                    x1 -= pad_w_r
+                    y1 -= pad_h_r
+                    x2 -= pad_w_r
+                    y2 -= pad_h_r
+                    # Scale back to full resolution
+                    x1_f = np.clip(x1 / r_scale, 0, w - 1)
+                    y1_f = np.clip(y1 / r_scale, 0, h - 1)
+                    x2_f = np.clip(x2 / r_scale, 0, w - 1)
+                    y2_f = np.clip(y2 / r_scale, 0, h - 1)
+                    seg_len = np.sqrt(
+                        (x2_f - x1_f)**2 + (y2_f - y1_f)**2)
+                    if seg_len >= min_len:
+                        radon_candidates.append(
+                            (float(x1_f), float(y1_f),
+                             float(x2_f), float(y2_f), snr_val))
+
+        # ── PCF filtering ───────────────────────────────────────────
+        half_w_pcf = pcf_kern // 2
+        pcf_confirmed = []
+        pcf_rejected = []
+        for x1, y1, x2, y2, score in radon_candidates:
+            dx = x2 - x1
+            dy = y2 - y1
+            length = np.sqrt(dx * dx + dy * dy)
+            if length < 5:
+                pcf_rejected.append((x1, y1, x2, y2, score))
+                continue
+            ux, uy = dx / length, dy / length
+            nx, ny = -uy, ux
+            num_samples = max(5, min(20, int(length / 10)))
+            par_sum = 0.0
+            perp_sum = 0.0
+            count = 0
+            for i_s in range(num_samples):
+                t = (i_s + 1) / (num_samples + 1)
+                cx_s = x1 + t * dx
+                cy_s = y1 + t * dy
+                par_val = 0.0
+                par_n = 0
+                for d in range(-half_w_pcf, half_w_pcf + 1):
+                    px = int(round(cx_s + d * ux))
+                    py = int(round(cy_s + d * uy))
+                    if 0 <= py < h and 0 <= px < w:
+                        par_val += cleaned[py, px]
+                        par_n += 1
+                perp_val = 0.0
+                perp_n = 0
+                for d in range(-half_w_pcf, half_w_pcf + 1):
+                    px = int(round(cx_s + d * nx))
+                    py = int(round(cy_s + d * ny))
+                    if 0 <= py < h and 0 <= px < w:
+                        perp_val += cleaned[py, px]
+                        perp_n += 1
+                if par_n > 0 and perp_n > 0:
+                    par_sum += par_val / par_n
+                    perp_sum += perp_val / perp_n
+                    count += 1
+            if count == 0:
+                pcf_rejected.append((x1, y1, x2, y2, score))
+                continue
+            mean_par = par_sum / count
+            mean_perp = perp_sum / count
+            ratio = mean_perp / (abs(mean_par) + 1e-10)
+            if ratio >= pcf_ratio:
+                pcf_confirmed.append((x1, y1, x2, y2, score))
+            else:
+                pcf_rejected.append((x1, y1, x2, y2, score))
+
+        # ── LSD detection ───────────────────────────────────────────
+        lsd_segments = []
+        lsd_enhanced = gray_frm.copy()
+        if hasattr(cv2, 'createLineSegmentDetector'):
+            clahe_lsd = cv2.createCLAHE(clipLimit=8.0, tileGridSize=(6, 6))
+            lsd_enhanced = clahe_lsd.apply(gray_frm)
+            lsd = cv2.createLineSegmentDetector(
+                refine=cv2.LSD_REFINE_ADV,
+                scale=0.8, sigma_scale=0.6, quant=2.0,
+                ang_th=22.5, log_eps=lsd_eps,
+                density_th=0.5, n_bins=1024)
+            lines, widths, precisions, nfas = lsd.detect(lsd_enhanced)
+            if lines is not None:
+                for i_l, line in enumerate(lines):
+                    lx1, ly1, lx2, ly2 = line[0]
+                    ll = np.sqrt((lx2 - lx1)**2 + (ly2 - ly1)**2)
+                    if ll >= min_len * 0.6:
+                        nfa_val = nfas[i_l][0] if nfas is not None else 0.0
+                        lsd_segments.append(
+                            (float(lx1), float(ly1),
+                             float(lx2), float(ly2), nfa_val))
+                lsd_segments.sort(key=lambda r: r[4])
+
+        # ── Build sinogram visualisation ────────────────────────────
+        sino_vis = np.zeros(
+            (snr_sinogram.shape[0], snr_sinogram.shape[1], 3),
+            dtype=np.uint8)
+        sino_vis[:] = BG_PANEL
+        # Normalise SNR sinogram for display
+        s_max = max(snr_thresh * 2, np.max(snr_sinogram)) if snr_sinogram.size > 0 else 1.0
+        has_signal_s = snr_sinogram > 1.0
+        below_s = has_signal_s & (snr_sinogram < snr_thresh)
+        above_s = snr_sinogram >= snr_thresh
+
+        _bg_arr = np.array(BG_PANEL, dtype=np.float32)
+        _dim_s = np.array(ACCENT_SINOGRAM, dtype=np.float32) * 0.4
+        _bright_s = np.array(ACCENT_SINOGRAM, dtype=np.float32)
+
+        if np.any(below_s):
+            intensity = np.clip(
+                snr_sinogram[below_s] / snr_thresh, 0, 1)
+            blend = _bg_arr + (_dim_s - _bg_arr) * intensity[:, np.newaxis]
+            sino_vis[below_s] = np.clip(blend, 0, 255).astype(np.uint8)
+        if np.any(above_s):
+            intensity = np.clip(
+                snr_sinogram[above_s] / s_max, 0.3, 1)
+            blend = _dim_s + (_bright_s - _dim_s) * intensity[:, np.newaxis]
+            sino_vis[above_s] = np.clip(blend, 0, 255).astype(np.uint8)
+
+        # Store results in cache
+        _radon_cache['key'] = cache_key
+        _radon_cache['residual'] = cleaned
+        _radon_cache['star_mask'] = star_mask
+        _radon_cache['sinogram_vis'] = sino_vis
+        _radon_cache['peak_coords'] = peak_coords_list
+        _radon_cache['lsd_segments'] = lsd_segments
+        _radon_cache['lsd_enhanced'] = lsd_enhanced
+        _radon_cache['radon_candidates'] = radon_candidates
+        _radon_cache['pcf_confirmed'] = pcf_confirmed
+        _radon_cache['pcf_rejected'] = pcf_rejected
+
+    # ── Composite display builder ───────────────────────────────────
+
+    def create_display(frm, gray_frm, p):
+        nonlocal slider_regions
+
+        canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+        canvas[:] = BG_DARK
+
+        # ── Run pipeline ────────────────────────────────────────────
+        compute_radon_pipeline(gray_frm, p)
+
+        # ── Top row: Original panel ─────────────────────────────────
+        orig_panel = cv2.resize(frm, (orig_w, orig_h))
+        canvas[0:orig_h, 0:orig_w] = orig_panel
+        _draw_border(canvas, 0, 0, orig_w, orig_h, BORDER)
+
+        bot_y = orig_h + gap
+
+        # ── Panel 1: Residual (star-cleaned) ────────────────────────
+        res = _radon_cache['residual']
+        smask = _radon_cache['star_mask']
+        # Normalise residual for display
+        r_abs = np.abs(res)
+        r_max = max(1.0, np.percentile(r_abs, 99.5))
+        res_norm = np.clip(r_abs / r_max, 0, 1)
+        res_bgr = np.zeros((res.shape[0], res.shape[1], 3), dtype=np.uint8)
+        # Teal tint
+        res_bgr[:, :, 0] = (res_norm * ACCENT_RESIDUAL[0]).astype(np.uint8)
+        res_bgr[:, :, 1] = (res_norm * ACCENT_RESIDUAL[1]).astype(np.uint8)
+        res_bgr[:, :, 2] = (res_norm * ACCENT_RESIDUAL[2]).astype(np.uint8)
+        # Overlay star mask
+        if smask is not None:
+            res_bgr[smask] = ACCENT_RESIDUAL_STAR
+        res_panel = cv2.resize(res_bgr, (small_w, small_h))
+
+        # ── Panel 2: Sinogram ───────────────────────────────────────
+        sino_vis = _radon_cache['sinogram_vis']
+        sino_panel = cv2.resize(sino_vis, (small_w, small_h),
+                                interpolation=cv2.INTER_NEAREST)
+        # Mark peaks
+        if _radon_cache['peak_coords']:
+            sino_h_orig, sino_w_orig = sino_vis.shape[:2]
+            for pc in _radon_cache['peak_coords']:
+                py_s = int(pc[0] * small_h / sino_h_orig)
+                px_s = int(pc[1] * small_w / sino_w_orig)
+                cv2.circle(sino_panel, (px_s, py_s), 4,
+                           ACCENT_SINOGRAM_PEAK, 1, cv2.LINE_AA)
+                cv2.circle(sino_panel, (px_s, py_s), 1,
+                           ACCENT_SINOGRAM_PEAK, -1)
+
+        # ── Panel 3: LSD Lines ──────────────────────────────────────
+        lsd_enh = _radon_cache['lsd_enhanced']
+        lsd_bgr = cv2.cvtColor(
+            cv2.resize(lsd_enh, (small_w, small_h)), cv2.COLOR_GRAY2BGR)
+        # Dim the background slightly
+        lsd_bgr = (lsd_bgr.astype(np.float32) * 0.5).astype(np.uint8)
+        lsd_scale_x = small_w / src_w
+        lsd_scale_y = small_h / src_h
+        for lx1, ly1, lx2, ly2, _ in _radon_cache['lsd_segments'][:30]:
+            pt1 = (int(lx1 * lsd_scale_x), int(ly1 * lsd_scale_y))
+            pt2 = (int(lx2 * lsd_scale_x), int(ly2 * lsd_scale_y))
+            cv2.line(lsd_bgr, pt1, pt2, ACCENT_LSD, 2, cv2.LINE_AA)
+
+        # ── Panel 4: Detections (Radon + PCF overlay on original) ───
+        det_bgr = cv2.resize(frm, (small_w, small_h))
+        det_bgr = (det_bgr.astype(np.float32) * 0.4).astype(np.uint8)
+        det_scale_x = small_w / src_w
+        det_scale_y = small_h / src_h
+
+        # Rejected candidates (dim red dashes)
+        for x1, y1, x2, y2, _ in _radon_cache['pcf_rejected']:
+            pt1 = (int(x1 * det_scale_x), int(y1 * det_scale_y))
+            pt2 = (int(x2 * det_scale_x), int(y2 * det_scale_y))
+            # Dashed line effect: draw short segments
+            dx = pt2[0] - pt1[0]
+            dy = pt2[1] - pt1[1]
+            seg_l = max(1, int(np.sqrt(dx*dx + dy*dy)))
+            for d in range(0, seg_l, 8):
+                t1 = d / seg_l
+                t2 = min((d + 4) / seg_l, 1.0)
+                sp = (int(pt1[0] + t1 * dx), int(pt1[1] + t1 * dy))
+                ep = (int(pt1[0] + t2 * dx), int(pt1[1] + t2 * dy))
+                cv2.line(det_bgr, sp, ep, ACCENT_DET_REJECT, 1, cv2.LINE_AA)
+
+        # Raw Radon candidates (amber, thin)
+        for x1, y1, x2, y2, _ in _radon_cache['radon_candidates']:
+            pt1 = (int(x1 * det_scale_x), int(y1 * det_scale_y))
+            pt2 = (int(x2 * det_scale_x), int(y2 * det_scale_y))
+            cv2.line(det_bgr, pt1, pt2, ACCENT_DET_RADON, 1, cv2.LINE_AA)
+
+        # PCF-confirmed (bright green, thick)
+        for x1, y1, x2, y2, _ in _radon_cache['pcf_confirmed']:
+            pt1 = (int(x1 * det_scale_x), int(y1 * det_scale_y))
+            pt2 = (int(x2 * det_scale_x), int(y2 * det_scale_y))
+            cv2.line(det_bgr, pt1, pt2, ACCENT_DET_PCF, 2, cv2.LINE_AA)
+
+        # ── Place 4 bottom panels ───────────────────────────────────
+        for px, py, pw, ph, panel in [
+            (0, bot_y, small_w, small_h, res_panel),
+            (small_w + gap, bot_y, small_w, small_h, sino_panel),
+            (2 * (small_w + gap), bot_y, small_w, small_h, lsd_bgr),
+            (3 * (small_w + gap), bot_y, small_w, small_h, det_bgr),
+        ]:
+            # Ensure panel fits the target region
+            ph_actual = min(ph, panel.shape[0])
+            pw_actual = min(pw, panel.shape[1])
+            canvas[py:py + ph_actual, px:px + pw_actual] = \
+                panel[:ph_actual, :pw_actual]
+            _draw_border(canvas, px, py, pw, ph, BORDER)
+
+        # ── Panel tags ──────────────────────────────────────────────
+        tag_y_off, tag_x_off = 18, 8
+        _draw_tag(canvas, "ORIGINAL", tag_x_off, tag_y_off,
+                  BG_DARK, TEXT_DIM)
+
+        n_stars = int(np.sum(_radon_cache['star_mask'])) if _radon_cache['star_mask'] is not None else 0
+        star_pct = n_stars / max(1, src_h * src_w) * 100
+        _draw_tag(canvas,
+                  f"RESIDUAL  stars {star_pct:.1f}%",
+                  tag_x_off, bot_y + tag_y_off, BG_DARK, ACCENT_RESIDUAL)
+
+        n_peaks = len(_radon_cache['peak_coords'])
+        snr_v = p['radon_snr_threshold'] / 10.0
+        _draw_tag(canvas,
+                  f"SINOGRAM  SNR>={snr_v:.1f}  [{n_peaks}]",
+                  small_w + gap + tag_x_off, bot_y + tag_y_off,
+                  BG_DARK, ACCENT_SINOGRAM)
+
+        n_lsd = len(_radon_cache['lsd_segments'])
+        eps_v = (p['lsd_log_eps'] - 20) / 10.0
+        _draw_tag(canvas,
+                  f"LSD  eps={eps_v:.1f}  [{n_lsd}]",
+                  2 * (small_w + gap) + tag_x_off, bot_y + tag_y_off,
+                  BG_DARK, ACCENT_LSD)
+
+        n_conf = len(_radon_cache['pcf_confirmed'])
+        n_rej = len(_radon_cache['pcf_rejected'])
+        _draw_tag(canvas,
+                  f"DETECTIONS  {n_conf} ok  {n_rej} rej",
+                  3 * (small_w + gap) + tag_x_off, bot_y + tag_y_off,
+                  BG_DARK, ACCENT_DET_PCF)
+
+        # ── Sidebar ─────────────────────────────────────────────────
+        sb_x = orig_w
+        _fill_rect(canvas, sb_x, 0, sidebar_w,
+                   canvas_h - status_bar_h, BG_SIDEBAR)
+        _draw_border(canvas, sb_x, 0, sidebar_w,
+                     canvas_h - status_bar_h, BORDER)
+
+        # Title
+        _put_text(canvas, "MNEMOSKY", sb_x + 14, 24, ACCENT, 0.52, 1)
+        _put_text(canvas, "Radon Debug", sb_x + 14, 46,
+                  TEXT_HEADING, 0.40)
+        cv2.line(canvas, (sb_x + 14, 56),
+                 (sb_x + sidebar_w - 14, 56), BORDER, 1)
+
+        # ── Draw sliders ────────────────────────────────────────────
+        new_regions = []
+        track_x_start = sb_x + slider_pad_x
+        track_x_end = sb_x + sidebar_w - slider_pad_x
+        track_width = track_x_end - track_x_start
+
+        for i, (key, label, fmt_fn, v_min, v_max) in enumerate(slider_defs):
+            row_y = slider_section_top + i * slider_row_h
+            val = p[key]
+            _put_text(canvas, label, track_x_start, row_y + 14,
+                      TEXT_DIM, 0.34)
+            _put_text(canvas, fmt_fn(val), track_x_end - 46,
+                      row_y + 14, ACCENT, 0.36, 1)
+            track_y = row_y + 28
+            _fill_rect(canvas, track_x_start,
+                       track_y - slider_track_h // 2,
+                       track_width, slider_track_h, SLIDER_TRACK)
+            ratio = (val - v_min) / max(1, v_max - v_min)
+            fill_w = int(track_width * ratio)
+            if fill_w > 0:
+                _fill_rect(canvas, track_x_start,
+                           track_y - slider_track_h // 2,
+                           fill_w, slider_track_h, SLIDER_FILL)
+            thumb_x = track_x_start + fill_w
+            cv2.circle(canvas, (thumb_x, track_y),
+                       slider_thumb_r, SLIDER_THUMB, -1)
+            cv2.circle(canvas, (thumb_x, track_y),
+                       slider_thumb_r, ACCENT, 1, cv2.LINE_AA)
+            new_regions.append(
+                (track_x_start, track_x_end, track_y,
+                 v_min, v_max, key))
+
+        # ── Pipeline stats section ──────────────────────────────────
+        stats_y = slider_section_top + len(slider_defs) * slider_row_h + 12
+        cv2.line(canvas, (sb_x + 14, stats_y - 6),
+                 (sb_x + sidebar_w - 14, stats_y - 6), BORDER, 1)
+        _put_text(canvas, "PIPELINE STATS", sb_x + 14,
+                  stats_y + 10, TEXT_HEADING, 0.36)
+        stats_y += 26
+        for label_s, val_s in [
+            ("Radon candidates", str(len(_radon_cache['radon_candidates']))),
+            ("PCF confirmed", str(len(_radon_cache['pcf_confirmed']))),
+            ("PCF rejected", str(len(_radon_cache['pcf_rejected']))),
+            ("LSD segments", str(len(_radon_cache['lsd_segments']))),
+            ("Sinogram peaks", str(len(_radon_cache['peak_coords']))),
+        ]:
+            _put_text(canvas, label_s, sb_x + 14, stats_y,
+                      TEXT_DIM, 0.30)
+            _put_text(canvas, val_s, sb_x + sidebar_w - 50,
+                      stats_y, ACCENT, 0.32, 1)
+            stats_y += 16
+        stats_y += 8
+
+        # ── Controls help ───────────────────────────────────────────
+        cv2.line(canvas, (sb_x + 14, stats_y - 6),
+                 (sb_x + sidebar_w - 14, stats_y - 6), BORDER, 1)
+        _put_text(canvas, "CONTROLS", sb_x + 14, stats_y + 10,
+                  TEXT_HEADING, 0.36)
+        stats_y += 26
+        for key_str, desc in [
+            ("SPACE / ENTER", "Accept"),
+            ("ESC", "Cancel"),
+            ("R", "Reset"),
+            ("N / P", "Next / Prev frame"),
+        ]:
+            _put_text(canvas, key_str, sb_x + 14, stats_y,
+                      ACCENT_DIM, 0.30)
+            _put_text(canvas, desc, sb_x + 126, stats_y,
+                      TEXT_DIM, 0.30)
+            stats_y += 16
+
+        # ── Status bar with frame slider ────────────────────────────
+        sb_y = canvas_h - status_bar_h
+        _fill_rect(canvas, 0, sb_y, canvas_w, status_bar_h, BG_PANEL)
+        cv2.line(canvas, (0, sb_y), (canvas_w, sb_y), BORDER, 1)
+
+        _put_text(canvas, f"Frame {current_frame_idx}/{total_frames}",
+                  12, sb_y + 16, TEXT_DIM, 0.36)
+        _put_text(canvas, f"{src_w}x{src_h}",
+                  canvas_w - 90, sb_y + 16, TEXT_DIM, 0.36)
+        cv2.circle(canvas, (canvas_w // 2, sb_y + 11), 4, ACCENT, -1)
+        _put_text(canvas, "RADON", canvas_w // 2 + 10, sb_y + 16,
+                  ACCENT_DIM, 0.33)
+
+        frame_track_pad = 14
+        frame_track_x0 = frame_track_pad
+        frame_track_x1 = canvas_w - frame_track_pad
+        frame_track_y = sb_y + 40
+        frame_track_w = frame_track_x1 - frame_track_x0
+
+        _fill_rect(canvas, frame_track_x0,
+                   frame_track_y - slider_track_h // 2,
+                   frame_track_w, slider_track_h, SLIDER_TRACK)
+        f_ratio = ((p['frame_idx'] - frame_v_min)
+                   / max(1, frame_v_max - frame_v_min))
+        f_fill_w = int(frame_track_w * f_ratio)
+        if f_fill_w > 0:
+            _fill_rect(canvas, frame_track_x0,
+                       frame_track_y - slider_track_h // 2,
+                       f_fill_w, slider_track_h, SLIDER_FILL)
+        f_thumb_x = frame_track_x0 + f_fill_w
+        cv2.circle(canvas, (f_thumb_x, frame_track_y),
+                   slider_thumb_r, SLIDER_THUMB, -1)
+        cv2.circle(canvas, (f_thumb_x, frame_track_y),
+                   slider_thumb_r, ACCENT, 1, cv2.LINE_AA)
+
+        new_regions.append(
+            (frame_track_x0, frame_track_x1, frame_track_y,
+             frame_v_min, frame_v_max, 'frame_idx'))
+
+        slider_regions = new_regions
+        return canvas
+
+    # ── Mouse callback ──────────────────────────────────────────────
+
+    def _update_slider_from_x(mouse_x, mouse_y):
+        for i, (x_start, x_end, y_center, v_min, v_max, key) in enumerate(slider_regions):
+            if (abs(mouse_y - y_center) < slider_row_h // 2
+                    and x_start - 4 <= mouse_x <= x_end + 4):
+                ratio = max(0.0, min(1.0,
+                    (mouse_x - x_start) / max(1, x_end - x_start)))
+                params[key] = int(round(v_min + ratio * (v_max - v_min)))
+                dragging['idx'] = i
+                return
+        dragging['idx'] = -1
+
+    def on_mouse(event, x, y, flags, userdata):
+        if event == cv2.EVENT_MOUSEMOVE:
+            mouse_pos[0] = x
+            mouse_pos[1] = y
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            _update_slider_from_x(x, y)
+        elif event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON):
+            if dragging['idx'] >= 0:
+                x_start, x_end, _, v_min, v_max, key = \
+                    slider_regions[dragging['idx']]
+                ratio = max(0.0, min(1.0,
+                    (x - x_start) / max(1, x_end - x_start)))
+                params[key] = int(round(v_min + ratio * (v_max - v_min)))
+        elif event == cv2.EVENT_LBUTTONUP:
+            dragging['idx'] = -1
+
+    cv2.setMouseCallback(window_name, on_mouse)
+
+    print("\n" + "=" * 60)
+    print("RADON PIPELINE DEBUG PREVIEW")
+    print("=" * 60)
+    print("Use the Frame slider to find a frame with satellite trail signal.")
+    print("Adjust sliders to tune the Radon detection pipeline parameters.")
+    print()
+    print("Bottom panels (left to right):")
+    print("  RESIDUAL  — Background-subtracted, star-cleaned image (teal)")
+    print("  SINOGRAM  — Radon SNR heatmap; peaks = detected streaks (amber)")
+    print("  LSD LINES — LSD line segments overlaid on enhanced frame (green)")
+    print("  DETECTIONS — Final results: green=PCF ok, amber=raw, red=rejected")
+    print()
+    print("Controls:")
+    print("  Click+drag   - Adjust sliders in the sidebar")
+    print("  SPACE/ENTER  - Accept current settings and continue")
+    print("  ESC          - Cancel and use default settings")
+    print("  R            - Reset to default values")
+    print("  N            - Jump forward 1 second")
+    print("  P            - Jump back 1 second")
+    print("=" * 60 + "\n")
+
+    first_render = True
+    _prev_cache_key = None
+    _cached_display = None
+
+    # ── Main loop ───────────────────────────────────────────────────
+    while True:
+        # Check if Frame slider was dragged
+        if params['frame_idx'] != current_frame_idx:
+            current_frame_idx = params['frame_idx']
+            cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_idx)
+            ret, new_frame = cap.read()
+            if ret:
+                frame = new_frame
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Dirty-flag: recompute only when parameters or frame change
+        cache_key = (
+            current_frame_idx,
+            params['radon_snr_threshold'], params['pcf_ratio_threshold'],
+            params['star_mask_sigma'], params['lsd_log_eps'],
+            params['pcf_kernel_len'], params['min_streak_length'],
+        )
+
+        needs_redraw = (cache_key != _prev_cache_key) or first_render
+
+        if needs_redraw:
+            _cached_display = create_display(frame, gray, params)
+            _prev_cache_key = cache_key
+
+            cv2.imshow(window_name, _cached_display)
+
+            if first_render:
+                cv2.resizeWindow(window_name, canvas_w, canvas_h)
+                first_render = False
+
+        key = cv2.waitKey(30) & 0xFF
+
+        if key == 27:  # ESC
+            print("Radon preview cancelled. Using default parameters.")
+            cv2.destroyWindow(window_name)
+            cap.release()
+            return None
+
+        elif key in [13, 32]:  # ENTER or SPACE
+            final_params = {
+                'radon_snr_threshold': params['radon_snr_threshold'] / 10.0,
+                'pcf_ratio_threshold': params['pcf_ratio_threshold'] / 10.0,
+                'star_mask_sigma': params['star_mask_sigma'] / 10.0,
+                'lsd_log_eps': (params['lsd_log_eps'] - 20) / 10.0,
+                'pcf_kernel_len': params['pcf_kernel_len'] if params['pcf_kernel_len'] % 2 == 1 else params['pcf_kernel_len'] + 1,
+                'min_streak_length': params['min_streak_length'],
+            }
+            print(f"\nAccepted Radon pipeline parameters:")
+            print(f"  Radon SNR threshold: {final_params['radon_snr_threshold']:.1f}")
+            print(f"  PCF ratio threshold: {final_params['pcf_ratio_threshold']:.1f}")
+            print(f"  Star mask sigma:     {final_params['star_mask_sigma']:.1f}")
+            print(f"  LSD log_eps:         {final_params['lsd_log_eps']:.1f}")
+            print(f"  PCF kernel length:   {final_params['pcf_kernel_len']}")
+            print(f"  Min streak length:   {final_params['min_streak_length']}px")
+            cv2.destroyWindow(window_name)
+            cap.release()
+            return final_params
+
+        elif key == ord('r') or key == ord('R'):
+            saved_frame_idx = params['frame_idx']
+            params = defaults.copy()
+            params['frame_idx'] = saved_frame_idx
+            _radon_cache['key'] = None
+            _prev_cache_key = None
+            print("Radon parameters reset to defaults.")
+
+        elif key == ord('n') or key == ord('N'):
+            current_frame_idx = min(total_frames - 1,
+                                    current_frame_idx + int(fps))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_idx)
+            ret, new_frame = cap.read()
+            if not ret:
+                current_frame_idx = 0
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, new_frame = cap.read()
+            if ret:
+                frame = new_frame
+                params['frame_idx'] = current_frame_idx
+
+        elif key == ord('p') or key == ord('P'):
+            current_frame_idx = max(0, current_frame_idx - int(fps))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_idx)
+            ret, new_frame = cap.read()
+            if ret:
+                frame = new_frame
+                params['frame_idx'] = current_frame_idx
+
+        # Check if window was closed
+        if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+            print("Radon preview window closed. Using default parameters.")
             cap.release()
             return None
 
@@ -5002,6 +5902,10 @@ class RadonStreakDetector(SatelliteTrailDetector):
         self.pcf_ratio_threshold = 2.0    # Parallel / perpendicular ratio
         self.pcf_kernel_length = 31       # Matched filter kernel length for PCF
 
+        # Overridable from Radon preview (default None = use hardcoded values)
+        self._star_mask_sigma = None      # Star mask threshold (default 5.0σ)
+        self._lsd_log_eps = None          # LSD significance (default 1.0)
+
         # Ground truth calibration profiles (must come after parameter defaults)
         self.gt_profiles = None
         if groundtruth_dir is not None:
@@ -5323,7 +6227,10 @@ class RadonStreakDetector(SatelliteTrailDetector):
         sinogram = np.zeros((diag, num_angles), dtype=np.float32)
         center = (diag / 2.0, diag / 2.0)
 
-        # GPU-accelerated path: upload padded image once
+        # GPU-accelerated path: upload padded image once, reduce on GPU
+        # to avoid downloading the full diag×diag rotated image per angle.
+        # cv2.cuda.reduce sums columns on-device, so we only download a
+        # 1×diag row per angle (~700× less data than the full image).
         if self._use_gpu:
             try:
                 gpu_padded = cv2.cuda_GpuMat()
@@ -5335,8 +6242,10 @@ class RadonStreakDetector(SatelliteTrailDetector):
                         flags=cv2.INTER_NEAREST,
                         borderMode=cv2.BORDER_CONSTANT,
                         borderValue=(0,))
-                    rotated = gpu_rotated.download()
-                    sinogram[:, i] = np.sum(rotated, axis=0)
+                    # Sum columns on GPU (axis 0 = reduce rows → 1×diag result)
+                    gpu_col_sum = cv2.cuda.reduce(
+                        gpu_rotated, 0, cv2.REDUCE_SUM, dtype=cv2.CV_32F)
+                    sinogram[:, i] = gpu_col_sum.download().ravel()
                 return sinogram.astype(np.float64), angles
             except Exception:
                 self._use_gpu = False
@@ -5483,9 +6392,9 @@ class RadonStreakDetector(SatelliteTrailDetector):
     def _perpendicular_cross_filter(self, residual, candidates, kernel_length=None):
         """Apply perpendicular cross filtering to reject false positives.
 
-        Uses local patch sampling (not full-frame filter2D) for speed.
-        For each candidate, samples brightness along the line direction
-        and perpendicular to it, then compares the mean responses.
+        Uses vectorized NumPy sampling for speed.  For each candidate,
+        samples brightness along the line direction and perpendicular to
+        it, then compares the mean responses.
 
         Args:
             residual: Background-subtracted float64 image
@@ -5499,8 +6408,14 @@ class RadonStreakDetector(SatelliteTrailDetector):
             kernel_length = self.pcf_kernel_length
         half_w = kernel_length // 2
 
+        if not candidates:
+            return []
+
         confirmed = []
         h, w = residual.shape
+
+        # Pre-compute the kernel offset array once (shared across candidates)
+        d_offsets = np.arange(-half_w, half_w + 1, dtype=np.float64)
 
         for x1, y1, x2, y2, score in candidates:
             dx = x2 - x1
@@ -5515,58 +6430,84 @@ class RadonStreakDetector(SatelliteTrailDetector):
 
             # Sample at several points along the trail
             num_samples = max(5, min(20, int(length / 10)))
-            par_sum = 0.0
-            perp_sum = 0.0
-            count = 0
 
-            for i in range(num_samples):
-                t = (i + 1) / (num_samples + 1)
-                cx = x1 + t * dx
-                cy = y1 + t * dy
+            # Vectorized: generate all sample center points at once
+            t_vals = np.arange(1, num_samples + 1, dtype=np.float64) / (num_samples + 1)
+            cx_arr = x1 + t_vals * dx  # (num_samples,)
+            cy_arr = y1 + t_vals * dy
 
-                # Parallel: average brightness along the trail direction (local)
-                par_val = 0.0
-                par_n = 0
-                for d in range(-half_w, half_w + 1):
-                    px = int(round(cx + d * ux))
-                    py = int(round(cy + d * uy))
-                    if 0 <= py < h and 0 <= px < w:
-                        par_val += residual[py, px]
-                        par_n += 1
+            # Parallel sampling coordinates: center + d * (ux, uy)
+            # Shape: (num_samples, kernel_size) via broadcasting
+            par_px = np.round(cx_arr[:, None] + d_offsets[None, :] * ux).astype(np.intp)
+            par_py = np.round(cy_arr[:, None] + d_offsets[None, :] * uy).astype(np.intp)
 
-                # Perpendicular: average brightness across the trail
-                perp_val = 0.0
-                perp_n = 0
-                for d in range(-half_w, half_w + 1):
-                    px = int(round(cx + d * nx))
-                    py = int(round(cy + d * ny))
-                    if 0 <= py < h and 0 <= px < w:
-                        perp_val += residual[py, px]
-                        perp_n += 1
+            # Perpendicular sampling coordinates: center + d * (nx, ny)
+            perp_px = np.round(cx_arr[:, None] + d_offsets[None, :] * nx).astype(np.intp)
+            perp_py = np.round(cy_arr[:, None] + d_offsets[None, :] * ny).astype(np.intp)
 
-                if par_n > 0 and perp_n > 0:
-                    par_sum += par_val / par_n
-                    perp_sum += perp_val / perp_n
-                    count += 1
+            # Bounds masks
+            par_valid = (par_py >= 0) & (par_py < h) & (par_px >= 0) & (par_px < w)
+            perp_valid = (perp_py >= 0) & (perp_py < h) & (perp_px >= 0) & (perp_px < w)
 
-            if count == 0:
+            # Clamp coordinates for safe indexing (invalid positions will be
+            # zeroed out via the mask)
+            par_py_c = np.clip(par_py, 0, h - 1)
+            par_px_c = np.clip(par_px, 0, w - 1)
+            perp_py_c = np.clip(perp_py, 0, h - 1)
+            perp_px_c = np.clip(perp_px, 0, w - 1)
+
+            # Fancy-index all values at once
+            par_vals = residual[par_py_c, par_px_c]   # (num_samples, kernel_size)
+            perp_vals = residual[perp_py_c, perp_px_c]
+            par_vals[~par_valid] = 0.0
+            perp_vals[~perp_valid] = 0.0
+
+            # Per-sample means (only counting valid pixels)
+            par_counts = par_valid.sum(axis=1)    # (num_samples,)
+            perp_counts = perp_valid.sum(axis=1)
+            both_valid = (par_counts > 0) & (perp_counts > 0)
+
+            if not np.any(both_valid):
                 continue
 
-            mean_par = par_sum / count
-            mean_perp = perp_sum / count
+            par_means = np.zeros(num_samples, dtype=np.float64)
+            perp_means = np.zeros(num_samples, dtype=np.float64)
+            par_means[both_valid] = par_vals[both_valid].sum(axis=1) / par_counts[both_valid]
+            perp_means[both_valid] = perp_vals[both_valid].sum(axis=1) / perp_counts[both_valid]
 
-            # Real streaks: perpendicular cross-section is peaked (high),
-            # parallel profile is also high.  Stars have similar response
-            # in both directions.  We want perp (across trail) to be
-            # significantly higher than par (along trail with offset).
-            # Actually for a streak, the perpendicular profile peaks at
-            # center and the parallel profile is flat — so we test if
-            # the perpendicular center value exceeds the parallel spread.
+            mean_par = par_means[both_valid].mean()
+            mean_perp = perp_means[both_valid].mean()
+
             ratio = mean_perp / (abs(mean_par) + 1e-10)
             if ratio >= self.pcf_ratio_threshold:
                 confirmed.append((x1, y1, x2, y2, score))
 
         return confirmed
+
+    # ── GPU-accelerated median blur ─────────────────────────────────
+
+    def _median_blur_gpu(self, gray_u8, kernel_size):
+        """Run medianBlur on GPU if available, otherwise fall back to CPU.
+
+        Args:
+            gray_u8: Grayscale uint8 image.
+            kernel_size: Odd kernel size for median filter.
+
+        Returns:
+            Median-blurred uint8 image.
+        """
+        if self._use_gpu and _HAS_CUDA_MEDIAN:
+            try:
+                gpu_img = cv2.cuda_GpuMat()
+                gpu_img.upload(gray_u8)
+                median_filter = cv2.cuda.createMedianFilter(
+                    gpu_img.type(), kernel_size)
+                gpu_result = median_filter.apply(gpu_img)
+                return gpu_result.download()
+            except Exception:
+                # Permanent fallback — disable for this instance
+                self._use_gpu = False
+        return cv2.medianBlur(gray_u8, kernel_size)
 
     # ── Dual-threshold star masking ─────────────────────────────────
 
@@ -5586,17 +6527,18 @@ class RadonStreakDetector(SatelliteTrailDetector):
         """
         img = gray_frame.astype(np.float64)
 
-        # Background estimation
+        # Background estimation (GPU-accelerated median blur when available)
         bg_kernel = min(51, max(3, min(img.shape) // 8))
         if bg_kernel % 2 == 0:
             bg_kernel += 1
-        bg = cv2.medianBlur(gray_frame.astype(np.uint8) if img.max() <= 255
-                            else np.clip(img, 0, 255).astype(np.uint8),
-                            bg_kernel).astype(np.float64)
+        gray_u8 = (gray_frame.astype(np.uint8) if img.max() <= 255
+                    else np.clip(img, 0, 255).astype(np.uint8))
+        bg = self._median_blur_gpu(gray_u8, bg_kernel).astype(np.float64)
         residual = img - bg
 
-        # High threshold: identify bright stars (5-sigma)
-        high_thresh = 5.0 * noise_sigma
+        # High threshold: identify bright stars (configurable sigma)
+        star_sigma = self._star_mask_sigma if self._star_mask_sigma is not None else 5.0
+        high_thresh = star_sigma * noise_sigma
         star_mask = residual > high_thresh
 
         # Dilate to cover halos and spikes
@@ -5655,7 +6597,7 @@ class RadonStreakDetector(SatelliteTrailDetector):
             bg_kernel = min(51, max(3, min(h, w) // 8))
             if bg_kernel % 2 == 0:
                 bg_kernel += 1
-            bg = cv2.medianBlur(gray, bg_kernel).astype(np.float64)
+            bg = self._median_blur_gpu(gray, bg_kernel).astype(np.float64)
             residual = gray.astype(np.float64) - bg
             flat = residual.ravel()
             mad = np.median(np.abs(flat - np.median(flat)))
@@ -5679,7 +6621,7 @@ class RadonStreakDetector(SatelliteTrailDetector):
         lsd_segments = self._detect_lines_lsd(
             enhanced,
             min_length=self.params.get('satellite_min_length', 50) * 0.6 * lsd_scale,
-            log_eps=1.0
+            log_eps=self._lsd_log_eps if self._lsd_log_eps is not None else 1.0
         )
 
         # Convert LSD results to HoughLinesP format, scaling back to full res
@@ -5837,12 +6779,28 @@ class RadonStreakDetector(SatelliteTrailDetector):
 
 # ── Multiprocessing worker for parallel frame detection ────────────────
 
+def _apply_radon_preview_params(detector, rp):
+    """Apply Radon preview parameters to a RadonStreakDetector instance."""
+    if 'radon_snr_threshold' in rp:
+        detector.radon_snr_threshold = rp['radon_snr_threshold']
+    if 'pcf_ratio_threshold' in rp:
+        detector.pcf_ratio_threshold = rp['pcf_ratio_threshold']
+    if 'pcf_kernel_len' in rp:
+        detector.pcf_kernel_length = rp['pcf_kernel_len']
+    if 'star_mask_sigma' in rp:
+        detector._star_mask_sigma = rp['star_mask_sigma']
+    if 'lsd_log_eps' in rp:
+        detector._lsd_log_eps = rp['lsd_log_eps']
+    if 'min_streak_length' in rp:
+        detector.params['satellite_min_length'] = rp['min_streak_length']
+
+
 _worker_detector = None
 
 
 def _worker_init(algorithm, sensitivity, preprocessing_params,
                  skip_aspect_ratio_check, signal_envelope, groundtruth_dir,
-                 use_gpu):
+                 use_gpu, radon_params=None):
     """Create a detector instance in each worker process."""
     global _worker_detector
     if algorithm == 'radon':
@@ -5851,6 +6809,8 @@ def _worker_init(algorithm, sensitivity, preprocessing_params,
             skip_aspect_ratio_check=skip_aspect_ratio_check,
             signal_envelope=signal_envelope,
             groundtruth_dir=groundtruth_dir)
+        if radon_params:
+            _apply_radon_preview_params(_worker_detector, radon_params)
     else:
         _worker_detector = SatelliteTrailDetector(
             sensitivity, preprocessing_params=preprocessing_params,
@@ -6645,7 +7605,7 @@ def export_dataset_from_annotations(input_path, annotations_path,
     exporter.finalize()
 
 
-def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=7, algorithm='default', groundtruth_dir=None, num_workers=0, no_gpu=False, review_mode=False, review_only=False, annotations_path=None, hitl_profile='default', auto_accept=0.9, no_learn=False, dataset_format='aabb', dataset_split=(0.7, 0.2, 0.1), dataset_skip=0, dataset_dedup=5, dataset_negatives=0.2, dataset_image_format='jpg', dataset_image_quality=95, dataset_dir_override=None):
+def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=7, algorithm='default', groundtruth_dir=None, num_workers=0, no_gpu=False, review_mode=False, review_only=False, annotations_path=None, hitl_profile='default', auto_accept=0.9, no_learn=False, dataset_format='aabb', dataset_split=(0.7, 0.2, 0.1), dataset_skip=0, dataset_dedup=5, dataset_negatives=0.2, dataset_image_format='jpg', dataset_image_quality=95, dataset_dir_override=None, radon_params=None):
     """
     Process video to detect and highlight satellite and airplane trails.
 
@@ -6784,6 +7744,8 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
             skip_aspect_ratio_check=skip_aspect_ratio_check,
             signal_envelope=signal_envelope,
             groundtruth_dir=groundtruth_dir)
+        if radon_params:
+            _apply_radon_preview_params(detector, radon_params)
         print(f"Algorithm: Radon + LSD + PCF (advanced)")
     else:
         detector = SatelliteTrailDetector(
@@ -6854,7 +7816,7 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
             initializer=_worker_init,
             initargs=(algorithm, sensitivity, preprocessing_params,
                       skip_aspect_ratio_check, signal_envelope,
-                      groundtruth_dir, use_gpu_workers))
+                      groundtruth_dir, use_gpu_workers, radon_params))
         pending = deque()  # (frame, frame_idx, AsyncResult)
         prefetch = num_workers * 2
         print(f"Parallel workers: {num_workers}" +
@@ -7516,13 +8478,19 @@ Notes:
     # Handle preprocessing preview if requested
     preprocessing_params = None
     signal_envelope = None
+    radon_preview_params = None
     if args.preview:
-        preprocessing_params = show_preprocessing_preview(args.input)
-        if preprocessing_params is None:
-            print("Using default preprocessing parameters.")
+        if args.algorithm == 'radon':
+            radon_preview_params = show_radon_preview(args.input)
+            if radon_preview_params is None:
+                print("Using default Radon pipeline parameters.")
         else:
-            # Extract signal envelope (if user marked trail examples)
-            signal_envelope = preprocessing_params.pop('signal_envelope', None)
+            preprocessing_params = show_preprocessing_preview(args.input)
+            if preprocessing_params is None:
+                print("Using default preprocessing parameters.")
+            else:
+                # Extract signal envelope (if user marked trail examples)
+                signal_envelope = preprocessing_params.pop('signal_envelope', None)
 
     # Load learned parameters profile if available
     if args.hitl_profile and not args.review and not args.review_only:
@@ -7589,6 +8557,7 @@ Notes:
         dataset_image_format=args.dataset_image_format,
         dataset_image_quality=args.dataset_image_quality,
         dataset_dir_override=args.dataset_dir,
+        radon_params=radon_preview_params,
     )
 
 

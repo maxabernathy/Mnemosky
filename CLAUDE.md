@@ -103,6 +103,7 @@ pip install scipy
 ### Key Functions
 
 - `show_preprocessing_preview()` - Interactive GUI for tuning preprocessing parameters (CLAHE, blur, Canny). Asymmetric layout: large Original panel (left column, ~58% width) + CLAHE/Blur/Edges stacked vertically (right column), sidebar with custom-drawn sliders and trail example thumbnails, full-width frame slider in status bar. Sleek dark-grey theme with fluorescent accent highlights (single window, no external trackbar window).
+- `show_radon_preview()` - Interactive GUI for tuning the Radon detection pipeline (Radon SNR, PCF ratio, star mask sigma, LSD significance, PCF kernel, min length). Same dark-grey/fluorescent theme. Four diagnostic panels: Residual (star-cleaned), Sinogram (SNR heatmap with peaks), LSD Lines, and Detections (PCF-confirmed vs rejected). Activated by `--preview` with `--algorithm radon`.
 - `_worker_init()` / `_worker_detect()` - Multiprocessing worker functions for parallel frame detection
 - `process_video()` - Main video processing pipeline (handles I/O, frame iteration, output, optional YOLO dataset export, parallel dispatch)
 - `main()` - CLI entry point with argument parsing
@@ -357,6 +358,9 @@ python satellite_trail_detector.py input.mp4 output.mp4 --no-labels
 # Interactive preprocessing preview (tune CLAHE, blur, Canny parameters)
 python satellite_trail_detector.py input.mp4 output.mp4 --preview
 
+# Radon pipeline debug preview (tune Radon SNR, PCF, star mask, LSD parameters)
+python satellite_trail_detector.py input.mp4 output.mp4 --algorithm radon --preview
+
 # Export ML dataset (default: AABB with 70/20/10 split, dedup, negatives)
 python satellite_trail_detector.py input.mp4 output.mp4 --dataset
 
@@ -523,6 +527,8 @@ class CustomDetectionAlgorithm(BaseDetectionAlgorithm):
 
 22. **HITL confidence scoring**: `ParameterAdapter.compute_confidence()` computes a pseudo-confidence from contrast margin, SNR margin, length score, and smoothness, squashed through a sigmoid. Used for active learning prioritization (low-confidence detections reviewed first) and auto-accept (detections above `--auto-accept` threshold are pre-accepted).
 
+23. **Radon debug preview**: `show_radon_preview()` provides an interactive GUI for tuning the 6 most important Radon pipeline parameters before processing. Triggered by `--preview` when `--algorithm radon` is active; the default `show_preprocessing_preview()` is used otherwise. The preview displays 4 diagnostic panels (Residual, Sinogram, LSD Lines, Detections) showing intermediate pipeline stages. Accepted parameters flow through `process_video()` → `RadonStreakDetector` via the `radon_params` dict and `_apply_radon_preview_params()`. The tunable parameters are: `radon_snr_threshold`, `pcf_ratio_threshold`, `star_mask_sigma` (stored as `_star_mask_sigma`), `lsd_log_eps` (stored as `_lsd_log_eps`), `pcf_kernel_length`, and `satellite_min_length`.
+
 ## Common Tasks
 
 ### Adding a new sensitivity preset
@@ -559,6 +565,7 @@ Add to the `main()` function's argument parser, then handle in `process_video()`
 | Component | Location |
 |-----------|----------|
 | Preprocessing preview | `satellite_trail_detector.py:show_preprocessing_preview()` (line ~57) |
+| Radon debug preview | `satellite_trail_detector.py:show_radon_preview()` (line ~1103) |
 | HITL safety bounds | `satellite_trail_detector.py:PARAMETER_SAFETY_BOUNDS` (line ~1207) |
 | HITL correction rules | `satellite_trail_detector.py:CORRECTION_RULES` (line ~1224) |
 | Annotation database | `satellite_trail_detector.py:AnnotationDatabase` (line ~1296) |
