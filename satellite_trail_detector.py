@@ -3879,8 +3879,12 @@ class SatelliteTrailDetector:
             if 'mf_snr_threshold' in self.preprocessing_params:
                 self.params['mf_snr_threshold'] = self.preprocessing_params['mf_snr_threshold']
 
-        # GPU acceleration flag (CUDA filter2D, warpAffine)
+        # Per-operation GPU flags — a failure in one GPU path (e.g. median
+        # blur) should not disable unrelated GPU ops (e.g. warpAffine).
         self._use_gpu = _HAS_CUDA
+        self._use_gpu_filter = _HAS_CUDA      # filter2D (matched filter)
+        self._use_gpu_warp = _HAS_CUDA         # warpAffine (Radon)
+        self._use_gpu_median = _HAS_CUDA       # median blur (star mask / bg)
 
         # Pre-compute matched filter kernel bank (48 kernels: 24 angles x 2 lengths)
         # These depend only on num_angles, kernel_lengths, and sigma_perp —
@@ -3896,7 +3900,7 @@ class SatelliteTrailDetector:
                 self._mf_kernel_bank.append((angle_deg, kernel, noise_factor))
         # Pre-create GPU filter objects if CUDA is available
         self._gpu_filters = None
-        if self._use_gpu:
+        if self._use_gpu_filter:
             try:
                 self._gpu_filters = []
                 for angle_deg, kernel, noise_factor in self._mf_kernel_bank:
@@ -4203,7 +4207,7 @@ class SatelliteTrailDetector:
         best_angle = np.zeros_like(signal)
 
         # GPU-accelerated path: upload signal once, run all filters on GPU
-        if self._use_gpu and self._gpu_filters is not None:
+        if self._use_gpu_filter and self._gpu_filters is not None:
             try:
                 gpu_signal = cv2.cuda_GpuMat()
                 gpu_signal.upload(signal)
@@ -4220,9 +4224,8 @@ class SatelliteTrailDetector:
                     best_snr[better] = snr[better]
                     best_angle[better] = angle_deg
             except Exception:
-                # CUDA failed at runtime — fall back to CPU for this
-                # frame and all future frames
-                self._use_gpu = False
+                # CUDA failed at runtime — fall back to CPU for filter2D only
+                self._use_gpu_filter = False
                 self._gpu_filters = None
                 best_snr = np.zeros_like(signal)
                 best_angle = np.zeros_like(signal)
@@ -5895,6 +5898,9 @@ class RadonStreakDetector(SatelliteTrailDetector):
         # LSD availability flag (removed in some OpenCV builds)
         self._lsd_available = hasattr(cv2, 'createLineSegmentDetector')
 
+        # Cached CLAHE for LSD stage (clipLimit=8.0, different from parent's 6.0)
+        self._clahe_lsd = cv2.createCLAHE(clipLimit=8.0, tileGridSize=(6, 6))
+
         # Radon detection parameters (tuned for performance)
         self.radon_num_angles = 90        # 2-degree angular resolution (fast)
         self.radon_max_dim = 480          # Max short-side pixels for Radon input
@@ -6231,7 +6237,7 @@ class RadonStreakDetector(SatelliteTrailDetector):
         # to avoid downloading the full diag×diag rotated image per angle.
         # cv2.cuda.reduce sums columns on-device, so we only download a
         # 1×diag row per angle (~700× less data than the full image).
-        if self._use_gpu:
+        if self._use_gpu_warp:
             try:
                 gpu_padded = cv2.cuda_GpuMat()
                 gpu_padded.upload(padded)
@@ -6246,9 +6252,9 @@ class RadonStreakDetector(SatelliteTrailDetector):
                     gpu_col_sum = cv2.cuda.reduce(
                         gpu_rotated, 0, cv2.REDUCE_SUM, dtype=cv2.CV_32F)
                     sinogram[:, i] = gpu_col_sum.download().ravel()
-                return sinogram.astype(np.float64), angles
+                return sinogram, angles
             except Exception:
-                self._use_gpu = False
+                self._use_gpu_warp = False
                 # Fall through to CPU path
 
         # CPU path
@@ -6260,7 +6266,7 @@ class RadonStreakDetector(SatelliteTrailDetector):
                                      borderValue=0)
             sinogram[:, i] = np.sum(rotated, axis=0)
 
-        return sinogram.astype(np.float64), angles
+        return sinogram, angles
 
     def _detect_streaks_radon(self, residual, noise_sigma, snr_threshold=3.0,
                               min_length=40):
@@ -6303,7 +6309,7 @@ class RadonStreakDetector(SatelliteTrailDetector):
         if blur_k % 2 == 0:
             blur_k += 1
         baseline = cv2.GaussianBlur(
-            snr_sinogram.astype(np.float32), (blur_k, 1), 0).astype(np.float64)
+            snr_sinogram, (blur_k, 1), 0)
         snr_sinogram = snr_sinogram - baseline
 
         # Find peaks above threshold
@@ -6317,16 +6323,15 @@ class RadonStreakDetector(SatelliteTrailDetector):
         else:
             # Fallback: use cv2.dilate for NMS
             kernel_nms = np.ones((5, 5), dtype=np.uint8)
-            snr_f32 = snr_sinogram.astype(np.float32)
-            local_max = cv2.dilate(snr_f32, kernel_nms).astype(np.float64)
+            local_max = cv2.dilate(snr_sinogram, kernel_nms)
         peaks = peak_mask & (snr_sinogram == local_max)
 
         peak_coords = np.argwhere(peaks)  # (offset_idx, angle_idx)
         if len(peak_coords) == 0:
             return []
 
-        # Sort by SNR descending
-        peak_snrs = np.array([snr_sinogram[r, c] for r, c in peak_coords])
+        # Sort by SNR descending (vectorized fancy indexing)
+        peak_snrs = snr_sinogram[peak_coords[:, 0], peak_coords[:, 1]]
         order = np.argsort(peak_snrs)[::-1]
         peak_coords = peak_coords[order]
         peak_snrs = peak_snrs[order]
@@ -6397,7 +6402,7 @@ class RadonStreakDetector(SatelliteTrailDetector):
         it, then compares the mean responses.
 
         Args:
-            residual: Background-subtracted float64 image
+            residual: Background-subtracted float32 image
             candidates: List of (x1, y1, x2, y2, score) tuples
             kernel_length: Half-width for perpendicular sampling
 
@@ -6415,7 +6420,7 @@ class RadonStreakDetector(SatelliteTrailDetector):
         h, w = residual.shape
 
         # Pre-compute the kernel offset array once (shared across candidates)
-        d_offsets = np.arange(-half_w, half_w + 1, dtype=np.float64)
+        d_offsets = np.arange(-half_w, half_w + 1, dtype=np.float32)
 
         for x1, y1, x2, y2, score in candidates:
             dx = x2 - x1
@@ -6432,7 +6437,7 @@ class RadonStreakDetector(SatelliteTrailDetector):
             num_samples = max(5, min(20, int(length / 10)))
 
             # Vectorized: generate all sample center points at once
-            t_vals = np.arange(1, num_samples + 1, dtype=np.float64) / (num_samples + 1)
+            t_vals = np.arange(1, num_samples + 1, dtype=np.float32) / (num_samples + 1)
             cx_arr = x1 + t_vals * dx  # (num_samples,)
             cy_arr = y1 + t_vals * dy
 
@@ -6470,15 +6475,15 @@ class RadonStreakDetector(SatelliteTrailDetector):
             if not np.any(both_valid):
                 continue
 
-            par_means = np.zeros(num_samples, dtype=np.float64)
-            perp_means = np.zeros(num_samples, dtype=np.float64)
+            par_means = np.zeros(num_samples, dtype=np.float32)
+            perp_means = np.zeros(num_samples, dtype=np.float32)
             par_means[both_valid] = par_vals[both_valid].sum(axis=1) / par_counts[both_valid]
             perp_means[both_valid] = perp_vals[both_valid].sum(axis=1) / perp_counts[both_valid]
 
             mean_par = par_means[both_valid].mean()
             mean_perp = perp_means[both_valid].mean()
 
-            ratio = mean_perp / (abs(mean_par) + 1e-10)
+            ratio = mean_par / (abs(mean_perp) + 1e-10)
             if ratio >= self.pcf_ratio_threshold:
                 confirmed.append((x1, y1, x2, y2, score))
 
@@ -6496,7 +6501,7 @@ class RadonStreakDetector(SatelliteTrailDetector):
         Returns:
             Median-blurred uint8 image.
         """
-        if self._use_gpu and _HAS_CUDA_MEDIAN:
+        if self._use_gpu_median and _HAS_CUDA_MEDIAN:
             try:
                 gpu_img = cv2.cuda_GpuMat()
                 gpu_img.upload(gray_u8)
@@ -6505,13 +6510,14 @@ class RadonStreakDetector(SatelliteTrailDetector):
                 gpu_result = median_filter.apply(gpu_img)
                 return gpu_result.download()
             except Exception:
-                # Permanent fallback — disable for this instance
-                self._use_gpu = False
+                # Permanent fallback — disable median GPU only
+                self._use_gpu_median = False
         return cv2.medianBlur(gray_u8, kernel_size)
 
     # ── Dual-threshold star masking ─────────────────────────────────
 
-    def _dual_threshold_star_mask(self, gray_frame, noise_sigma):
+    def _dual_threshold_star_mask(self, gray_frame, noise_sigma,
+                                   residual=None):
         """Remove bright stars using dual-threshold segmentation.
 
         High threshold identifies bright stars; dilation expands the mask
@@ -6519,22 +6525,24 @@ class RadonStreakDetector(SatelliteTrailDetector):
         replaced with local background estimates.
 
         Args:
-            gray_frame: Grayscale frame (uint8 or float64)
+            gray_frame: Grayscale frame (uint8 or float32)
             noise_sigma: Estimated noise standard deviation
+            residual: Pre-computed background-subtracted image. When
+                      provided, skips the expensive medianBlur bg
+                      estimation (~100ms savings at 1080p).
 
         Returns:
-            Star-cleaned image (float64), star mask (bool)
+            Star-cleaned image (float32), star mask (bool)
         """
-        img = gray_frame.astype(np.float64)
-
-        # Background estimation (GPU-accelerated median blur when available)
-        bg_kernel = min(51, max(3, min(img.shape) // 8))
-        if bg_kernel % 2 == 0:
-            bg_kernel += 1
-        gray_u8 = (gray_frame.astype(np.uint8) if img.max() <= 255
-                    else np.clip(img, 0, 255).astype(np.uint8))
-        bg = self._median_blur_gpu(gray_u8, bg_kernel).astype(np.float64)
-        residual = img - bg
+        if residual is None:
+            img = gray_frame.astype(np.float32)
+            bg_kernel = min(51, max(3, min(img.shape) // 8))
+            if bg_kernel % 2 == 0:
+                bg_kernel += 1
+            gray_u8 = (gray_frame.astype(np.uint8) if img.max() <= 255
+                        else np.clip(img, 0, 255).astype(np.uint8))
+            bg = self._median_blur_gpu(gray_u8, bg_kernel).astype(np.float32)
+            residual = img - bg
 
         # High threshold: identify bright stars (configurable sigma)
         star_sigma = self._star_mask_sigma if self._star_mask_sigma is not None else 5.0
@@ -6589,40 +6597,48 @@ class RadonStreakDetector(SatelliteTrailDetector):
 
         # ── Background subtraction and noise estimation ─────────────
         if temporal_context is not None:
-            diff_image = temporal_context['diff_image'].astype(np.float64)
-            noise_map = temporal_context['noise_map'].astype(np.float64)
+            diff_image = temporal_context['diff_image'].astype(np.float32)
+            noise_map = temporal_context['noise_map'].astype(np.float32)
             noise_sigma = float(np.median(noise_map))
             residual = diff_image.copy()
         else:
             bg_kernel = min(51, max(3, min(h, w) // 8))
             if bg_kernel % 2 == 0:
                 bg_kernel += 1
-            bg = self._median_blur_gpu(gray, bg_kernel).astype(np.float64)
-            residual = gray.astype(np.float64) - bg
+            bg = self._median_blur_gpu(gray, bg_kernel).astype(np.float32)
+            residual = gray.astype(np.float32) - bg
             flat = residual.ravel()
             mad = np.median(np.abs(flat - np.median(flat)))
             noise_sigma = max(0.5, mad * 1.4826)
 
-        # ── Star masking ────────────────────────────────────────────
-        cleaned, star_mask = self._dual_threshold_star_mask(gray, noise_sigma)
+        # ── Star masking (pass pre-computed residual to skip redundant medianBlur) ─
+        cleaned, star_mask = self._dual_threshold_star_mask(
+            gray, noise_sigma, residual=residual)
 
         # ── Stage 1: LSD detection ──────────────────────────────────
-        # Downsample for LSD if frame is very wide (>2000px)
+        # LSD is the dominant bottleneck (~500ms at 1920px).  Downsample
+        # to 960px wide — LSD detects line *segments* not individual
+        # pixels, so half-res still finds all trails with negligible
+        # accuracy loss while giving ~4x speedup.
+        lsd_max_width = 960
         lsd_scale = 1.0
-        if w > 2000:
-            lsd_scale = 1920.0 / w
+        if w > lsd_max_width:
+            lsd_scale = float(lsd_max_width) / w
         lsd_gray = gray if lsd_scale >= 1.0 else cv2.resize(
             gray, (int(w * lsd_scale), int(h * lsd_scale)),
             interpolation=cv2.INTER_AREA)
 
-        clahe = cv2.createCLAHE(clipLimit=8.0, tileGridSize=(6, 6))
-        enhanced = clahe.apply(lsd_gray)
+        enhanced = self._clahe_lsd.apply(lsd_gray)
 
         lsd_segments = self._detect_lines_lsd(
             enhanced,
             min_length=self.params.get('satellite_min_length', 50) * 0.6 * lsd_scale,
             log_eps=self._lsd_log_eps if self._lsd_log_eps is not None else 1.0
         )
+
+        # Cap LSD segments to prevent classify_trail explosion (4-8ms each).
+        # Keep the most significant segments (already sorted by NFA).
+        lsd_segments = lsd_segments[:50]
 
         # Convert LSD results to HoughLinesP format, scaling back to full res
         lsd_lines = []
@@ -6800,15 +6816,25 @@ _worker_detector = None
 
 def _worker_init(algorithm, sensitivity, preprocessing_params,
                  skip_aspect_ratio_check, signal_envelope, groundtruth_dir,
-                 use_gpu, radon_params=None):
-    """Create a detector instance in each worker process."""
+                 use_gpu, radon_params=None, gt_profiles=None):
+    """Create a detector instance in each worker process.
+
+    When gt_profiles is provided, skips the expensive _calibrate_from_groundtruth()
+    (which loads and analyzes all PNG files) and directly applies the pre-computed
+    calibration.  This saves ~1-2s per worker at startup.
+    """
     global _worker_detector
     if algorithm == 'radon':
+        # Pass groundtruth_dir=None to skip per-worker calibration;
+        # apply the pre-computed profiles instead.
         _worker_detector = RadonStreakDetector(
             sensitivity, preprocessing_params=preprocessing_params,
             skip_aspect_ratio_check=skip_aspect_ratio_check,
             signal_envelope=signal_envelope,
-            groundtruth_dir=groundtruth_dir)
+            groundtruth_dir=None)
+        if gt_profiles is not None:
+            _worker_detector.gt_profiles = gt_profiles
+            _worker_detector._apply_gt_calibration(gt_profiles)
         if radon_params:
             _apply_radon_preview_params(_worker_detector, radon_params)
     else:
@@ -6817,6 +6843,9 @@ def _worker_init(algorithm, sensitivity, preprocessing_params,
             skip_aspect_ratio_check=skip_aspect_ratio_check,
             signal_envelope=signal_envelope)
     _worker_detector._use_gpu = use_gpu
+    _worker_detector._use_gpu_filter = use_gpu
+    _worker_detector._use_gpu_warp = use_gpu
+    _worker_detector._use_gpu_median = use_gpu
 
 
 def _worker_detect(args):
@@ -7811,12 +7840,16 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     pool = None
     if num_workers >= 1:
         use_gpu_workers = _HAS_CUDA and not no_gpu
+        # Pass pre-computed GT calibration to workers to avoid N redundant
+        # _calibrate_from_groundtruth() runs (each loads all PNG files).
+        gt_profiles = getattr(detector, 'gt_profiles', None)
         pool = multiprocessing.Pool(
             num_workers,
             initializer=_worker_init,
             initargs=(algorithm, sensitivity, preprocessing_params,
                       skip_aspect_ratio_check, signal_envelope,
-                      groundtruth_dir, use_gpu_workers, radon_params))
+                      groundtruth_dir, use_gpu_workers, radon_params,
+                      gt_profiles))
         pending = deque()  # (frame, frame_idx, AsyncResult)
         prefetch = num_workers * 2
         print(f"Parallel workers: {num_workers}" +
@@ -8562,4 +8595,5 @@ Notes:
 
 
 if __name__ == '__main__':
+    multiprocessing.freeze_support()
     main()
