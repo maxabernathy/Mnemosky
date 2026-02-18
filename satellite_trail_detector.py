@@ -10025,7 +10025,546 @@ def export_dataset_from_annotations(input_path, annotations_path,
     exporter.finalize()
 
 
-def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=7, algorithm='default', groundtruth_dir=None, num_workers=0, no_gpu=False, review_mode=False, review_only=False, annotations_path=None, hitl_profile='default', auto_accept=0.9, no_learn=False, dataset_format='aabb', dataset_split=(0.7, 0.2, 0.1), dataset_skip=0, dataset_dedup=5, dataset_negatives=0.2, dataset_image_format='jpg', dataset_image_quality=95, dataset_dir_override=None, radon_params=None, nn_params=None):
+# ── Processing Window ─────────────────────────────────────────────────
+# Live visual dashboard shown during video processing.  Same dark-grey /
+# fluorescent-accent theme as the preview windows.  Lightweight: only
+# redraws when the processing loop yields a new result (every frame) and
+# uses pre-allocated canvases to avoid per-frame allocation overhead.
+
+
+class ProcessingWindow:
+    """Real-time processing dashboard with scientific visualisations.
+
+    Layout (single OpenCV window, ~1100 x 680):
+    ┌──────────────────────────┬──────────────────────────┐
+    │  LIVE FRAME              │  TRAIL MAP               │
+    │  (current frame thumb    │  (2-D scatter of all     │
+    │   with detection boxes)  │   detected trail centres  │
+    │                          │   over normalised frame   │
+    │                          │   space)                  │
+    ├──────────────────────────┴──────────────────────────┤
+    │  DETECTION TIMELINE                                  │
+    │  (horizontal strip – time axis with event markers)   │
+    ├─────────────────────────────────────────────────────┤
+    │  STATUS BAR: progress ring + stats + orbital ETA     │
+    └─────────────────────────────────────────────────────┘
+
+    The window updates once per processed frame (cheap — no extra decode).
+    Press Q or ESC in the window to abort processing early.
+    """
+
+    # ── Theme (matches preview windows) ──────────────────────────────
+    BG_DARK      = (30, 30, 30)
+    BG_PANEL     = (42, 42, 42)
+    BORDER       = (58, 58, 58)
+    TEXT_PRIMARY  = (210, 210, 210)
+    TEXT_DIM      = (120, 120, 120)
+    ACCENT        = (200, 255, 80)       # fluorescent green-yellow
+    ACCENT_DIM    = (100, 170, 50)
+    COLOR_SAT     = (0, 185, 255)        # GOLD for satellites
+    COLOR_AIR     = (0, 140, 255)        # ORANGE for airplanes
+    GRID_COLOR    = (45, 45, 45)
+    WAVEFORM_BG   = (36, 36, 36)
+
+    # ── Layout constants ──────────────────────────────────────────────
+    WIN_W        = 1100
+    WIN_H        = 680
+    TOP_ROW_H    = 400          # live frame + trail map
+    TIMELINE_H   = 110          # detection timeline strip
+    STATUS_H     = 56           # bottom status bar
+    GAP          = 2
+
+    # Detection timeline ring buffer length (in frames)
+    _TIMELINE_BUCKETS = 200
+
+    WINDOW_NAME = 'Mnemosky  \u2013  Processing'
+
+    def __init__(self, total_frames, fps, video_w, video_h, algorithm='default'):
+        self._total = max(1, int(total_frames)) if total_frames != float('inf') else 0
+        self._fps = fps or 30.0
+        self._vid_w = video_w
+        self._vid_h = video_h
+        self._algorithm = algorithm
+
+        # Running statistics
+        self._frame_count = 0
+        self._sat_count = 0
+        self._air_count = 0
+        self._t_start = time.monotonic()
+
+        # Trail map: normalised (x, y) positions + type
+        self._trail_points = []        # [(nx, ny, 'satellite'|'airplane'), ...]
+
+        # Detection timeline: bucketed event counts
+        self._bucket_size = max(1, self._total // self._TIMELINE_BUCKETS) if self._total else 1
+        self._sat_buckets = np.zeros(self._TIMELINE_BUCKETS, dtype=np.int32)
+        self._air_buckets = np.zeros(self._TIMELINE_BUCKETS, dtype=np.int32)
+
+        # Waveform: rolling detection-density signal (per-second)
+        self._waveform_len = max(60, int(self._total / self._fps)) if self._total else 120
+        self._waveform = np.zeros(self._waveform_len, dtype=np.float32)
+
+        # Latest thumbnail of the frame being processed
+        self._thumb = None
+        self._thumb_w = 0
+        self._thumb_h = 0
+
+        # Pre-compute panel geometry
+        half_w = (self.WIN_W - self.GAP) // 2
+        self._frame_rect = (0, 0, half_w, self.TOP_ROW_H)
+        self._map_rect = (half_w + self.GAP, 0, self.WIN_W - half_w - self.GAP, self.TOP_ROW_H)
+        tl_y = self.TOP_ROW_H + self.GAP
+        self._timeline_rect = (0, tl_y, self.WIN_W, self.TIMELINE_H)
+        sb_y = tl_y + self.TIMELINE_H + self.GAP
+        self._status_rect = (0, sb_y, self.WIN_W, self.STATUS_H)
+
+        # Pre-allocate canvas
+        self._canvas = np.full((self.WIN_H, self.WIN_W, 3), self.BG_DARK, dtype=np.uint8)
+
+        # Compute thumbnail size to fit frame panel with padding
+        pad = 12
+        avail_w = self._frame_rect[2] - 2 * pad
+        avail_h = self._frame_rect[3] - 40 - pad  # 40px for tag
+        scale = min(avail_w / max(1, video_w), avail_h / max(1, video_h))
+        self._thumb_w = int(video_w * scale)
+        self._thumb_h = int(video_h * scale)
+        self._thumb_x = self._frame_rect[0] + (self._frame_rect[2] - self._thumb_w) // 2
+        self._thumb_y = self._frame_rect[1] + 32 + (self._frame_rect[3] - 32 - self._thumb_h) // 2
+
+        # Window creation
+        self._window_alive = False
+        self._abort_requested = False
+
+        # Display throttle: redraw at most ~20 fps to keep overhead low
+        self._min_draw_interval = 0.05   # 50 ms
+        self._last_draw_time = 0.0
+
+    # ── Public API ────────────────────────────────────────────────────
+
+    def open(self):
+        """Create the OpenCV window."""
+        cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.WINDOW_NAME, self.WIN_W, self.WIN_H)
+        self._window_alive = True
+
+    def update(self, frame_count, frame, detected_trails):
+        """Feed one processed frame into the dashboard.
+
+        Args:
+            frame_count: 1-based frame index.
+            frame: BGR image (full resolution — will be thumbnailed).
+            detected_trails: list of (trail_type, detection_info) tuples.
+
+        Returns:
+            False if the user requested abort (Q / ESC), True otherwise.
+        """
+        if not self._window_alive:
+            return True
+
+        self._frame_count = frame_count
+
+        # ── Update statistics ─────────────────────────────────────────
+        n_sat = sum(1 for t, _ in detected_trails if t == 'satellite')
+        n_air = sum(1 for t, _ in detected_trails if t == 'airplane')
+        self._sat_count += n_sat
+        self._air_count += n_air
+
+        # Bucket index for timeline
+        if self._total:
+            bi = min(int((frame_count - 1) / self._bucket_size), self._TIMELINE_BUCKETS - 1)
+        else:
+            bi = min(int((frame_count - 1) / max(1, self._bucket_size)), self._TIMELINE_BUCKETS - 1)
+        self._sat_buckets[bi] += n_sat
+        self._air_buckets[bi] += n_air
+
+        # Waveform (per-second density)
+        sec_idx = int((frame_count - 1) / self._fps)
+        if sec_idx < self._waveform_len:
+            self._waveform[sec_idx] += n_sat + n_air
+
+        # Trail map points
+        for trail_type, det_info in detected_trails:
+            cx, cy = det_info.get('center', (0, 0))
+            nx = cx / max(1, self._vid_w)
+            ny = cy / max(1, self._vid_h)
+            self._trail_points.append((nx, ny, trail_type))
+
+        # ── Throttled display update ───────────────────────────────────
+        # Statistics are always updated above; the expensive draw + imshow
+        # is throttled to ~20 fps to keep CPU overhead negligible.
+        now = time.monotonic()
+        should_draw = (now - self._last_draw_time >= self._min_draw_interval
+                       or detected_trails)  # always redraw on detection events
+
+        if should_draw:
+            # Thumbnail
+            self._thumb = cv2.resize(frame, (self._thumb_w, self._thumb_h),
+                                     interpolation=cv2.INTER_AREA)
+            # Draw detection boxes on thumbnail
+            sx = self._thumb_w / max(1, self._vid_w)
+            sy = self._thumb_h / max(1, self._vid_h)
+            for trail_type, det_info in detected_trails:
+                bx1, by1, bx2, by2 = det_info['bbox']
+                color = self.COLOR_SAT if trail_type == 'satellite' else self.COLOR_AIR
+                cv2.rectangle(self._thumb,
+                              (int(bx1 * sx), int(by1 * sy)),
+                              (int(bx2 * sx), int(by2 * sy)),
+                              color, 1, cv2.LINE_AA)
+
+            self._draw()
+            cv2.imshow(self.WINDOW_NAME, self._canvas)
+            self._last_draw_time = now
+
+        key = cv2.waitKey(1) & 0xFF
+        if key in (27, ord('q'), ord('Q')):
+            self._abort_requested = True
+            return False
+        return True
+
+    @property
+    def abort_requested(self):
+        return self._abort_requested
+
+    def close(self):
+        """Destroy the window."""
+        if self._window_alive:
+            try:
+                cv2.destroyWindow(self.WINDOW_NAME)
+            except Exception:
+                pass
+            self._window_alive = False
+
+    # ── Internal drawing ──────────────────────────────────────────────
+
+    def _draw(self):
+        """Redraw the entire dashboard onto self._canvas."""
+        c = self._canvas
+        c[:] = self.BG_DARK
+
+        self._draw_frame_panel(c)
+        self._draw_trail_map(c)
+        self._draw_timeline(c)
+        self._draw_status_bar(c)
+
+    # -- Live frame panel --
+
+    def _draw_frame_panel(self, c):
+        x, y, w, h = self._frame_rect
+        # Panel background
+        cv2.rectangle(c, (x, y), (x + w, y + h), self.BG_PANEL, -1)
+        cv2.rectangle(c, (x, y), (x + w - 1, y + h - 1), self.BORDER, 1)
+
+        # Tag
+        self._draw_tag(c, "LIVE FRAME", x + 8, y + 20, self.BG_DARK, self.ACCENT)
+
+        # Frame counter
+        if self._total:
+            ftxt = f"f{self._frame_count}/{self._total}"
+        else:
+            ftxt = f"f{self._frame_count}"
+        (tw, _), _ = cv2.getTextSize(ftxt, cv2.FONT_HERSHEY_SIMPLEX, 0.34, 1)
+        cv2.putText(c, ftxt, (x + w - tw - 10, y + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, self.TEXT_DIM, 1, cv2.LINE_AA)
+
+        # Thumbnail
+        if self._thumb is not None:
+            th, tw_t = self._thumb.shape[:2]
+            c[self._thumb_y:self._thumb_y + th,
+              self._thumb_x:self._thumb_x + tw_t] = self._thumb
+
+            # Subtle border around thumb
+            cv2.rectangle(c,
+                          (self._thumb_x - 1, self._thumb_y - 1),
+                          (self._thumb_x + tw_t, self._thumb_y + th),
+                          self.BORDER, 1)
+
+    # -- Trail map panel --
+
+    def _draw_trail_map(self, c):
+        x, y, w, h = self._map_rect
+        # Panel background
+        cv2.rectangle(c, (x, y), (x + w, y + h), self.BG_PANEL, -1)
+        cv2.rectangle(c, (x, y), (x + w - 1, y + h - 1), self.BORDER, 1)
+
+        # Tag
+        self._draw_tag(c, "TRAIL MAP", x + 8, y + 20, self.BG_DARK, self.ACCENT)
+
+        # Count label
+        n_trails = len(self._trail_points)
+        ctxt = f"{n_trails} trail{'s' if n_trails != 1 else ''}"
+        (tw, _), _ = cv2.getTextSize(ctxt, cv2.FONT_HERSHEY_SIMPLEX, 0.34, 1)
+        cv2.putText(c, ctxt, (x + w - tw - 10, y + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, self.TEXT_DIM, 1, cv2.LINE_AA)
+
+        # Map area (inset)
+        pad = 14
+        map_x = x + pad
+        map_y = y + 34
+        map_w = w - 2 * pad
+        map_h = h - 34 - pad
+
+        if map_w < 20 or map_h < 20:
+            return
+
+        # Preserve video aspect ratio inside the map area
+        vid_aspect = self._vid_w / max(1, self._vid_h)
+        map_aspect = map_w / max(1, map_h)
+        if vid_aspect > map_aspect:
+            # Video is wider — fit to width
+            draw_w = map_w
+            draw_h = int(map_w / vid_aspect)
+        else:
+            # Video is taller — fit to height
+            draw_h = map_h
+            draw_w = int(map_h * vid_aspect)
+        draw_x = map_x + (map_w - draw_w) // 2
+        draw_y = map_y + (map_h - draw_h) // 2
+
+        # Grid lines (4x4)
+        for i in range(1, 4):
+            gx = draw_x + int(draw_w * i / 4)
+            cv2.line(c, (gx, draw_y), (gx, draw_y + draw_h), self.GRID_COLOR, 1)
+            gy = draw_y + int(draw_h * i / 4)
+            cv2.line(c, (draw_x, gy), (draw_x + draw_w, gy), self.GRID_COLOR, 1)
+
+        # Border of map region
+        cv2.rectangle(c, (draw_x, draw_y), (draw_x + draw_w, draw_y + draw_h),
+                      self.BORDER, 1)
+
+        # Plot trail points
+        for nx, ny, ttype in self._trail_points:
+            px = draw_x + int(nx * draw_w)
+            py = draw_y + int(ny * draw_h)
+            color = self.COLOR_SAT if ttype == 'satellite' else self.COLOR_AIR
+            cv2.circle(c, (px, py), 3, color, -1, cv2.LINE_AA)
+
+        # Crosshair at frame centre for reference
+        cx = draw_x + draw_w // 2
+        cy = draw_y + draw_h // 2
+        arm = 6
+        cv2.line(c, (cx - arm, cy), (cx + arm, cy), self.BORDER, 1)
+        cv2.line(c, (cx, cy - arm), (cx, cy + arm), self.BORDER, 1)
+
+    # -- Detection timeline --
+
+    def _draw_timeline(self, c):
+        x, y, w, h = self._timeline_rect
+        # Panel background
+        cv2.rectangle(c, (x, y), (x + w, y + h), self.BG_PANEL, -1)
+        cv2.rectangle(c, (x, y), (x + w - 1, y + h - 1), self.BORDER, 1)
+
+        # Tag
+        self._draw_tag(c, "DETECTION TIMELINE", x + 8, y + 18, self.BG_DARK, self.ACCENT)
+
+        # Timeline area
+        pad_l = 10
+        pad_r = 10
+        pad_t = 28
+        pad_b = 20
+        tl_x = x + pad_l
+        tl_y = y + pad_t
+        tl_w = w - pad_l - pad_r
+        tl_h = h - pad_t - pad_b
+
+        if tl_w < 40 or tl_h < 20:
+            return
+
+        # Determine visible bucket range
+        if self._total:
+            n_buckets = min(self._TIMELINE_BUCKETS, max(1,
+                            int(math.ceil(self._total / self._bucket_size))))
+        else:
+            n_buckets = min(self._TIMELINE_BUCKETS, max(1,
+                            int(math.ceil(self._frame_count / max(1, self._bucket_size)))))
+
+        if n_buckets < 1:
+            n_buckets = 1
+
+        bar_w = max(1, tl_w / n_buckets)
+
+        # Find max for scaling
+        max_val = max(1, int(np.max(self._sat_buckets[:n_buckets] +
+                                     self._air_buckets[:n_buckets])))
+
+        # Draw stacked bars
+        for i in range(n_buckets):
+            bx = int(tl_x + i * bar_w)
+            bw = max(1, int(bar_w) - (1 if bar_w > 3 else 0))
+
+            sv = self._sat_buckets[i]
+            av = self._air_buckets[i]
+            total = sv + av
+
+            if total == 0:
+                continue
+
+            # Satellite portion (bottom)
+            sat_h = int((sv / max_val) * tl_h)
+            if sat_h > 0:
+                cv2.rectangle(c,
+                              (bx, tl_y + tl_h - sat_h),
+                              (bx + bw, tl_y + tl_h),
+                              self.COLOR_SAT, -1)
+
+            # Airplane portion (stacked on top)
+            air_h = int((av / max_val) * tl_h)
+            if air_h > 0:
+                cv2.rectangle(c,
+                              (bx, tl_y + tl_h - sat_h - air_h),
+                              (bx + bw, tl_y + tl_h - sat_h),
+                              self.COLOR_AIR, -1)
+
+        # Baseline
+        cv2.line(c, (tl_x, tl_y + tl_h), (tl_x + tl_w, tl_y + tl_h),
+                 self.BORDER, 1)
+
+        # Progress playhead
+        if self._total:
+            ph_x = tl_x + int(tl_w * self._frame_count / self._total)
+        elif self._frame_count > 0:
+            ph_x = tl_x + min(tl_w, int(tl_w * min(1.0, self._frame_count /
+                                                     max(1, n_buckets * self._bucket_size))))
+        else:
+            ph_x = tl_x
+        cv2.line(c, (ph_x, tl_y - 2), (ph_x, tl_y + tl_h + 2), self.ACCENT, 1)
+        # Small triangle head
+        pts = np.array([[ph_x - 4, tl_y - 2], [ph_x + 4, tl_y - 2],
+                        [ph_x, tl_y + 4]], dtype=np.int32)
+        cv2.fillPoly(c, [pts], self.ACCENT)
+
+        # Waveform overlay (detection density per second) — thin line
+        wf = self._waveform
+        wf_max = max(1.0, float(np.max(wf)))
+        wf_len = self._waveform_len
+        if wf_len > 1:
+            pts_wf = []
+            for i in range(wf_len):
+                wx = tl_x + int(i * tl_w / wf_len)
+                wy = tl_y + tl_h - int((wf[i] / wf_max) * tl_h * 0.8)
+                pts_wf.append((wx, wy))
+            if len(pts_wf) >= 2:
+                cv2.polylines(c, [np.array(pts_wf, dtype=np.int32)],
+                              False, self.ACCENT_DIM, 1, cv2.LINE_AA)
+
+        # Time labels
+        if self._total:
+            dur = self._total / self._fps
+            cv2.putText(c, "0s", (tl_x, tl_y + tl_h + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, self.TEXT_DIM, 1, cv2.LINE_AA)
+            end_lbl = f"{dur:.0f}s"
+            (ew, _), _ = cv2.getTextSize(end_lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.28, 1)
+            cv2.putText(c, end_lbl, (tl_x + tl_w - ew, tl_y + tl_h + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, self.TEXT_DIM, 1, cv2.LINE_AA)
+
+        # Legend
+        lx = x + w - 170
+        ly = y + 18
+        cv2.rectangle(c, (lx, ly - 8), (lx + 8, ly), self.COLOR_SAT, -1)
+        cv2.putText(c, "Satellite", (lx + 12, ly),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, self.TEXT_DIM, 1, cv2.LINE_AA)
+        cv2.rectangle(c, (lx + 75, ly - 8), (lx + 83, ly), self.COLOR_AIR, -1)
+        cv2.putText(c, "Airplane", (lx + 87, ly),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, self.TEXT_DIM, 1, cv2.LINE_AA)
+
+    # -- Status bar --
+
+    def _draw_status_bar(self, c):
+        x, y, w, h = self._status_rect
+        cv2.rectangle(c, (x, y), (x + w, y + h), self.BG_PANEL, -1)
+        cv2.rectangle(c, (x, y), (x + w - 1, y + h - 1), self.BORDER, 1)
+
+        # ── Progress ring (left side) ─────────────────────────────────
+        ring_cx = x + 28
+        ring_cy = y + h // 2
+        ring_r = 18
+        # Background ring
+        cv2.circle(c, (ring_cx, ring_cy), ring_r, self.BORDER, 2, cv2.LINE_AA)
+        # Progress arc
+        if self._total:
+            progress = self._frame_count / self._total
+            angle = int(progress * 360)
+            if angle > 0:
+                cv2.ellipse(c, (ring_cx, ring_cy), (ring_r, ring_r),
+                            -90, 0, angle, self.ACCENT, 2, cv2.LINE_AA)
+            # Percentage text inside ring
+            pct_txt = f"{progress * 100:.0f}%"
+        else:
+            # Indeterminate — spinning dot
+            elapsed = time.monotonic() - self._t_start
+            spin_angle = int(elapsed * 120) % 360
+            cv2.ellipse(c, (ring_cx, ring_cy), (ring_r, ring_r),
+                        -90 + spin_angle, 0, 60, self.ACCENT, 2, cv2.LINE_AA)
+            pct_txt = "..."
+
+        (pw, ph_t), _ = cv2.getTextSize(pct_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.30, 1)
+        cv2.putText(c, pct_txt, (ring_cx - pw // 2, ring_cy + ph_t // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, self.TEXT_PRIMARY, 1, cv2.LINE_AA)
+
+        # ── Stats text ────────────────────────────────────────────────
+        sx = x + 60
+        sy = y + h // 2
+
+        # Processing FPS
+        elapsed = time.monotonic() - self._t_start
+        proc_fps = self._frame_count / max(0.01, elapsed)
+        fps_txt = f"{proc_fps:.1f} fps"
+        cv2.putText(c, fps_txt, (sx, sy - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, self.ACCENT, 1, cv2.LINE_AA)
+
+        # Algorithm label
+        cv2.putText(c, self._algorithm.upper(), (sx, sy + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, self.TEXT_DIM, 1, cv2.LINE_AA)
+
+        # ── Detection counts (centre) ────────────────────────────────
+        cx = x + w // 2 - 80
+        # Satellites
+        cv2.circle(c, (cx, sy - 4), 4, self.COLOR_SAT, -1, cv2.LINE_AA)
+        cv2.putText(c, f"{self._sat_count}", (cx + 8, sy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, self.TEXT_PRIMARY, 1, cv2.LINE_AA)
+        sat_w = 8 + len(str(self._sat_count)) * 12 + 14
+        # Airplanes
+        cv2.circle(c, (cx + sat_w, sy - 4), 4, self.COLOR_AIR, -1, cv2.LINE_AA)
+        cv2.putText(c, f"{self._air_count}", (cx + sat_w + 8, sy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, self.TEXT_PRIMARY, 1, cv2.LINE_AA)
+
+        # Total
+        total = self._sat_count + self._air_count
+        cv2.putText(c, f"total {total}", (cx, sy + 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, self.TEXT_DIM, 1, cv2.LINE_AA)
+
+        # ── ETA / elapsed (right side) ────────────────────────────────
+        ex = x + w - 180
+        if self._total and self._frame_count > 0:
+            remaining = (self._total - self._frame_count) / max(0.01, proc_fps)
+            if remaining > 3600:
+                eta_txt = f"ETA {remaining / 3600:.1f}h"
+            elif remaining > 60:
+                eta_txt = f"ETA {remaining / 60:.1f}m"
+            else:
+                eta_txt = f"ETA {remaining:.0f}s"
+        else:
+            eta_txt = f"elapsed {elapsed:.0f}s"
+
+        cv2.putText(c, eta_txt, (ex, sy - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, self.TEXT_DIM, 1, cv2.LINE_AA)
+
+        # Hint
+        cv2.putText(c, "Q / ESC to abort", (ex, sy + 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.26, self.TEXT_DIM, 1, cv2.LINE_AA)
+
+    # ── Helpers ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _draw_tag(img, text, x, y, bg_color, text_color, scale=0.38):
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+        pad_x, pad_y = 6, 4
+        cv2.rectangle(img, (x, y - th - pad_y),
+                      (x + tw + pad_x * 2, y + pad_y), bg_color, -1)
+        cv2.putText(img, text, (x + pad_x, y - 1),
+                    cv2.FONT_HERSHEY_SIMPLEX, scale, text_color, 1, cv2.LINE_AA)
+
+
+def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=7, algorithm='default', groundtruth_dir=None, num_workers=0, no_gpu=False, review_mode=False, review_only=False, annotations_path=None, hitl_profile='default', auto_accept=0.9, no_learn=False, dataset_format='aabb', dataset_split=(0.7, 0.2, 0.1), dataset_skip=0, dataset_dedup=5, dataset_negatives=0.2, dataset_image_format='jpg', dataset_image_quality=95, dataset_dir_override=None, radon_params=None, nn_params=None, show_processing=False):
     """
     Process video to detect and highlight satellite and airplane trails.
 
@@ -10065,6 +10604,10 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         dataset_image_format: Image format for export ('jpg' or 'png'). Default: 'jpg'.
         dataset_image_quality: JPEG quality 1-100. Default: 95.
         dataset_dir_override: Explicit dataset output directory (optional).
+        show_processing: If True, display a live processing dashboard window
+            with frame preview, trail map, detection timeline, and progress
+            ring.  Enabled automatically when --preview was used (seamless
+            transition) or via --show-processing.  Press Q/ESC to abort.
     """
     # Validate input
     input_path = Path(input_path)
@@ -10289,6 +10832,15 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
 
     print("\nProcessing video...")
 
+    # ── Processing window (live dashboard) ────────────────────────
+    proc_win = None
+    if show_processing:
+        proc_win = ProcessingWindow(
+            total_frames=max_frames, fps=fps,
+            video_w=width, video_h=height,
+            algorithm=algorithm)
+        proc_win.open()
+
     # ── Unified frame-result generator ─────────────────────────────
     # Abstracts sequential vs parallel detection so the post-processing
     # loop below is shared.  Yields (frame, frame_idx, detected_trails,
@@ -10403,6 +10955,12 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         # suppressing single-frame noise.  Also builds tracklets.
         if detection_tracker is not None:
             detected_trails = detection_tracker.update(fc, detected_trails)
+
+        # ── Processing window update ──────────────────────────────────
+        if proc_win is not None:
+            if not proc_win.update(fc, frame, detected_trails):
+                print("\n\nProcessing aborted by user.")
+                break
 
         # Collect detections for HITL review mode
         # fc is 1-based frame_count; store as 0-based index for cap.set()
@@ -10561,6 +11119,8 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         out.write(final_frame)
     
     # Cleanup
+    if proc_win is not None:
+        proc_win.close()
     cap.release()
     out.release()
 
@@ -10749,6 +11309,15 @@ Notes:
         '--preview', '-p',
         action='store_true',
         help='Show interactive preprocessing preview to tune CLAHE, blur, and edge detection parameters before processing'
+    )
+
+    parser.add_argument(
+        '--show-processing',
+        action='store_true',
+        help='Show a live processing dashboard window with frame preview, '
+             'trail map, detection timeline, and progress ring. '
+             'Automatically enabled when --preview is used (seamless transition). '
+             'Press Q or ESC in the window to abort processing early.'
     )
 
     parser.add_argument(
@@ -11120,6 +11689,10 @@ Notes:
         )
         return
 
+    # Enable processing window automatically when --preview was used
+    # (seamless transition from preview to processing dashboard)
+    _show_proc = args.show_processing or args.preview
+
     process_video(
         args.input,
         args.output,
@@ -11157,6 +11730,7 @@ Notes:
         dataset_dir_override=args.dataset_dir,
         radon_params=radon_preview_params,
         nn_params=nn_params,
+        show_processing=_show_proc,
     )
 
 

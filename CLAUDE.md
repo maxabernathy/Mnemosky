@@ -120,6 +120,13 @@ pip install onnxruntime       # Alternative ONNX backend
    - Active learning: frames sorted by minimum detection confidence, low-confidence detections pulsed with amber star
    - Feeds corrections to `AnnotationDatabase` and applies Tier 1 learning via `ParameterAdapter`
 
+10. **`ProcessingWindow`** - Live processing dashboard shown during video processing
+   - Same dark-grey/fluorescent-accent theme as preview windows
+   - Layout: LIVE FRAME (current frame thumbnail with detection boxes) | TRAIL MAP (2-D scatter of all detected trail centres over normalised frame space) | DETECTION TIMELINE (horizontal strip with stacked bars, waveform overlay, progress playhead) | STATUS BAR (progress ring, processing FPS, detection counts, ETA)
+   - Throttled display (~20 fps redraw) to keep CPU overhead negligible; always redraws on detection events
+   - Press Q/ESC to abort processing early
+   - Automatically enabled when `--preview` is used (seamless transition) or via `--show-processing`
+
 ### Key Functions
 
 - `show_preprocessing_preview()` - Interactive GUI for tuning preprocessing parameters (CLAHE, blur, Canny). Asymmetric layout: large Original panel (left column, ~58% width) + CLAHE/Blur/Edges stacked vertically (right column), sidebar with custom-drawn sliders and trail example thumbnails, full-width frame slider in status bar. Sleek dark-grey theme with fluorescent accent highlights (single window, no external trackbar window).
@@ -436,6 +443,12 @@ python satellite_trail_detector.py input.mp4 output.mp4 --workers 0  # sequentia
 # Disable CUDA GPU acceleration (CPU only)
 python satellite_trail_detector.py input.mp4 output.mp4 --no-gpu
 
+# Live processing dashboard (frame preview, trail map, timeline, progress ring)
+python satellite_trail_detector.py input.mp4 output.mp4 --show-processing
+
+# Preview + processing dashboard (seamless transition: --preview auto-enables dashboard)
+python satellite_trail_detector.py input.mp4 output.mp4 --preview
+
 # HITL review mode: process video, then open interactive review UI
 python satellite_trail_detector.py input.mp4 output.mp4 --review
 
@@ -580,6 +593,8 @@ class CustomDetectionAlgorithm(BaseDetectionAlgorithm):
 
 27. **NN backend auto-install**: When a backend is not installed and the user selects it, `_ensure_nn_backend()` attempts `pip install` automatically. Falls back to a manual install hint on failure. Backend availability is cached in `_NN_BACKENDS_CHECKED` dict.
 
+28. **Processing window (`--show-processing`)**: The `ProcessingWindow` class provides a live dashboard during video processing.  Four panels: LIVE FRAME (thumbnailed current frame with detection boxes), TRAIL MAP (2-D scatter of all trail centre positions plotted over normalised frame space with aspect-ratio-preserving grid), DETECTION TIMELINE (stacked satellite/airplane bar chart bucketed across the video duration, with a waveform overlay showing per-second detection density and a progress playhead), and STATUS BAR (progress ring with percentage, processing FPS, algorithm label, satellite/airplane counts with colour-coded dots, ETA, and abort hint).  Throttled to ~20 fps redraw; always redraws immediately on detection events.  Automatically enabled when `--preview` is used (seamless transition from preview to processing).  Press Q/ESC to abort.
+
 ## Common Tasks
 
 ### Adding a new sensitivity preset
@@ -647,6 +662,7 @@ Add to the `main()` function's argument parser, then handle in `process_video()`
 | NeuralNetDetector class | `satellite_trail_detector.py:NeuralNetDetector` (line ~7570) |
 | NN detect_trails | `satellite_trail_detector.py:NeuralNetDetector.detect_trails()` (line ~7570) |
 | NN param helper | `satellite_trail_detector.py:_apply_nn_params()` (line ~7570) |
+| Processing window | `satellite_trail_detector.py:ProcessingWindow` (line ~10035) |
 | Worker functions | `satellite_trail_detector.py:_worker_init()` / `_worker_detect()` (line ~7930) |
 | Dataset utility functions | `satellite_trail_detector.py:_compute_obb_corners()` etc. (line ~6026) |
 | DatasetExporter class | `satellite_trail_detector.py:DatasetExporter` (line ~6091) |
