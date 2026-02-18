@@ -62,6 +62,21 @@ try:
 except Exception:
     _HAS_CUDA_MEDIAN = False
 
+# ── RAW image support (lazy — only needed for folder input) ──────────────────
+_HAS_RAWPY = False
+try:
+    import rawpy
+    _HAS_RAWPY = True
+except ImportError:
+    pass
+
+_HAS_EXIFREAD = False
+try:
+    import exifread
+    _HAS_EXIFREAD = True
+except ImportError:
+    pass
+
 # ── Neural network backend availability (lazy — import deferred to first use) ─
 _NN_BACKENDS_CHECKED = {}  # name -> bool (cached after first probe)
 
@@ -212,6 +227,139 @@ def _deep_merge(base, override):
             _deep_merge(base[k], v)
         else:
             base[k] = v
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Hardware detection and adaptive compute strategy
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_HARDWARE_PROFILE = None  # cached after first call
+
+
+def _detect_hardware():
+    """Detect available hardware resources (CPU, RAM, GPU).
+
+    Results are cached in ``_HARDWARE_PROFILE`` after the first call.
+
+    Returns:
+        dict with keys: cpu_count, ram_gb, has_cuda, gpu_name, gpu_vram_mb.
+    """
+    global _HARDWARE_PROFILE
+    if _HARDWARE_PROFILE is not None:
+        return _HARDWARE_PROFILE
+
+    profile = {
+        'cpu_count': 1,
+        'ram_gb': 8.0,
+        'has_cuda': _HAS_CUDA,
+        'gpu_name': None,
+        'gpu_vram_mb': 0,
+    }
+
+    # CPU count
+    try:
+        profile['cpu_count'] = multiprocessing.cpu_count()
+    except Exception:
+        pass
+
+    # RAM (Linux sysconf, then fallback)
+    try:
+        page_size = os.sysconf('SC_PAGE_SIZE')
+        phys_pages = os.sysconf('SC_PHYS_PAGES')
+        profile['ram_gb'] = round(page_size * phys_pages / (1024 ** 3), 1)
+    except Exception:
+        try:
+            import shutil
+            total, _, _ = shutil.disk_usage('/')
+            # rough fallback — disk size as a proxy is useless, just keep default
+        except Exception:
+            pass
+
+    # GPU info via OpenCV CUDA
+    if _HAS_CUDA:
+        try:
+            dev_id = cv2.cuda.getDevice()
+            # Try to get device info
+            try:
+                info = cv2.cuda.DeviceInfo(dev_id)
+                profile['gpu_name'] = info.name()
+                profile['gpu_vram_mb'] = int(info.totalMemory() / (1024 * 1024))
+            except Exception:
+                # Fallback: try printCudaDeviceInfo (prints to stdout)
+                import io
+                import contextlib
+                f = io.StringIO()
+                try:
+                    with contextlib.redirect_stdout(f):
+                        cv2.cuda.printCudaDeviceInfo(dev_id)
+                    output = f.getvalue()
+                    for line in output.split('\n'):
+                        if 'name' in line.lower() and ':' in line:
+                            profile['gpu_name'] = line.split(':', 1)[1].strip()
+                        if 'total memory' in line.lower() and ':' in line:
+                            mem_str = line.split(':', 1)[1].strip()
+                            # Parse "XXX MB" or "X.X GB"
+                            if 'gb' in mem_str.lower():
+                                profile['gpu_vram_mb'] = int(
+                                    float(mem_str.lower().replace('gb', '').strip()) * 1024)
+                            elif 'mb' in mem_str.lower():
+                                profile['gpu_vram_mb'] = int(
+                                    float(mem_str.lower().replace('mb', '').strip()))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    _HARDWARE_PROFILE = profile
+    return profile
+
+
+def _optimal_raw_params(hardware, no_gpu=False):
+    """Compute optimal RAW conversion parameters based on hardware.
+
+    Args:
+        hardware: Dict from ``_detect_hardware()``.
+        no_gpu: If True, disable GPU regardless of availability.
+
+    Returns:
+        dict with keys: target_height, num_threads, use_gpu.
+    """
+    ram = hardware.get('ram_gb', 8.0)
+    cpus = hardware.get('cpu_count', 1)
+    has_gpu = hardware.get('has_cuda', False) and not no_gpu
+    vram = hardware.get('gpu_vram_mb', 0)
+
+    # target_height: default 1440, upgrade to 2160 if high-end, cap at 1080 if low RAM
+    if ram < 12:
+        target_height = 1080
+    elif has_gpu and vram >= 8192 and ram >= 16:
+        target_height = 2160
+    else:
+        target_height = 1440
+
+    # num_threads: each decoded 6000x4000x3 16-bit frame ≈ 144MB
+    # Keep total decode-buffer memory under 25% of RAM
+    max_by_ram = max(2, int(ram * 0.25 / 0.15))  # 0.15 GB per frame
+    num_threads = min(cpus, max_by_ram, 4)
+
+    return {
+        'target_height': target_height,
+        'num_threads': num_threads,
+        'use_gpu': has_gpu,
+    }
+
+
+def _format_hardware_summary(hw):
+    """One-line hardware summary for startup output."""
+    parts = [f"{hw['cpu_count']}-core CPU", f"{hw['ram_gb']:.0f}GB RAM"]
+    if hw['has_cuda']:
+        name = hw.get('gpu_name') or 'CUDA GPU'
+        vram = hw.get('gpu_vram_mb', 0)
+        if vram > 0:
+            parts.append(f"{name} ({vram / 1024:.0f}GB VRAM)")
+        else:
+            parts.append(name)
+    return "Hardware: " + ", ".join(parts)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9864,6 +10012,577 @@ class DatasetExporter:
         print(f"{'=' * 50}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# RAW image folder → MP4 conversion
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _extract_exif_from_raw(filepath):
+    """Extract key EXIF fields from a RAW image file.
+
+    Uses the ``exifread`` library (optional dependency).  Returns an empty
+    dict if exifread is not installed or the file cannot be parsed.
+
+    Returns:
+        dict with optional keys: datetime, exposure_time, iso, focal_length.
+    """
+    if not _HAS_EXIFREAD:
+        return {}
+    try:
+        with open(filepath, 'rb') as f:
+            tags = exifread.process_file(f, stop_tag='EXIF FocalLength',
+                                         details=False)
+        result = {}
+        # DateTimeOriginal → datetime
+        dt_tag = tags.get('EXIF DateTimeOriginal')
+        if dt_tag:
+            result['datetime'] = datetime.strptime(
+                str(dt_tag)[:19], '%Y:%m:%d %H:%M:%S')
+        # ExposureTime → float seconds
+        exp_tag = tags.get('EXIF ExposureTime')
+        if exp_tag:
+            val = exp_tag.values[0]
+            result['exposure_time'] = float(val.num) / float(val.den)
+        # ISO
+        iso_tag = tags.get('EXIF ISOSpeedRatings')
+        if iso_tag:
+            result['iso'] = int(str(iso_tag))
+        # FocalLength
+        fl_tag = tags.get('EXIF FocalLength')
+        if fl_tag:
+            val = fl_tag.values[0]
+            result['focal_length'] = float(val.num) / float(val.den)
+        return result
+    except Exception:
+        return {}
+
+
+def _decode_raw_file(filepath, half_size=False):
+    """Decode a single RAW file to a 16-bit BGR numpy array.
+
+    Args:
+        filepath: Path to the RAW file.
+        half_size: Use half-size demosaic for speed (2x faster, half resolution).
+
+    Returns:
+        16-bit BGR numpy array, or None on failure.
+    """
+    try:
+        with rawpy.imread(str(filepath)) as raw:
+            rgb = raw.postprocess(
+                use_camera_wb=True,
+                half_size=half_size,
+                no_auto_bright=True,
+                output_bps=16,
+            )
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    except Exception as e:
+        print(f"  Warning: failed to decode {Path(filepath).name}: {e}")
+        return None
+
+
+def _enhance_raw_frame_16bit(bgr16, use_gpu=False):
+    """Apply 16-bit dim-trail enhancement to a RAW-decoded BGR frame.
+
+    Enhancement pipeline (in LAB space to preserve colour):
+      1. BGR → LAB at 16-bit
+      2. CLAHE on L channel (clipLimit=4.0, tileGridSize=(8,8))
+      3. Percentile stretch on L: map [p2, p99.5] → [0, 65535]
+      4. LAB → BGR
+
+    Args:
+        bgr16: 16-bit BGR numpy array (dtype uint16).
+        use_gpu: If True, attempt CUDA acceleration.
+
+    Returns:
+        Enhanced 16-bit BGR numpy array.
+    """
+    # GPU path
+    if use_gpu and _HAS_CUDA:
+        try:
+            gpu_bgr = cv2.cuda_GpuMat()
+            gpu_bgr.upload(bgr16)
+
+            # BGR → LAB on GPU
+            gpu_lab = cv2.cuda.cvtColor(gpu_bgr, cv2.COLOR_BGR2Lab)
+            lab = gpu_lab.download()
+
+            L = lab[:, :, 0].copy()
+
+            # CLAHE on L (CPU — cv2.cuda.createCLAHE may not be available
+            # for 16-bit; use CPU CLAHE which is still fast on L-only)
+            clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+            L = clahe.apply(L)
+
+            # Percentile stretch
+            p_lo, p_hi = np.percentile(L, [2, 99.5])
+            if p_hi > p_lo:
+                L = np.clip((L.astype(np.float32) - p_lo) /
+                            (p_hi - p_lo) * 65535, 0, 65535).astype(np.uint16)
+
+            lab[:, :, 0] = L
+
+            # LAB → BGR on GPU
+            gpu_lab2 = cv2.cuda_GpuMat()
+            gpu_lab2.upload(lab)
+            gpu_result = cv2.cuda.cvtColor(gpu_lab2, cv2.COLOR_Lab2BGR)
+            return gpu_result.download()
+        except Exception:
+            pass  # fall through to CPU
+
+    # CPU path
+    lab = cv2.cvtColor(bgr16, cv2.COLOR_BGR2Lab)
+    L = lab[:, :, 0].copy()
+
+    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+    L = clahe.apply(L)
+
+    p_lo, p_hi = np.percentile(L, [2, 99.5])
+    if p_hi > p_lo:
+        L = np.clip((L.astype(np.float32) - p_lo) /
+                    (p_hi - p_lo) * 65535, 0, 65535).astype(np.uint16)
+
+    lab[:, :, 0] = L
+    return cv2.cvtColor(lab, cv2.COLOR_Lab2BGR)
+
+
+def convert_raw_folder_to_video(folder_path, output_video_path,
+                                target_height=1440, output_fps=24.0,
+                                half_size=False, enhance=True,
+                                no_gpu=False, num_threads=0):
+    """Convert a folder of RAW image files to an MP4 video.
+
+    Decodes RAW files (ARW, CR2, NEF, DNG, etc.) via rawpy, optionally
+    applies 16-bit CLAHE + percentile stretch to boost dim trail visibility,
+    downscales to ``target_height``, and writes an MP4 video.
+
+    Displays a live progress window with frame preview, EXIF info,
+    conversion stats, and L-channel histogram.
+
+    Args:
+        folder_path: Path to folder containing RAW image files.
+        output_video_path: Path for the output MP4 file.
+        target_height: Downscale height in pixels (0 = native resolution).
+        output_fps: Playback FPS for the output video.
+        half_size: Use half-size demosaic for faster decoding.
+        enhance: Apply 16-bit CLAHE + percentile stretch.
+        no_gpu: Disable CUDA GPU acceleration.
+        num_threads: Number of parallel RAW decode threads (0 = auto).
+
+    Returns:
+        Metadata dict with timelapse info and conversion parameters.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    folder = Path(folder_path)
+
+    # ── Step 1: Discover RAW files ───────────────────────────────────────────
+    raw_extensions = ['*.ARW', '*.arw', '*.CR2', '*.cr2',
+                      '*.NEF', '*.nef', '*.DNG', '*.dng']
+    all_files = []
+    for ext in raw_extensions:
+        all_files.extend(sorted(folder.glob(ext)))
+
+    # Deduplicate (case-insensitive filesystems)
+    seen = set()
+    files = []
+    for f in all_files:
+        key = str(f).lower()
+        if key not in seen:
+            seen.add(key)
+            files.append(f)
+    files.sort()
+
+    if not files:
+        print(f"Error: No RAW image files found in {folder}")
+        print("  Supported formats: ARW, CR2, NEF, DNG")
+        return None
+
+    total = len(files)
+    print(f"Found {total} RAW images in {folder}")
+
+    # ── Step 2: Extract EXIF metadata ────────────────────────────────────────
+    metadata = {'total_images': total, 'source_folder': str(folder)}
+
+    # Sample first 5 + last 3 files for timestamp computation
+    sample_indices = list(range(min(5, total)))
+    if total > 5:
+        sample_indices += list(range(max(5, total - 3), total))
+
+    timestamps = []
+    first_exif = _extract_exif_from_raw(files[0])
+
+    if first_exif.get('exposure_time'):
+        metadata['exposure_time'] = first_exif['exposure_time']
+    if first_exif.get('iso'):
+        metadata['iso'] = first_exif['iso']
+    if first_exif.get('focal_length'):
+        metadata['focal_length'] = first_exif['focal_length']
+
+    if _HAS_EXIFREAD:
+        for idx in sample_indices:
+            exif = _extract_exif_from_raw(files[idx])
+            if 'datetime' in exif:
+                timestamps.append((idx, exif['datetime']))
+
+        if len(timestamps) >= 2:
+            timestamps.sort(key=lambda t: t[0])
+            intervals = []
+            for i in range(1, len(timestamps)):
+                dt = (timestamps[i][1] - timestamps[i - 1][1]).total_seconds()
+                didx = timestamps[i][0] - timestamps[i - 1][0]
+                if didx > 0 and dt > 0:
+                    intervals.append(dt / didx)
+
+            if intervals:
+                median_interval = float(np.median(intervals))
+                metadata['frame_interval_seconds'] = median_interval
+                metadata['effective_capture_fps'] = (
+                    1.0 / median_interval if median_interval > 0 else output_fps)
+                metadata['total_duration_seconds'] = median_interval * (total - 1)
+                if metadata.get('exposure_time'):
+                    metadata['duty_cycle'] = (
+                        metadata['exposure_time'] / median_interval)
+                metadata['fps_source'] = 'exif_computed'
+    else:
+        print("  Warning: exifread not installed — cannot extract EXIF metadata.")
+        print("    pip install exifread")
+        print("  Falling back to default timing. Use --fps and --exposure-time "
+              "to override.")
+
+    if 'fps_source' not in metadata:
+        metadata['fps_source'] = 'default_fallback'
+        metadata['effective_capture_fps'] = output_fps
+
+    metadata['output_fps'] = output_fps
+
+    # Print timelapse summary
+    print(f"  EXIF: ", end="")
+    parts = []
+    if metadata.get('exposure_time'):
+        parts.append(f"exp={metadata['exposure_time']}s")
+    if metadata.get('iso'):
+        parts.append(f"ISO {metadata['iso']}")
+    if metadata.get('focal_length'):
+        parts.append(f"{metadata['focal_length']}mm")
+    print(", ".join(parts) if parts else "unavailable")
+
+    if 'frame_interval_seconds' in metadata:
+        dur = metadata.get('total_duration_seconds', 0)
+        dur_min = dur / 60
+        print(f"  Interval: {metadata['frame_interval_seconds']:.1f}s  "
+              f"Duration: {dur_min:.1f}min  "
+              f"Duty cycle: {metadata.get('duty_cycle', 0):.1%}")
+    print(f"  Output FPS: {output_fps}  "
+          f"(source: {metadata['fps_source']})")
+
+    # ── Step 3: Setup parallel decoding + GPU enhancement ────────────────────
+    hw = _detect_hardware()
+    use_gpu = _HAS_CUDA and not no_gpu
+    if num_threads <= 0:
+        opt = _optimal_raw_params(hw, no_gpu=no_gpu)
+        num_threads = opt['num_threads']
+
+    # Decode first frame to determine dimensions
+    print(f"  Decoding first frame to determine dimensions...")
+    first_frame = _decode_raw_file(files[0], half_size=half_size)
+    if first_frame is None:
+        print("Error: Could not decode any RAW files.")
+        return None
+
+    src_h, src_w = first_frame.shape[:2]
+
+    if target_height > 0 and src_h > target_height:
+        scale = target_height / src_h
+        out_w = int(src_w * scale)
+        out_h = target_height
+    else:
+        out_w, out_h = src_w, src_h
+
+    metadata['width'] = out_w
+    metadata['height'] = out_h
+    print(f"  Source: {src_w}x{src_h} → Output: {out_w}x{out_h}")
+    print(f"  Threads: {num_threads}  GPU: {'Yes' if use_gpu else 'No'}  "
+          f"Enhance: {'Yes' if enhance else 'No'}  "
+          f"Half-size: {'Yes' if half_size else 'No'}")
+
+    # ── Initialize VideoWriter ───────────────────────────────────────────────
+    codecs_to_try = [
+        ('mp4v', 'MPEG-4'), ('avc1', 'H.264'), ('h264', 'H.264'),
+        ('H264', 'H.264'), ('X264', 'H.264'),
+    ]
+    out = None
+    for codec_name, codec_desc in codecs_to_try:
+        fourcc = cv2.VideoWriter_fourcc(*codec_name)
+        test_out = cv2.VideoWriter(
+            str(output_video_path), fourcc, output_fps, (out_w, out_h))
+        if test_out.isOpened():
+            out = test_out
+            print(f"  Codec: {codec_name} ({codec_desc})")
+            break
+        test_out.release()
+    if out is None:
+        fourcc = -1
+        out = cv2.VideoWriter(
+            str(output_video_path), fourcc, output_fps, (out_w, out_h))
+        print(f"  Codec: system default")
+    if out is None or not out.isOpened():
+        print("Error: Could not create output video.")
+        return None
+
+    # ── Progress window setup ────────────────────────────────────────────────
+    CANVAS_W, CANVAS_H = 1280, 720
+    BG = (30, 30, 30)
+    BG_CARD = (42, 42, 42)
+    TEXT = (210, 210, 210)
+    TEXT_DIM = (120, 120, 120)
+    ACCENT = (200, 255, 80)  # fluorescent green-yellow (BGR)
+    BAR_BG = (50, 50, 50)
+    HEADER_H = 40
+    PROGRESS_H = 32
+    SIDEBAR_W = 340
+    PREVIEW_W = CANVAS_W - SIDEBAR_W - 20  # 10px padding each side
+    PREVIEW_H = CANVAS_H - HEADER_H - PROGRESS_H - 20
+
+    def _fill_rect(img, x, y, w, h, color):
+        cv2.rectangle(img, (x, y), (x + w, y + h), color, -1)
+
+    def _put_text(img, text, x, y, color, scale=0.42, thickness=1):
+        cv2.putText(img, str(text), (int(x), int(y)),
+                    cv2.FONT_HERSHEY_SIMPLEX, scale, color,
+                    thickness, cv2.LINE_AA)
+
+    # Build static canvas
+    canvas = np.full((CANVAS_H, CANVAS_W, 3), BG[0], dtype=np.uint8)
+    canvas[:, :, 1] = BG[1]
+    canvas[:, :, 2] = BG[2]
+
+    # Header bar background
+    _fill_rect(canvas, 0, 0, CANVAS_W, HEADER_H, (22, 22, 22))
+    _put_text(canvas, "RAW Conversion", 12, 26, ACCENT, 0.55, 1)
+
+    # Progress bar background
+    _fill_rect(canvas, 0, CANVAS_H - PROGRESS_H, CANVAS_W, PROGRESS_H,
+               (22, 22, 22))
+
+    # Sidebar — EXIF info card (static)
+    sx = CANVAS_W - SIDEBAR_W + 10
+    sy = HEADER_H + 10
+    card_w = SIDEBAR_W - 20
+    _fill_rect(canvas, sx, sy, card_w, 130, BG_CARD)
+    _put_text(canvas, "EXIF Info", sx + 8, sy + 18, ACCENT, 0.40, 1)
+    exif_lines = []
+    if metadata.get('exposure_time'):
+        exif_lines.append(f"Exposure: {metadata['exposure_time']}s")
+    if metadata.get('iso'):
+        exif_lines.append(f"ISO: {metadata['iso']}")
+    if metadata.get('focal_length'):
+        exif_lines.append(f"Focal: {metadata['focal_length']}mm")
+    if 'frame_interval_seconds' in metadata:
+        exif_lines.append(
+            f"Interval: {metadata['frame_interval_seconds']:.1f}s")
+    if 'total_duration_seconds' in metadata:
+        dur = metadata['total_duration_seconds']
+        if dur >= 3600:
+            exif_lines.append(f"Duration: {dur / 3600:.1f}h")
+        else:
+            exif_lines.append(f"Duration: {dur / 60:.1f}min")
+    if metadata.get('duty_cycle'):
+        exif_lines.append(f"Duty cycle: {metadata['duty_cycle']:.1%}")
+    for i, line in enumerate(exif_lines[:6]):
+        _put_text(canvas, line, sx + 12, sy + 36 + i * 16, TEXT, 0.36)
+
+    # Static canvas saved for per-frame refresh
+    static_canvas = canvas.copy()
+
+    show_window = True
+    decode_times = []
+    enhance_times = []
+
+    # ── Step 4: Parallel decode + enhance + write loop ───────────────────────
+    def _decode_task(filepath):
+        """Worker task: decode a single RAW file."""
+        return _decode_raw_file(filepath, half_size=half_size)
+
+    written = 0
+    skipped = 0
+    t_start = time.time()
+
+    # Process first frame (already decoded)
+    def _process_frame(bgr16, frame_idx, filename):
+        """Enhance, downscale, write, and update progress window."""
+        nonlocal written, show_window
+
+        t_enh_start = time.time()
+
+        if enhance:
+            bgr16 = _enhance_raw_frame_16bit(bgr16, use_gpu=use_gpu)
+
+        # Downscale
+        h, w = bgr16.shape[:2]
+        if out_h != h or out_w != w:
+            bgr16 = cv2.resize(bgr16, (out_w, out_h),
+                               interpolation=cv2.INTER_AREA)
+
+        # 16-bit → 8-bit
+        frame_8bit = (bgr16 >> 8).astype(np.uint8)
+
+        t_enh = time.time() - t_enh_start
+        enhance_times.append(t_enh)
+
+        # Write to video
+        out.write(frame_8bit)
+        written += 1
+
+        # ── Update progress window ──────────────────────────────────────
+        if not show_window:
+            return
+
+        try:
+            canvas[:] = static_canvas
+
+            # Header: filename + counter
+            pct = frame_idx / total * 100
+            header_text = (f"{filename}  --  {frame_idx + 1} / {total}  "
+                           f"({pct:.1f}%)")
+            _put_text(canvas, header_text, 200, 26, TEXT, 0.45)
+
+            # Preview panel
+            preview_x, preview_y = 10, HEADER_H + 10
+            # Fit frame into preview area maintaining aspect ratio
+            ph, pw = frame_8bit.shape[:2]
+            scale_p = min(PREVIEW_W / pw, PREVIEW_H / ph)
+            disp_w = int(pw * scale_p)
+            disp_h = int(ph * scale_p)
+            preview = cv2.resize(frame_8bit, (disp_w, disp_h),
+                                 interpolation=cv2.INTER_AREA)
+            # Center in preview area
+            px = preview_x + (PREVIEW_W - disp_w) // 2
+            py = preview_y + (PREVIEW_H - disp_h) // 2
+            canvas[py:py + disp_h, px:px + disp_w] = preview
+
+            # Sidebar — Conversion Stats card
+            stats_y = HEADER_H + 150
+            _fill_rect(canvas, sx, stats_y, card_w, 120, BG_CARD)
+            _put_text(canvas, "Conversion Stats", sx + 8, stats_y + 18,
+                      ACCENT, 0.40, 1)
+
+            avg_dec = (np.mean(decode_times[-20:])
+                       if decode_times else 0)
+            avg_enh = (np.mean(enhance_times[-20:])
+                       if enhance_times else 0)
+            elapsed = time.time() - t_start
+            fps_actual = written / elapsed if elapsed > 0 else 0
+            remaining = total - frame_idx - 1
+            eta = remaining / fps_actual if fps_actual > 0 else 0
+            eta_str = (f"{eta / 60:.0f}m {eta % 60:.0f}s"
+                       if eta >= 60 else f"{eta:.0f}s")
+
+            stats_lines = [
+                f"Decode: {avg_dec:.2f}s/frame",
+                f"Enhance: {avg_enh:.3f}s/frame",
+                f"Speed: {fps_actual:.2f} frames/s",
+                f"ETA: {eta_str}",
+                f"Output: {out_w}x{out_h}",
+            ]
+            for i, line in enumerate(stats_lines):
+                _put_text(canvas, line, sx + 12, stats_y + 36 + i * 16,
+                          TEXT, 0.36)
+
+            # Sidebar — L-channel histogram
+            hist_y = stats_y + 135
+            hist_w, hist_h = card_w - 20, 80
+            _fill_rect(canvas, sx, hist_y, card_w, hist_h + 20, BG_CARD)
+            _put_text(canvas, "L Histogram (8-bit output)", sx + 8,
+                      hist_y + 14, TEXT_DIM, 0.32)
+
+            gray = cv2.cvtColor(frame_8bit, cv2.COLOR_BGR2GRAY)
+            hist = cv2.calcHist([gray], [0], None, [64], [0, 256])
+            hist = hist.ravel()
+            max_val = hist.max()
+            if max_val > 0:
+                hist = hist / max_val * (hist_h - 10)
+                hx = sx + 10
+                hy = hist_y + hist_h + 5
+                pts = [(hx + int(i * hist_w / 64), int(hy - hist[i]))
+                       for i in range(64)]
+                pts = [(hx, hy)] + pts + [(hx + hist_w, hy)]
+                cv2.fillPoly(canvas,
+                             [np.array(pts, dtype=np.int32)],
+                             (100, 180, 50))
+
+            # Progress bar
+            bar_y = CANVAS_H - PROGRESS_H + 6
+            bar_w = CANVAS_W - 20
+            _fill_rect(canvas, 10, bar_y, bar_w, 16, BAR_BG)
+            fill_w = int(bar_w * (frame_idx + 1) / total)
+            if fill_w > 0:
+                _fill_rect(canvas, 10, bar_y, fill_w, 16, ACCENT)
+            bar_text = f"{frame_idx + 1}/{total}  {pct:.1f}%"
+            _put_text(canvas, bar_text, 20, bar_y + 13, (30, 30, 30), 0.36)
+
+            cv2.imshow('Mnemosky - RAW Conversion', canvas)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q') or key == ord('Q'):
+                show_window = False
+                cv2.destroyWindow('Mnemosky - RAW Conversion')
+        except Exception:
+            # Headless or display error — disable window silently
+            show_window = False
+
+    # Process the already-decoded first frame
+    t_dec0 = time.time()
+    decode_times.append(0.0)  # first frame was decoded during setup
+    _process_frame(first_frame, 0, files[0].name)
+    del first_frame
+
+    # Process remaining frames with parallel decoding
+    if total > 1:
+        remaining_files = files[1:]
+
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            # Submit all decode tasks
+            futures = []
+            for f in remaining_files:
+                futures.append(executor.submit(_decode_task, f))
+
+            # Collect results in order and process
+            for i, future in enumerate(futures):
+                frame_idx = i + 1
+                t_dec_start = time.time()
+
+                try:
+                    bgr16 = future.result(timeout=120)
+                except Exception as e:
+                    print(f"  Warning: decode timeout/error for "
+                          f"{remaining_files[i].name}: {e}")
+                    skipped += 1
+                    continue
+
+                decode_times.append(time.time() - t_dec_start)
+
+                if bgr16 is None:
+                    skipped += 1
+                    continue
+
+                _process_frame(bgr16, frame_idx, remaining_files[i].name)
+
+    # Cleanup
+    out.release()
+    if show_window:
+        try:
+            cv2.destroyWindow('Mnemosky - RAW Conversion')
+        except Exception:
+            pass
+
+    elapsed = time.time() - t_start
+    metadata['output_video'] = str(output_video_path)
+    print(f"  Conversion complete: {written} frames written, "
+          f"{skipped} skipped, {elapsed:.1f}s total")
+
+    return metadata
+
+
 def export_dataset_from_annotations(input_path, annotations_path,
                                     dataset_dir_override=None,
                                     output_path=None,
@@ -10673,6 +11392,12 @@ Examples:
     python satellite_trail_detector.py video.mp4 debug_viz.mp4 --debug-only
     python satellite_trail_detector.py video.mp4 output.mp4 --preview
 
+RAW Image Folder Input (Sony A7III, Canon, Nikon, etc.):
+    python satellite_trail_detector.py /mnt/sdcard/DCIM/101SONY/ output.mp4
+    python satellite_trail_detector.py ./night_sky/ output.mp4 --half-size-raw --keep-video
+    python satellite_trail_detector.py ./arw_folder/ output.mp4 --target-height 2160
+    python satellite_trail_detector.py ./arw_folder/ output.mp4 --no-raw-enhance --fps 30
+
 Notes:
     - Output video maintains same resolution and quality as input
     - Uses MPEG-4 (mp4v) codec by default for broad compatibility
@@ -10691,9 +11416,9 @@ Notes:
     
     parser.add_argument(
         'input',
-        help='Path to input MP4 video file'
+        help='Path to input MP4 video file or folder of RAW images (ARW, CR2, NEF, DNG)'
     )
-    
+
     parser.add_argument(
         'output',
         help='Path to output MP4 video file'
@@ -10950,6 +11675,43 @@ Notes:
         help='Disable CUDA GPU acceleration even if available'
     )
 
+    # --- RAW Image Folder Input ---
+    parser.add_argument(
+        '--fps',
+        type=float, default=None,
+        help='Override playback FPS for output video when input is an image '
+             'folder. Default: 24.0'
+    )
+
+    parser.add_argument(
+        '--target-height',
+        type=int, default=None,
+        help='Downscale height for RAW images before processing. '
+             'Default: auto (1080-2160 based on hardware). '
+             'Use 0 for native resolution (e.g. 6000x4000 for A7III).'
+    )
+
+    parser.add_argument(
+        '--half-size-raw',
+        action='store_true',
+        help='Use half-size demosaic for RAW decoding (~2x faster). '
+             'Produces half-resolution before downscale.'
+    )
+
+    parser.add_argument(
+        '--keep-video',
+        action='store_true',
+        help='Keep the intermediate MP4 video when input is an image folder. '
+             'Saved as <output>.input.mp4 for reuse without re-decoding.'
+    )
+
+    parser.add_argument(
+        '--no-raw-enhance',
+        action='store_true',
+        help='Skip 16-bit CLAHE + percentile stretch during RAW-to-video '
+             'conversion. Faster but loses dim trail enhancement.'
+    )
+
     # --- HITL Review Mode ---
     parser.add_argument(
         '--review',
@@ -11066,24 +11828,83 @@ Notes:
         save_config(config, args.config)
         print(f"Config saved to {args.config or _CONFIG_PATH}")
 
+    # ── RAW image folder → intermediate MP4 conversion ────────────────
+    # Must happen before preview so --preview operates on the converted video.
+    input_path = args.input
+    _raw_intermediate = None  # path to temp file for cleanup
+
+    if Path(input_path).is_dir():
+        if not _HAS_RAWPY:
+            print("Error: rawpy is required for RAW image folder support.")
+            print("  pip install rawpy")
+            sys.exit(1)
+
+        # Detect hardware for adaptive parameter selection
+        hw = _detect_hardware()
+        print(_format_hardware_summary(hw))
+        opt = _optimal_raw_params(hw, no_gpu=args.no_gpu)
+
+        # Determine target height (CLI override → hardware-optimal → default)
+        target_h = args.target_height
+        if target_h is None:
+            target_h = opt['target_height']
+
+        # Determine intermediate video path
+        if args.keep_video:
+            intermediate = str(
+                Path(args.output).parent /
+                (Path(args.output).stem + '.input.mp4'))
+        else:
+            tmp = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+            intermediate = tmp.name
+            tmp.close()
+            _raw_intermediate = intermediate
+
+        raw_metadata = convert_raw_folder_to_video(
+            input_path, intermediate,
+            target_height=target_h,
+            output_fps=args.fps or 24.0,
+            half_size=args.half_size_raw,
+            enhance=not args.no_raw_enhance,
+            no_gpu=args.no_gpu,
+            num_threads=args.workers,
+        )
+
+        if raw_metadata is None:
+            print("Error: RAW folder conversion failed.")
+            if _raw_intermediate and os.path.exists(_raw_intermediate):
+                os.unlink(_raw_intermediate)
+            sys.exit(1)
+
+        # Override exposure_time from EXIF
+        if raw_metadata.get('exposure_time'):
+            args.exposure_time = raw_metadata['exposure_time']
+            print(f"Using EXIF exposure time: {args.exposure_time}s")
+
+        input_path = intermediate
+        print(f"Intermediate video: {intermediate}")
+        if args.keep_video:
+            print(f"  (kept for reuse — pass this file directly next time)")
+
     # Handle preprocessing preview if requested
+    # Uses input_path (which is the intermediate MP4 for folder input)
     preprocessing_params = None
     signal_envelope = None
     radon_preview_params = None
     nn_preview_params = None
     if args.preview:
         if args.algorithm == 'radon':
-            radon_preview_params = show_radon_preview(args.input)
+            radon_preview_params = show_radon_preview(input_path)
             if radon_preview_params is None:
                 print("Using default Radon pipeline parameters.")
         elif args.algorithm == 'nn':
-            nn_preview_params = show_nn_preview(args.input, nn_params=nn_params)
+            nn_preview_params = show_nn_preview(input_path, nn_params=nn_params)
             if nn_preview_params is not None:
                 nn_params.update(nn_preview_params)
             else:
                 print("Using default NN pipeline parameters.")
         else:
-            preprocessing_params = show_preprocessing_preview(args.input)
+            preprocessing_params = show_preprocessing_preview(input_path)
             if preprocessing_params is None:
                 print("Using default preprocessing parameters.")
             else:
@@ -11105,7 +11926,7 @@ Notes:
     # Handle --dataset-from-annotations: export from HITL-verified annotations
     if args.dataset_from_annotations:
         export_dataset_from_annotations(
-            input_path=args.input,
+            input_path=input_path,
             annotations_path=args.dataset_from_annotations,
             dataset_dir_override=args.dataset_dir,
             output_path=args.output,
@@ -11120,9 +11941,10 @@ Notes:
         )
         return
 
-    process_video(
-        args.input,
-        args.output,
+    try:
+        process_video(
+            input_path,
+            args.output,
         sensitivity=args.sensitivity,
         freeze_duration=args.freeze_duration,
         max_duration=args.max_duration,
@@ -11158,6 +11980,13 @@ Notes:
         radon_params=radon_preview_params,
         nn_params=nn_params,
     )
+    finally:
+        # Clean up temporary intermediate video from RAW conversion
+        if _raw_intermediate and os.path.exists(_raw_intermediate):
+            try:
+                os.unlink(_raw_intermediate)
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':
