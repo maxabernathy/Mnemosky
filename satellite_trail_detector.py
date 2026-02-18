@@ -45,6 +45,8 @@ from pathlib import Path
 from collections import deque
 from datetime import datetime, timezone
 
+__version__ = '0.2.0-sts'
+
 try:
     from scipy.ndimage import maximum_filter as _scipy_maximum_filter
     _HAS_SCIPY = True
@@ -3815,6 +3817,158 @@ class DetectionTracker:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  STS-Inspired Components: Translation Ledger, Loss Profiles
+# ═══════════════════════════════════════════════════════════════════════
+
+class TranslationLedger:
+    """Accounting for what the detector rejected and why (Callon).
+
+    Every transformation from raw pixels to classified detection *loses*
+    something.  The translation ledger tracks aggregate rejection statistics
+    so users can see what the detector discarded, making the filtering
+    assumptions transparent and auditable.
+
+    Inspired by Michel Callon's sociology of translation — each stage of
+    the detection pipeline is a translation that recruits some phenomena
+    and excludes others.  The ledger makes these exclusions visible.
+    """
+
+    def __init__(self):
+        self.total_lines_detected = 0
+        self.rejected_too_short = 0
+        self.rejected_too_long = 0
+        self.rejected_full_frame = 0
+        self.rejected_low_contrast = 0
+        self.rejected_too_dark = 0
+        self.rejected_too_few_pixels = 0
+        self.rejected_cloud_texture = 0
+        self.rejected_too_bright = 0
+        self.rejected_segment_variation = 0
+        self.rejected_aspect_ratio = 0
+        self.rejected_unclassifiable = 0
+        self.classified_satellite = 0
+        self.classified_airplane = 0
+        self.classified_anomalous = 0
+        self.supplementary_lines = 0
+        self.example_rejections = []   # up to 5 examples with reasons
+        self._max_examples = 5
+
+    def record_rejection(self, reason, line=None):
+        """Increment a rejection counter and optionally store an example."""
+        attr = f'rejected_{reason}'
+        if hasattr(self, attr):
+            setattr(self, attr, getattr(self, attr) + 1)
+        if line is not None and len(self.example_rejections) < self._max_examples:
+            self.example_rejections.append({
+                'reason': reason, 'line': tuple(int(v) for v in line[0])})
+
+    def record_classification(self, trail_type):
+        """Increment the counter for a successful classification."""
+        attr = f'classified_{trail_type}'
+        if hasattr(self, attr):
+            setattr(self, attr, getattr(self, attr) + 1)
+
+    @property
+    def total_rejected(self):
+        return sum(getattr(self, a) for a in dir(self) if a.startswith('rejected_'))
+
+    @property
+    def total_classified(self):
+        return (self.classified_satellite + self.classified_airplane +
+                self.classified_anomalous)
+
+    def summary_lines(self):
+        """Return a list of formatted summary strings for display."""
+        total = self.total_lines_detected + self.supplementary_lines
+        if total == 0:
+            return ["Translation Ledger: no lines detected"]
+        lines = []
+        lines.append("=== Translation Ledger (Callon) ===")
+        lines.append(f"Primary lines detected (Hough):   {self.total_lines_detected:>6}")
+        if self.supplementary_lines:
+            lines.append(f"Supplementary lines (matched flt): {self.supplementary_lines:>5}")
+        lines.append(f"  Rejected (too short):            {self.rejected_too_short:>5}  "
+                      f"({self._pct(self.rejected_too_short, total)})")
+        lines.append(f"  Rejected (too long):             {self.rejected_too_long:>5}  "
+                      f"({self._pct(self.rejected_too_long, total)})")
+        lines.append(f"  Rejected (full-frame artifact):  {self.rejected_full_frame:>5}  "
+                      f"({self._pct(self.rejected_full_frame, total)})")
+        lines.append(f"  Rejected (low contrast):         {self.rejected_low_contrast:>5}  "
+                      f"({self._pct(self.rejected_low_contrast, total)})")
+        lines.append(f"  Rejected (too dark):             {self.rejected_too_dark:>5}  "
+                      f"({self._pct(self.rejected_too_dark, total)})")
+        lines.append(f"  Rejected (cloud/texture):        {self.rejected_cloud_texture:>5}  "
+                      f"({self._pct(self.rejected_cloud_texture, total)})")
+        lines.append(f"  Rejected (too bright):           {self.rejected_too_bright:>5}  "
+                      f"({self._pct(self.rejected_too_bright, total)})")
+        lines.append(f"  Rejected (aspect ratio):         {self.rejected_aspect_ratio:>5}  "
+                      f"({self._pct(self.rejected_aspect_ratio, total)})")
+        lines.append(f"  Rejected (segment variation):    {self.rejected_segment_variation:>5}  "
+                      f"({self._pct(self.rejected_segment_variation, total)})")
+        lines.append(f"  Rejected (unclassifiable):       {self.rejected_unclassifiable:>5}  "
+                      f"({self._pct(self.rejected_unclassifiable, total)})")
+        lines.append(f"  {'─' * 43}")
+        lines.append(f"  Classified as satellite:         {self.classified_satellite:>5}  "
+                      f"({self._pct(self.classified_satellite, total)})")
+        lines.append(f"  Classified as airplane:          {self.classified_airplane:>5}  "
+                      f"({self._pct(self.classified_airplane, total)})")
+        if self.classified_anomalous:
+            lines.append(f"  Classified as anomalous:         {self.classified_anomalous:>5}  "
+                          f"({self._pct(self.classified_anomalous, total)})")
+        lines.append(f"  {'─' * 43}")
+        survived = self.total_classified
+        lines.append(f"  Survival rate: {self._pct(survived, total)} "
+                      f"of detected lines → classified trails")
+        return lines
+
+    def to_dict(self):
+        """Serialize for JSON storage in annotation database."""
+        return {k: getattr(self, k) for k in [
+            'total_lines_detected', 'supplementary_lines',
+            'rejected_too_short', 'rejected_too_long', 'rejected_full_frame',
+            'rejected_low_contrast', 'rejected_too_dark',
+            'rejected_too_few_pixels', 'rejected_cloud_texture',
+            'rejected_too_bright', 'rejected_segment_variation',
+            'rejected_aspect_ratio', 'rejected_unclassifiable',
+            'classified_satellite', 'classified_airplane',
+            'classified_anomalous', 'example_rejections',
+        ]}
+
+    @staticmethod
+    def _pct(n, total):
+        return f"{n / total * 100:.1f}%" if total > 0 else "0.0%"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  STS-Inspired: Situated Loss Profiles (Winner / Jasanoff)
+# ═══════════════════════════════════════════════════════════════════════
+#
+#  The loss function weights are *political choices* disguised as
+#  engineering defaults.  Making them a named user-facing choice with
+#  explicit value statements embodies Langdon Winner's insight that
+#  artifacts have politics.
+
+LOSS_PROFILES = {
+    'discovery': {
+        'weights': {'fp': 0.5, 'fn': 3.0, 'mc': 0.3},
+        'description': 'Maximizes recall — prioritizes not missing faint trails',
+    },
+    'precision': {
+        'weights': {'fp': 3.0, 'fn': 0.5, 'mc': 1.0},
+        'description': 'Minimizes false alarms — prioritizes confident detections',
+    },
+    'balanced': {
+        'weights': {'fp': 1.0, 'fn': 2.0, 'mc': 0.5},
+        'description': 'Balanced — slight preference for recall over precision',
+    },
+    'catalog': {
+        'weights': {'fp': 1.0, 'fn': 1.0, 'mc': 3.0},
+        'description': 'Prioritizes correct satellite vs airplane classification',
+    },
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  HITL (Human-in-the-Loop) Reinforcement Learning Components
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -3914,8 +4068,8 @@ class AnnotationDatabase:
     Supports loading/saving to JSON and export to pure COCO format.
     """
 
-    CATEGORY_MAP = {0: 'satellite', 1: 'airplane'}
-    CATEGORY_ID = {'satellite': 0, 'airplane': 1}
+    CATEGORY_MAP = {0: 'satellite', 1: 'airplane', 2: 'anomalous'}
+    CATEGORY_ID = {'satellite': 0, 'airplane': 1, 'anomalous': 2}
 
     def __init__(self, path=None):
         """Load existing database or create empty one."""
@@ -3935,6 +4089,7 @@ class AnnotationDatabase:
             'categories': [
                 {'id': 0, 'name': 'satellite', 'supercategory': 'trail'},
                 {'id': 1, 'name': 'airplane', 'supercategory': 'trail'},
+                {'id': 2, 'name': 'anomalous', 'supercategory': 'trail'},
             ],
             'images': [],
             'annotations': [],
@@ -4012,7 +4167,8 @@ class AnnotationDatabase:
         det_meta = {}
         for key in ('angle', 'center', 'length', 'avg_brightness', 'max_brightness',
                      'line', 'contrast_ratio', 'brightness_std', 'trail_snr',
-                     'has_dotted_pattern', 'avg_saturation'):
+                     'has_dotted_pattern', 'avg_saturation',
+                     'epistemic_profile', 'inscription'):
             if key in detection_info:
                 val = detection_info[key]
                 # Convert numpy types to native Python for JSON
@@ -4198,7 +4354,8 @@ class AnnotationDatabase:
         """Get all missed annotations for a given image."""
         return [m for m in self.data['missed_annotations'] if m['image_id'] == image_id]
 
-    def start_session(self, video_source, sensitivity, algorithm, params):
+    def start_session(self, video_source, sensitivity, algorithm, params,
+                      observer_context=None, loss_profile='balanced'):
         """Begin a new review session."""
         ts = datetime.now(timezone.utc)
         self._current_session_id = f"sess_{ts.strftime('%Y%m%d_%H%M%S')}"
@@ -4209,6 +4366,9 @@ class AnnotationDatabase:
             'completed_at': None,
             'sensitivity': sensitivity,
             'algorithm': algorithm,
+            'software_version': __version__,
+            'observer_context': observer_context,
+            'loss_profile': loss_profile,
             'frames_reviewed': 0,
             'total_frames': 0,
             'corrections_count': 0,
@@ -4336,13 +4496,24 @@ class ParameterAdapter:
     Tier 2: Batch coordinate-wise golden section search over calibration set.
     """
 
-    def __init__(self, initial_params, safety_bounds=None):
-        """Initialize with starting parameters and safety bounds."""
+    def __init__(self, initial_params, safety_bounds=None, loss_profile='balanced'):
+        """Initialize with starting parameters and safety bounds.
+
+        Args:
+            initial_params: Starting detection parameter dict.
+            safety_bounds: Hard min/max per parameter (prevents drift).
+            loss_profile: Named loss profile from LOSS_PROFILES (Winner).
+                Controls the FP/FN/misclassification tradeoff during Tier 2 learning.
+        """
         self.params = dict(initial_params)
         self.safety_bounds = safety_bounds or PARAMETER_SAFETY_BOUNDS
         self.update_counts = {p: 0 for p in initial_params}
         self.base_lr = 0.3
         self.decay_rate = 0.1
+        # STS: Situated loss weights (Winner — artifacts have politics)
+        profile = LOSS_PROFILES.get(loss_profile, LOSS_PROFILES['balanced'])
+        self.loss_weights = profile['weights']
+        self.loss_profile_name = loss_profile
 
     def apply_correction(self, correction_action, trail_type, detection_meta):
         """Tier 1: Apply single correction via EMA. Returns {param: new_value} updates."""
@@ -4376,12 +4547,13 @@ class ParameterAdapter:
 
     def optimize_batch(self, calibration_set):
         """Tier 2: Run coordinate-wise golden section search.
+        Uses the situated loss weights from the active loss profile (Winner).
         Returns optimized parameters dict."""
         if len(calibration_set) < 10:
             return dict(self.params)
 
         params = dict(self.params)
-        best_loss = self._compute_loss(params, calibration_set)
+        best_loss = self._compute_loss(params, calibration_set, weights=self.loss_weights)
 
         phi = (1 + 5 ** 0.5) / 2
         resphi = 2 - phi
@@ -4403,9 +4575,9 @@ class ParameterAdapter:
 
                 test = dict(params)
                 test[param_name] = x1
-                f1 = self._compute_loss(test, calibration_set)
+                f1 = self._compute_loss(test, calibration_set, weights=self.loss_weights)
                 test[param_name] = x2
-                f2 = self._compute_loss(test, calibration_set)
+                f2 = self._compute_loss(test, calibration_set, weights=self.loss_weights)
 
                 for __ in range(15):
                     if f1 < f2:
@@ -4414,18 +4586,18 @@ class ParameterAdapter:
                         f2 = f1
                         x1 = a + resphi * (b - a)
                         test[param_name] = x1
-                        f1 = self._compute_loss(test, calibration_set)
+                        f1 = self._compute_loss(test, calibration_set, weights=self.loss_weights)
                     else:
                         a = x1
                         x1 = x2
                         f1 = f2
                         x2 = b - resphi * (b - a)
                         test[param_name] = x2
-                        f2 = self._compute_loss(test, calibration_set)
+                        f2 = self._compute_loss(test, calibration_set, weights=self.loss_weights)
 
                 optimal = (a + b) / 2
                 test[param_name] = optimal
-                new_loss = self._compute_loss(test, calibration_set)
+                new_loss = self._compute_loss(test, calibration_set, weights=self.loss_weights)
                 if new_loss < best_loss:
                     params[param_name] = optimal
                     best_loss = new_loss
@@ -4435,7 +4607,7 @@ class ParameterAdapter:
                 break
 
         # Reversion safety: reject if >20% worse
-        original_loss = self._compute_loss(self.params, calibration_set)
+        original_loss = self._compute_loss(self.params, calibration_set, weights=self.loss_weights)
         if best_loss > original_loss * 1.2:
             return dict(self.params)
 
@@ -5558,6 +5730,9 @@ class SatelliteTrailDetector:
         # Yellowish complementary color palette (BGR format)
         self.satellite_color = (0, 185, 255)  # Gold/yellow for satellites
         self.airplane_color = (0, 140, 255)   # Orange/amber for airplanes
+        self.anomalous_color = (200, 50, 200)  # Magenta for anomalous (Bowker & Star)
+        self.ledger = None  # TranslationLedger instance (set externally if --ledger)
+        self.sensitivity = sensitivity  # Store for inscription metadata
         self.box_thickness = 1
         self.dot_length = 8  # Length of each dash in dotted line
         self.gap_length = 4  # Gap between dashes
@@ -6510,15 +6685,18 @@ class SatelliteTrailDetector:
 
         return num_peaks
 
-    def classify_trail(self, line, gray_frame, color_frame, hsv_frame=None, reusable_mask=None, supplementary=False):
+    def classify_trail(self, line, gray_frame, color_frame, hsv_frame=None, reusable_mask=None, supplementary=False, ledger=None):
         """
-        Classify a detected line as either a satellite or airplane trail.
+        Classify a detected line as either a satellite, airplane, or anomalous trail.
 
         Key distinction:
         - Airplanes: DOTTED features - bright point-like lights along the trail (navigation lights)
                     Sometimes colorful dots (red, green, white). Can be any length including 180-300px.
         - Satellites: SMOOTH, consistent brightness along trail. No bright point features.
                      Dim, monochromatic, uniform appearance. Typically 180-300 pixels for 1920x1080.
+        - Anomalous: Linear features that pass basic validity checks but match neither
+                     satellite nor airplane patterns.  Captures meteors, tumbling debris,
+                     drones, ISS with solar flare, and other residual phenomena (Bowker & Star).
 
         Args:
             line: Detected line from HoughLinesP
@@ -6529,13 +6707,15 @@ class SatelliteTrailDetector:
             supplementary: If True, this candidate came from the matched-filter
                 stage and has already passed an SNR gate.  Contrast thresholds
                 are relaxed and an additional SNR-based detection path is enabled.
+            ledger: Optional TranslationLedger for tracking rejection statistics.
 
         Returns:
-            trail_type: 'satellite', 'airplane', or None
+            trail_type: 'satellite', 'airplane', 'anomalous', or None
             detection_info: dict with 'bbox' and metadata if trail detected, None otherwise.
                 Keys: 'bbox' (x_min, y_min, x_max, y_max), 'angle' (degrees 0-180),
                 'center' (x, y), 'length' (pixels), 'avg_brightness' (float),
-                'max_brightness' (int), 'line' (original line endpoints)
+                'max_brightness' (int), 'line' (original line endpoints),
+                'epistemic_profile' (dict — detection provenance, margins, counterfactual)
         """
         x1, y1, x2, y2 = line[0]
 
@@ -6545,7 +6725,20 @@ class SatelliteTrailDetector:
         angle = np.degrees(np.arctan2(abs(y2 - y1), abs(x2 - x1)))
         center = ((x1 + x2) / 2, (y1 + y2) / 2)
 
+        # Epistemic profile — tracks how this detection was constructed (Latour).
+        # Every threshold test records its value, threshold, and margin.
+        ep = {
+            'detection_path': None,
+            'criteria_met': [],
+            'criteria_failed': [],
+            'rejection_reason': None,
+            'margin_analysis': {},
+            'stage': 'supplementary' if supplementary else 'primary',
+        }
+
         if length < self.params['min_line_length']:
+            if ledger:
+                ledger.record_rejection('too_short', line)
             return None, None
 
         # Reject full-frame-width artifacts early — real satellite trails
@@ -6553,6 +6746,8 @@ class SatelliteTrailDetector:
         # edge artifacts from morphological operations or sky gradients.
         frame_w = color_frame.shape[1] if color_frame is not None else 1920
         if length > frame_w * 0.80:
+            if ledger:
+                ledger.record_rejection('full_frame', line)
             return None, None
 
         # Use reusable mask if provided, otherwise allocate new one
@@ -6574,6 +6769,8 @@ class SatelliteTrailDetector:
 
         # Require minimum number of pixels - ensures we're detecting actual trails
         if len(trail_pixels_gray) < 15:
+            if ledger:
+                ledger.record_rejection('too_few_pixels', line)
             return None, None
 
         avg_brightness = np.mean(trail_pixels_gray)
@@ -6582,6 +6779,8 @@ class SatelliteTrailDetector:
 
         # Too dark (likely noise) - trails should have some minimum brightness
         if avg_brightness < 5:
+            if ledger:
+                ledger.record_rejection('too_dark', line)
             return None, None
 
         # Check minimum contrast - trail should stand out from background
@@ -6615,6 +6814,8 @@ class SatelliteTrailDetector:
             if supplementary:
                 min_contrast = max(1.03, min_contrast * 0.7)
             if contrast_ratio < min_contrast:
+                if ledger:
+                    ledger.record_rejection('low_contrast', line)
                 return None, None
 
         # Calculate bounding box
@@ -6634,6 +6835,8 @@ class SatelliteTrailDetector:
         aspect_ratio = max(width, height) / min(width, height)
 
         if not self.skip_aspect_ratio_check and aspect_ratio < self.params['min_aspect_ratio']:
+            if ledger:
+                ledger.record_rejection('aspect_ratio', line)
             return None, None
 
         # CLOUD AND FALSE POSITIVE FILTERING
@@ -6658,10 +6861,14 @@ class SatelliteTrailDetector:
             is_likely_cloud = (surrounding_std > 25 and surrounding_mean > 35)
 
             if is_likely_cloud:
+                if ledger:
+                    ledger.record_rejection('cloud_texture', line)
                 return None, None
 
             # Reject very bright uniform areas (likely daytime sky or lit structures)
             if surrounding_mean > 80:
+                if ledger:
+                    ledger.record_rejection('too_bright', line)
                 return None, None
 
         # 2. Check for gradient uniformity along the line
@@ -6680,11 +6887,15 @@ class SatelliteTrailDetector:
                 # If segments have very different brightnesses, likely not a trail
                 # Tightened from 25 to 20 for stricter filtering
                 if segment_variation > 20:
+                    if ledger:
+                        ledger.record_rejection('segment_variation', line)
                     return None, None
 
         # 3. Check maximum brightness - extremely bright lines are likely not trails
         # Real airplane/satellite trails in night sky shouldn't be extremely bright
         if max_brightness > 240:
+            if ledger:
+                ledger.record_rejection('too_bright', line)
             return None, None
 
         # Analyze color information for airplane detection
@@ -6761,8 +6972,25 @@ class SatelliteTrailDetector:
 
         bbox = (x_min, y_min, x_max, y_max)
 
-        # Build detection metadata (shared by both airplane and satellite results)
-        def _make_detection_info():
+        # Build detection metadata (shared by airplane, satellite, and anomalous results)
+        def _make_detection_info(detection_path=None, extra_criteria_met=None, extra_criteria_failed=None):
+            ep['detection_path'] = detection_path
+            if extra_criteria_met:
+                ep['criteria_met'].extend(extra_criteria_met)
+            if extra_criteria_failed:
+                ep['criteria_failed'].extend(extra_criteria_failed)
+            # Margin analysis — how close was the decision to going the other way?
+            if contrast_ratio is not None:
+                ep['margin_analysis']['contrast_ratio'] = {
+                    'value': round(float(contrast_ratio), 4),
+                    'threshold': round(float(min_contrast), 4),
+                    'margin': round(float(contrast_ratio - min_contrast), 4),
+                }
+            ep['margin_analysis']['brightness_variation'] = {
+                'value': round(float(brightness_variation), 4),
+                'threshold': 0.40,
+                'margin': round(float(0.40 - brightness_variation), 4),
+            }
             return {
                 'bbox': bbox,
                 'angle': angle,
@@ -6775,6 +7003,7 @@ class SatelliteTrailDetector:
                 'brightness_std': float(brightness_std),
                 'avg_saturation': float(avg_saturation),
                 'has_dotted_pattern': bool(has_bright_spots or has_high_variance or has_multiple_points),
+                'epistemic_profile': dict(ep),
             }
 
         # AIRPLANE DETECTION CRITERIA (check first - dotted features are distinctive)
@@ -6794,23 +7023,41 @@ class SatelliteTrailDetector:
 
         # If clear dotted pattern detected, it's definitely an airplane
         if has_strong_dots or has_colored_dots or has_moderate_dots or has_spatial_dots:
-            return 'airplane', _make_detection_info()
+            path = 'airplane_strong_dots'
+            if has_strong_dots: path = 'airplane_strong_dots'
+            elif has_colored_dots: path = 'airplane_colored_dots'
+            elif has_moderate_dots: path = 'airplane_moderate_dots'
+            else: path = 'airplane_spatial_dots'
+            if ledger:
+                ledger.record_classification('airplane')
+            return 'airplane', _make_detection_info(detection_path=path,
+                extra_criteria_met=['has_dotted_pattern', 'is_bright'])
 
         # If multiple distinct point features detected (navigation lights pattern)
         # Require higher brightness to avoid false positives
         if has_multiple_points and max_brightness > 120 and is_bright:
-            return 'airplane', _make_detection_info()
+            if ledger:
+                ledger.record_classification('airplane')
+            return 'airplane', _make_detection_info(detection_path='airplane_multiple_points',
+                extra_criteria_met=['has_multiple_points', 'is_bright'])
 
         # Calculate airplane score - require more evidence
         airplane_score = sum([is_bright, is_colorful, has_color_variation, has_dotted_pattern])
 
         # Require dotted pattern AND at least 2 other characteristics
         if has_dotted_pattern and airplane_score >= 3:
-            return 'airplane', _make_detection_info()
+            if ledger:
+                ledger.record_classification('airplane')
+            return 'airplane', _make_detection_info(detection_path='airplane_multi_evidence',
+                extra_criteria_met=[k for k, v in [('is_bright', is_bright), ('is_colorful', is_colorful),
+                    ('has_color_variation', has_color_variation)] if v])
 
         # Very strong dotted pattern with high brightness
         if has_dotted_pattern and brightness_peak_ratio > 2.0 and max_brightness > 120:
-            return 'airplane', _make_detection_info()
+            if ledger:
+                ledger.record_classification('airplane')
+            return 'airplane', _make_detection_info(detection_path='airplane_very_strong_dots',
+                extra_criteria_met=['has_dotted_pattern', 'very_high_peak_ratio'])
 
         # SATELLITE DETECTION CRITERIA
         # Satellites have SMOOTH, consistent brightness (no dotted features)
@@ -6837,17 +7084,38 @@ class SatelliteTrailDetector:
 
         # --- Primary paths (strongest confidence) ---
 
+        sat_criteria_met = [k for k, v in [
+            ('is_dim', is_dim), ('is_monochrome', is_monochrome),
+            ('is_smooth', is_smooth), ('is_satellite_length', is_satellite_length),
+            ('has_contrast', has_contrast)] if v]
+        sat_criteria_failed = [k for k, v in [
+            ('is_dim', is_dim), ('is_monochrome', is_monochrome),
+            ('is_smooth', is_smooth), ('is_satellite_length', is_satellite_length)] if not v]
+
         # All 4 characteristics met
         if satellite_score >= 4 and not has_dotted_pattern:
-            return 'satellite', _make_detection_info()
+            if ledger:
+                ledger.record_classification('satellite')
+            return 'satellite', _make_detection_info(
+                detection_path='satellite_primary_4of4',
+                extra_criteria_met=sat_criteria_met, extra_criteria_failed=sat_criteria_failed)
 
         # 3 characteristics including both smoothness and length
         if satellite_score >= 3 and is_smooth and is_satellite_length and not has_dotted_pattern:
-            return 'satellite', _make_detection_info()
+            if ledger:
+                ledger.record_classification('satellite')
+            return 'satellite', _make_detection_info(
+                detection_path='satellite_primary_3of4',
+                extra_criteria_met=sat_criteria_met, extra_criteria_failed=sat_criteria_failed)
 
         # Very dim, smooth trails in correct length range
         if is_smooth and avg_brightness <= self.params['brightness_threshold'] * 1.5 and is_satellite_length and not has_dotted_pattern:
-            return 'satellite', _make_detection_info()
+            if ledger:
+                ledger.record_classification('satellite')
+            return 'satellite', _make_detection_info(
+                detection_path='satellite_very_dim',
+                extra_criteria_met=['is_smooth', 'very_dim', 'is_satellite_length'],
+                extra_criteria_failed=sat_criteria_failed)
 
         # --- Extended paths for dim/long trails that miss primary criteria ---
         # These paths allow slightly beyond satellite_max_length (1.3×) but
@@ -6857,18 +7125,31 @@ class SatelliteTrailDetector:
         # Long smooth dim trail outside the "typical" length range but clearly
         # not an airplane: no dotted pattern, dim, monochrome, smooth
         if is_smooth and is_dim and is_monochrome and not has_dotted_pattern and length >= self.params['satellite_min_length'] and length <= extended_max:
-            return 'satellite', _make_detection_info()
+            if ledger:
+                ledger.record_classification('satellite')
+            return 'satellite', _make_detection_info(
+                detection_path='satellite_extended_dim_smooth_mono',
+                extra_criteria_met=sat_criteria_met, extra_criteria_failed=sat_criteria_failed)
 
         # Dim smooth trail with confirmed background contrast — even if
         # length or monochrome criteria aren't perfectly met
         if is_smooth and is_dim and has_contrast and not has_dotted_pattern and length >= self.params['satellite_min_length'] and length <= extended_max:
-            return 'satellite', _make_detection_info()
+            if ledger:
+                ledger.record_classification('satellite')
+            return 'satellite', _make_detection_info(
+                detection_path='satellite_extended_dim_smooth_contrast',
+                extra_criteria_met=sat_criteria_met, extra_criteria_failed=sat_criteria_failed)
 
         # Very dim trail (below brightness_threshold) that is smooth and long
         # enough — relaxed monochrome requirement since very dim trails have
         # negligible color information anyway
         if is_smooth and avg_brightness <= self.params['brightness_threshold'] and not has_dotted_pattern and length >= self.params['satellite_min_length'] and length <= extended_max:
-            return 'satellite', _make_detection_info()
+            if ledger:
+                ledger.record_classification('satellite')
+            return 'satellite', _make_detection_info(
+                detection_path='satellite_extended_very_dim_smooth',
+                extra_criteria_met=['is_smooth', 'very_dim'],
+                extra_criteria_failed=sat_criteria_failed)
 
         # --- SNR-based path for matched-filter candidates ---
         # Trails found by the supplementary matched filter have already
@@ -6880,8 +7161,36 @@ class SatelliteTrailDetector:
         if supplementary and not has_dotted_pattern and length >= self.params['satellite_min_length'] and length <= extended_max:
             trail_snr = self._compute_trail_snr(gray_frame, line)
             if trail_snr >= 2.5 and is_smooth:
-                return 'satellite', _make_detection_info()
+                if ledger:
+                    ledger.record_classification('satellite')
+                return 'satellite', _make_detection_info(
+                    detection_path='satellite_snr_based',
+                    extra_criteria_met=['is_smooth', f'snr={trail_snr:.1f}'],
+                    extra_criteria_failed=sat_criteria_failed)
 
+        # --- Anomalous category (Bowker & Star — the residual) ---
+        # The trail passed basic validity checks (length, contrast, aspect ratio,
+        # not a cloud/texture artifact) but matches neither satellite nor airplane
+        # patterns.  Instead of silently discarding it, classify as "anomalous" —
+        # making the residual category visible.  These are often the most
+        # interesting objects: meteors, tumbling debris, drones, ISS with solar
+        # panel flare, or atmospheric phenomena the binary classification misses.
+        if length >= self.params['satellite_min_length'] * 0.7:
+            if ledger:
+                ledger.record_classification('anomalous')
+            ep['rejection_reason'] = 'no_satellite_or_airplane_match'
+            return 'anomalous', _make_detection_info(
+                detection_path='anomalous_residual',
+                extra_criteria_met=[k for k, v in [
+                    ('is_dim', is_dim), ('is_smooth', is_smooth),
+                    ('has_dotted_pattern', has_dotted_pattern),
+                    ('is_bright', is_bright)] if v],
+                extra_criteria_failed=[k for k, v in [
+                    ('is_dim', is_dim), ('is_smooth', is_smooth),
+                    ('satellite_length', is_satellite_length)] if not v])
+
+        if ledger:
+            ledger.record_rejection('unclassifiable', line)
         return None, None
     
     def merge_overlapping_boxes(self, boxes, overlap_threshold=0.3):
@@ -7109,11 +7418,16 @@ class SatelliteTrailDetector:
         classified_trails = []
         all_classifications = []  # For debug: store all attempted classifications
 
+        # Translation ledger: count primary lines detected
+        _ledger = self.ledger
+        if _ledger and lines is not None:
+            _ledger.total_lines_detected += len(lines)
+
         # --- Stage 1: Primary detection (Canny + Hough) ---
         if lines is not None:
             for line in lines:
                 trail_type, detection_info = self.classify_trail(
-                    line, gray, frame, hsv_frame, reusable_mask)
+                    line, gray, frame, hsv_frame, reusable_mask, ledger=_ledger)
 
                 # Store for debug (even if filtered out)
                 if debug_info is not None:
@@ -7137,10 +7451,12 @@ class SatelliteTrailDetector:
         supplementary_lines = self._detect_dim_lines_matched_filter(
             gray, lines, temporal_context=temporal_context)
         if supplementary_lines is not None:
+            if _ledger:
+                _ledger.supplementary_lines += len(supplementary_lines)
             for line in supplementary_lines:
                 trail_type, detection_info = self.classify_trail(
                     line, gray, frame, hsv_frame, reusable_mask,
-                    supplementary=True)
+                    supplementary=True, ledger=_ledger)
 
                 if debug_info is not None:
                     all_classifications.append({
@@ -7168,9 +7484,14 @@ class SatelliteTrailDetector:
                 debug_info['temporal_context'] = temporal_context
 
         # Separate by type for merging
-        satellite_infos, airplane_infos = [], []
+        satellite_infos, airplane_infos, anomalous_infos = [], [], []
         for t, info in classified_trails:
-            (satellite_infos if t == 'satellite' else airplane_infos).append(info)
+            if t == 'satellite':
+                satellite_infos.append(info)
+            elif t == 'airplane':
+                airplane_infos.append(info)
+            elif t == 'anomalous':
+                anomalous_infos.append(info)
 
         # Merge overlapping satellite detections (simple box merge)
         satellite_boxes = [info['bbox'] for info in satellite_infos]
@@ -7199,13 +7520,33 @@ class SatelliteTrailDetector:
         # Merge airplane detections with angle awareness (keeps distinct airplanes separate)
         merged_airplane_infos = self.merge_airplane_detections(airplane_infos)
 
+        # Merge anomalous detections (simple box merge like satellites)
+        anomalous_boxes = [info['bbox'] for info in anomalous_infos]
+        merged_anomalous_boxes = self.merge_overlapping_boxes(anomalous_boxes)
+        merged_anomalous_infos = []
+        for mbox in merged_anomalous_boxes:
+            mx = (mbox[0] + mbox[2]) / 2
+            my = (mbox[1] + mbox[3]) / 2
+            best, best_dist = None, float('inf')
+            for info in anomalous_infos:
+                dx = info['center'][0] - mx
+                dy = info['center'][1] - my
+                dist = dx * dx + dy * dy
+                if dist < best_dist:
+                    best_dist, best = dist, info
+            if best:
+                merged_info = dict(best)
+                merged_info['bbox'] = mbox
+                merged_anomalous_infos.append(merged_info)
+
         # --- Enrich detections with photometry, curvature, velocity ---
         frame_width = frame.shape[1]
         diff_img = temporal_context['diff_image'] if temporal_context else None
 
         all_merged = (
             [('satellite', info) for info in merged_satellite_infos] +
-            [('airplane', info) for info in merged_airplane_infos]
+            [('airplane', info) for info in merged_airplane_infos] +
+            [('anomalous', info) for info in merged_anomalous_infos]
         )
         # Skip expensive photometry/curvature when detection count is high
         # (likely false-positive-heavy frames). Velocity is cheap and always runs.
@@ -7230,6 +7571,24 @@ class SatelliteTrailDetector:
                 info['length'], frame_width,
                 exposure_time=exposure_time,
                 fov_degrees=fov_degrees)
+
+            # Inscription metadata (Latour) — the detection as a constructed artifact.
+            # Every detection carries the full trace of its construction so it is
+            # self-documenting and scientifically auditable.
+            info['inscription'] = {
+                'software_version': __version__,
+                'algorithm': 'default',
+                'sensitivity': getattr(self, 'sensitivity', 'medium'),
+                'parameters_at_detection': {
+                    'satellite_contrast_min': self.params.get('satellite_contrast_min'),
+                    'canny_low': self.params.get('canny_low'),
+                    'canny_high': self.params.get('canny_high'),
+                    'min_line_length': self.params.get('min_line_length'),
+                    'satellite_min_length': self.params.get('satellite_min_length'),
+                    'satellite_max_length': self.params.get('satellite_max_length'),
+                },
+                'observer_context': getattr(self, '_observer_context', None),
+            }
 
         return all_merged
 
@@ -7289,6 +7648,9 @@ class SatelliteTrailDetector:
         if trail_type == 'airplane':
             color = self.airplane_color
             label = "AIRPLANE"
+        elif trail_type == 'anomalous':
+            color = self.anomalous_color
+            label = "Anomalous"
         else:  # satellite
             color = self.satellite_color
             label = "Satellite"
@@ -7382,6 +7744,10 @@ class SatelliteTrailDetector:
                     color = (255, 255, 0)  # Cyan - detected satellite
                     thickness = 1
                     label = "S"
+                elif trail_type == 'anomalous':
+                    color = (200, 50, 200)  # Magenta - anomalous (residual)
+                    thickness = 1
+                    label = "?"
                 else:
                     # Filtered out - use red but thinner
                     color = (0, 0, 255)  # Red - filtered
@@ -7418,7 +7784,7 @@ class SatelliteTrailDetector:
 
         # Semi-transparent background for legend
         overlay = debug_frame.copy()
-        cv2.rectangle(overlay, (5, 5), (180, 95), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (5, 5), (180, 110), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.6, debug_frame, 0.4, 0, debug_frame)
 
         # Legend text
@@ -7427,6 +7793,8 @@ class SatelliteTrailDetector:
         cv2.putText(debug_frame, "Green (A): Airplane", (legend_x, legend_y), font, font_scale - 0.1, (0, 255, 0), font_thickness, cv2.LINE_AA)
         legend_y += 15
         cv2.putText(debug_frame, "Cyan (S): Satellite", (legend_x, legend_y), font, font_scale - 0.1, (255, 255, 0), font_thickness, cv2.LINE_AA)
+        legend_y += 15
+        cv2.putText(debug_frame, "Magenta (?): Anomalous", (legend_x, legend_y), font, font_scale - 0.1, (200, 50, 200), font_thickness, cv2.LINE_AA)
         legend_y += 15
         cv2.putText(debug_frame, "Red (X): Filtered", (legend_x, legend_y), font, font_scale - 0.1, (0, 0, 255), font_thickness, cv2.LINE_AA)
 
@@ -10025,7 +10393,7 @@ def export_dataset_from_annotations(input_path, annotations_path,
     exporter.finalize()
 
 
-def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=7, algorithm='default', groundtruth_dir=None, num_workers=0, no_gpu=False, review_mode=False, review_only=False, annotations_path=None, hitl_profile='default', auto_accept=0.9, no_learn=False, dataset_format='aabb', dataset_split=(0.7, 0.2, 0.1), dataset_skip=0, dataset_dedup=5, dataset_negatives=0.2, dataset_image_format='jpg', dataset_image_quality=95, dataset_dir_override=None, radon_params=None, nn_params=None):
+def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=7, algorithm='default', groundtruth_dir=None, num_workers=0, no_gpu=False, review_mode=False, review_only=False, annotations_path=None, hitl_profile='default', auto_accept=0.9, no_learn=False, dataset_format='aabb', dataset_split=(0.7, 0.2, 0.1), dataset_skip=0, dataset_dedup=5, dataset_negatives=0.2, dataset_image_format='jpg', dataset_image_quality=95, dataset_dir_override=None, radon_params=None, nn_params=None, enable_ledger=False, loss_profile='balanced', observer_context=None):
     """
     Process video to detect and highlight satellite and airplane trails.
 
@@ -10194,6 +10562,39 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
             skip_aspect_ratio_check=skip_aspect_ratio_check,
             signal_envelope=signal_envelope)
 
+    # ── STS: Translation Ledger (Callon) ──────────────────────────
+    # Tracks what the detector rejected and why, making the filtering
+    # assumptions transparent and auditable.
+    if enable_ledger:
+        detector.ledger = TranslationLedger()
+        print("Translation ledger: active (tracks rejection statistics)")
+
+    # ── STS: Observer Context (Haraway — situated knowledges) ─────
+    # Record the observation conditions so the detector doesn't claim
+    # to see from nowhere.  Bortle class adjusts contrast thresholds.
+    if observer_context:
+        bortle = observer_context.get('bortle_class')
+        if bortle is not None and isinstance(bortle, (int, float)):
+            # Bortle 1 (pristine dark) → multiplier ~0.85 (lower contrast needed)
+            # Bortle 5 (suburban) → multiplier ~1.0 (default)
+            # Bortle 9 (inner city) → multiplier ~1.15 (raise contrast bar)
+            bortle_multiplier = 0.85 + (bortle - 1) * 0.0375
+            old_contrast = detector.params.get('satellite_contrast_min', 1.08)
+            new_contrast = round(old_contrast * bortle_multiplier, 4)
+            # Clamp to safety bounds
+            new_contrast = max(1.01, min(1.30, new_contrast))
+            detector.params['satellite_contrast_min'] = new_contrast
+            print(f"Observer context: Bortle {bortle} → contrast threshold "
+                  f"adjusted {old_contrast:.3f} → {new_contrast:.3f}")
+        ctx_parts = []
+        if observer_context.get('lat') is not None:
+            ctx_parts.append(f"({observer_context['lat']:.2f}, {observer_context['lon']:.2f})")
+        if observer_context.get('notes'):
+            ctx_parts.append(observer_context['notes'])
+        if ctx_parts:
+            print(f"Observer: {', '.join(ctx_parts)}")
+    detector._observer_context = observer_context
+
     # ── Temporal frame buffer for background subtraction ──────────
     # The temporal median of N surrounding frames removes stars, sky
     # gradients, vignetting, and hot pixels — leaving only transient
@@ -10221,6 +10622,7 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     frame_count = 0
     satellites_detected = 0
     airplanes_detected = 0
+    anomalous_detected = 0
 
     # ── HITL review mode: collect detections per frame ────────────
     detections_by_frame = {} if review_mode else None
@@ -10396,7 +10798,9 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
             detected_trails = [(t, b) for t, b in detected_trails if t == 'satellite']
         elif detect_type == 'airplanes':
             detected_trails = [(t, b) for t, b in detected_trails if t == 'airplane']
-        # If detect_type == 'both', no filtering needed
+        elif detect_type == 'anomalous':
+            detected_trails = [(t, b) for t, b in detected_trails if t == 'anomalous']
+        # If detect_type == 'both' or 'all', no filtering needed
 
         # Apply temporal consistency filter (Radon pipeline only).
         # Requires detections to appear in multiple recent frames to confirm,
@@ -10418,6 +10822,8 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
                     satellites_detected += 1
                 elif trail_type == 'airplane':
                     airplanes_detected += 1
+                elif trail_type == 'anomalous':
+                    anomalous_detected += 1
 
                 # Log enrichment metadata for this detection
                 _meta_parts = [f"f{fc}",
@@ -10433,6 +10839,10 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
                 curv = detection_info.get('curvature')
                 if curv and curv['is_curved']:
                     _meta_parts.append(f"curved({curv['curvature']:.2e})")
+                # Epistemic profile: show detection path (Latour)
+                ep = detection_info.get('epistemic_profile')
+                if ep and ep.get('detection_path'):
+                    _meta_parts.append(f"via:{ep['detection_path']}")
                 print(f"\r  [{' | '.join(_meta_parts)}]" + " " * 20)
 
                 # Extract the region to freeze (with highlights)
@@ -10567,13 +10977,21 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     print(f"\n\nProcessing complete!")
     print(f"Frames processed: {frame_count}")
 
-    if detect_type in ['both', 'satellites']:
+    if detect_type in ['both', 'all', 'satellites']:
         print(f"Satellites detected: {satellites_detected}")
-    if detect_type in ['both', 'airplanes']:
+    if detect_type in ['both', 'all', 'airplanes']:
         print(f"Airplanes detected: {airplanes_detected}")
+    if anomalous_detected > 0:
+        print(f"Anomalous detected: {anomalous_detected}")
 
-    print(f"Total trails detected: {satellites_detected + airplanes_detected}")
+    print(f"Total trails detected: {satellites_detected + airplanes_detected + anomalous_detected}")
     print(f"Output saved to: {output_path}")
+
+    # ── STS: Translation Ledger summary (Callon) ─────────────────
+    if detector.ledger is not None:
+        print()
+        for line in detector.ledger.summary_lines():
+            print(line)
 
     # ── ML dataset finalisation ──────────────────────────────────
     if dataset_exporter is not None:
@@ -10594,13 +11012,15 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         # Initialize parameter adapter
         param_adapter = None
         if not no_learn:
-            param_adapter = ParameterAdapter(detector.params, PARAMETER_SAFETY_BOUNDS)
+            param_adapter = ParameterAdapter(detector.params, PARAMETER_SAFETY_BOUNDS,
+                                              loss_profile=loss_profile)
             if hitl_profile:
                 param_adapter.load_profile(hitl_profile)
 
         # Populate annotations from detection results
         if not review_only and detections_by_frame:
-            ann_db.start_session(str(input_path), sensitivity, algorithm, detector.params)
+            ann_db.start_session(str(input_path), sensitivity, algorithm, detector.params,
+                                   observer_context=observer_context, loss_profile=loss_profile)
 
             for frame_idx, detections in detections_by_frame.items():
                 img_id = ann_db.add_image(frame_idx, str(input_path), width, height)
@@ -10722,9 +11142,10 @@ Notes:
 
     parser.add_argument(
         '--detect-type', '-t',
-        choices=['both', 'satellites', 'airplanes'],
+        choices=['both', 'all', 'satellites', 'airplanes', 'anomalous'],
         default='both',
-        help='What to detect: "both" (default), "satellites" only, or "airplanes" only'
+        help='What to detect: "both" (default, sat+airplane), "all" (sat+airplane+anomalous), '
+             '"satellites" only, "airplanes" only, or "anomalous" only'
     )
 
     parser.add_argument(
@@ -10997,6 +11418,62 @@ Notes:
              'saved to the annotation database, but parameters are not updated)'
     )
 
+    # --- STS-Inspired Features ---
+    parser.add_argument(
+        '--ledger',
+        action='store_true',
+        help='Enable the Translation Ledger (Callon): track and report what '
+             'the detector rejected and why. Prints a summary after processing.'
+    )
+
+    parser.add_argument(
+        '--loss-profile',
+        choices=['discovery', 'precision', 'balanced', 'catalog'],
+        default='balanced',
+        help='Named loss profile for HITL parameter learning (Winner). '
+             '"discovery" maximizes recall, "precision" minimizes false alarms, '
+             '"balanced" (default) slightly favors recall, '
+             '"catalog" prioritizes correct classification.'
+    )
+
+    parser.add_argument(
+        '--observer-lat',
+        type=float, default=None,
+        help='Observer latitude in decimal degrees (Haraway — situated knowledges)'
+    )
+
+    parser.add_argument(
+        '--observer-lon',
+        type=float, default=None,
+        help='Observer longitude in decimal degrees'
+    )
+
+    parser.add_argument(
+        '--observer-elevation',
+        type=float, default=None,
+        help='Observer elevation in metres above sea level'
+    )
+
+    parser.add_argument(
+        '--observer-bortle',
+        type=int, default=None, choices=range(1, 10),
+        metavar='1-9',
+        help='Bortle dark sky scale (1=pristine dark, 9=inner city). '
+             'Adjusts contrast thresholds: darker skies allow dimmer detections.'
+    )
+
+    parser.add_argument(
+        '--observer-fov',
+        type=float, default=None,
+        help='Observer field of view in degrees (overrides --fov for observer context)'
+    )
+
+    parser.add_argument(
+        '--observer-notes',
+        type=str, default=None,
+        help='Free-text observation notes (e.g. "4-inch Newtonian, partly cloudy")'
+    )
+
     args = parser.parse_args()
 
     # Validate parameter ranges
@@ -11102,6 +11579,25 @@ Notes:
                     preprocessing_params[key] = learned[key]
             print(f"Loaded learned parameters from profile: {args.hitl_profile}")
 
+    # ── Build observer context (Haraway — situated knowledges) ─────
+    _observer_context = None
+    if any([args.observer_lat, args.observer_lon, args.observer_bortle,
+            args.observer_elevation, args.observer_notes, args.observer_fov]):
+        _observer_context = {
+            'lat': args.observer_lat,
+            'lon': args.observer_lon,
+            'elevation_m': args.observer_elevation,
+            'bortle_class': args.observer_bortle,
+            'fov_degrees': args.observer_fov or args.fov,
+            'notes': args.observer_notes,
+            'timestamp_utc': datetime.now(timezone.utc).isoformat(),
+        }
+
+    # ── Print loss profile (Winner — artifacts have politics) ────
+    if args.loss_profile != 'balanced':
+        profile = LOSS_PROFILES.get(args.loss_profile, LOSS_PROFILES['balanced'])
+        print(f"Loss profile: {args.loss_profile} — {profile['description']}")
+
     # Handle --dataset-from-annotations: export from HITL-verified annotations
     if args.dataset_from_annotations:
         export_dataset_from_annotations(
@@ -11157,6 +11653,9 @@ Notes:
         dataset_dir_override=args.dataset_dir,
         radon_params=radon_preview_params,
         nn_params=nn_params,
+        enable_ledger=args.ledger,
+        loss_profile=args.loss_profile,
+        observer_context=_observer_context,
     )
 
 
