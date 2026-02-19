@@ -3969,8 +3969,13 @@ class DetectionTracker:
                         tracklet_len = len(t['detections'])
                         break
 
-            # Confirm if: enough temporal hits OR strong tracklet
-            if hits >= self.min_hits or tracklet_len >= 3:
+            # Confirm if: enough temporal hits OR strong tracklet OR
+            # high-confidence single-frame detection (meteors, ISS, flares)
+            trail_snr = info.get('trail_snr', 0)
+            contrast_r = info.get('contrast_ratio', 0)
+            high_confidence_single = (trail_snr >= 4.0 or contrast_r >= 1.15)
+
+            if hits >= self.min_hits or tracklet_len >= 3 or high_confidence_single:
                 enriched_info = dict(info)
                 enriched_info['temporal_hits'] = hits
                 if tracklet_id is not None:
@@ -4015,6 +4020,7 @@ class TranslationLedger:
         self.rejected_too_bright = 0
         self.rejected_segment_variation = 0
         self.rejected_aspect_ratio = 0
+        self.rejected_star_like = 0
         self.rejected_unclassifiable = 0
         self.classified_satellite = 0
         self.classified_airplane = 0
@@ -5914,6 +5920,7 @@ class SatelliteTrailDetector:
                 'satellite_min_length': 100,  # Satellites can be shorter segments
                 'satellite_max_length': 1000,  # Long trails but not full-frame artifacts
                 'satellite_contrast_min': 1.08,  # Lower contrast for dim satellites
+                'mf_sigma_perp': 0.85,  # Match ground truth PSF median (was 1.0 default, 15-25% SNR gain)
             },
             'high': {
                 'min_line_length': 35,  # Catches shorter trail fragments
@@ -5991,6 +5998,10 @@ class SatelliteTrailDetector:
             clip_limit = 6.0
             tile_size = 6
         self._clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_size, tile_size))
+
+        # PSF estimation state — re-estimate from stars every 10 frames
+        self._psf_frame_count = 0
+        self._estimated_psf_sigma = sigma_perp  # Start with preset value
 
         # Adapt detection parameters from user-marked trail signal envelope
         if self.signal_envelope:
@@ -6075,13 +6086,90 @@ class SatelliteTrailDetector:
 
         return gray, blurred
 
+    def _estimate_psf_from_stars(self, gray):
+        """Estimate point spread function (PSF) sigma from brightest stars.
+
+        Finds N brightest non-saturated point sources, measures their FWHM,
+        and returns the median sigma. Called every 10 frames to adapt the
+        matched filter kernel to actual seeing conditions.
+
+        Returns:
+            Estimated sigma in pixels, or None if insufficient stars found.
+        """
+        # Threshold: bright but not saturated (avoid bloomed stars)
+        thresh = np.percentile(gray, 99.5)
+        sat_thresh = 250
+        if thresh >= sat_thresh:
+            thresh = np.percentile(gray, 99.0)
+
+        bright_mask = (gray > thresh) & (gray < sat_thresh)
+        if np.sum(bright_mask) < 5:
+            return None
+
+        # Find contours (connected bright regions)
+        bright_u8 = bright_mask.astype(np.uint8) * 255
+        contours, _ = cv2.findContours(bright_u8, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+        if len(contours) < 3:
+            return None
+
+        # Filter for compact, roughly circular contours (stars)
+        sigmas = []
+        for cnt in contours[:30]:  # Cap at 30 to limit cost
+            area = cv2.contourArea(cnt)
+            if area < 3 or area > 200:  # Too small or too large
+                continue
+            x, y, w, h = cv2.boundingRect(cnt)
+            aspect = max(w, h) / (min(w, h) + 1e-5)
+            if aspect > 2.5:  # Not star-like (elongated)
+                continue
+            # Measure FWHM: take a small ROI around the centroid
+            M = cv2.moments(cnt)
+            if M['m00'] == 0:
+                continue
+            cx_s = int(M['m10'] / M['m00'])
+            cy_s = int(M['m01'] / M['m00'])
+            r = max(3, max(w, h))
+            y0, y1 = max(0, cy_s - r), min(gray.shape[0], cy_s + r + 1)
+            x0, x1 = max(0, cx_s - r), min(gray.shape[1], cx_s + r + 1)
+            roi = gray[y0:y1, x0:x1].astype(np.float32)
+            if roi.size < 9:
+                continue
+            peak = roi.max()
+            bg = np.percentile(roi, 20)
+            half_max = (peak + bg) / 2
+            fwhm_pixels = np.sqrt(np.sum(roi > half_max) / np.pi) * 2
+            sigma = fwhm_pixels / 2.355  # FWHM = 2.355 * sigma
+            if 0.3 < sigma < 3.0:  # Reasonable range
+                sigmas.append(sigma)
+
+        if len(sigmas) >= 3:
+            return float(np.median(sigmas))
+        return None
+
     def detect_lines(self, preprocessed):
         """Detect lines using Canny edge detection and Hough transform."""
+        # Adaptive Canny: derive thresholds from gradient magnitude percentiles.
+        # Noisy frames auto-raise thresholds (fewer FP), clean frames get lower
+        # thresholds (better sensitivity). Floored by preset values, capped.
+        grad_x = cv2.Sobel(preprocessed, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(preprocessed, cv2.CV_32F, 0, 1, ksize=3)
+        grad_mag = np.sqrt(grad_x * grad_x + grad_y * grad_y)
+        nonzero_grad = grad_mag[grad_mag > 0]
+        if len(nonzero_grad) > 100:
+            p70 = np.percentile(nonzero_grad, 70)
+            p95 = np.percentile(nonzero_grad, 95)
+            adaptive_low = np.clip(p70 * 0.5, self.params['canny_low'], 30)
+            adaptive_high = np.clip(p95 * 0.5, self.params['canny_high'], 120)
+        else:
+            adaptive_low = float(self.params['canny_low'])
+            adaptive_high = float(self.params['canny_high'])
+
         # Edge detection
         edges = cv2.Canny(
             preprocessed,
-            self.params['canny_low'],
-            self.params['canny_high']
+            int(adaptive_low),
+            int(adaptive_high)
         )
 
         # Morphological operations to connect broken trails
@@ -6094,9 +6182,11 @@ class SatelliteTrailDetector:
         # Directional dilation to bridge gaps in linear features.
         # Use 2 orientations (0° and 90°) — the Hough transform handles
         # intermediate angles, so full 4-angle bridging is redundant.
+        # 5×5 kernels bridge 5px gaps (reduced from 7px to avoid merging
+        # unrelated features and closing parallel trails).
         for angle in [0, 90]:
-            line_kernel = np.zeros((7, 7), dtype=np.uint8)
-            cv2.line(line_kernel, *self._rotated_kernel_endpoints(7, angle), 1, thickness=1)
+            line_kernel = np.zeros((5, 5), dtype=np.uint8)
+            cv2.line(line_kernel, *self._rotated_kernel_endpoints(5, angle), 1, thickness=1)
             edges = cv2.dilate(edges, line_kernel, iterations=1)
 
         # Clean up directional dilation
@@ -6113,13 +6203,86 @@ class SatelliteTrailDetector:
         )
 
         # Cap line count to avoid O(N) classify_trail bottleneck.
-        # Keep the longest lines (most likely to be real trails).
-        max_lines = 100
+        # Use composite score (length + edge strength) so short but real
+        # trails aren't discarded in favor of longer noise lines.
+        max_lines = 120
         if lines is not None and len(lines) > max_lines:
             lengths = np.sqrt((lines[:, 0, 2] - lines[:, 0, 0]).astype(np.float64)**2 +
                               (lines[:, 0, 3] - lines[:, 0, 1]).astype(np.float64)**2)
-            top_indices = np.argpartition(lengths, -max_lines)[-max_lines:]
+            # Sample edge strength at line midpoints
+            edge_strengths = np.zeros(len(lines), dtype=np.float64)
+            for idx in range(len(lines)):
+                mx = (lines[idx, 0, 0] + lines[idx, 0, 2]) // 2
+                my = (lines[idx, 0, 1] + lines[idx, 0, 3]) // 2
+                my = np.clip(my, 0, edges.shape[0] - 1)
+                mx = np.clip(mx, 0, edges.shape[1] - 1)
+                edge_strengths[idx] = edges[my, mx]
+            # Normalize both to [0, 1] range before combining
+            len_max = lengths.max() if lengths.max() > 0 else 1.0
+            edge_max = edge_strengths.max() if edge_strengths.max() > 0 else 1.0
+            scores = (lengths / len_max) * 0.6 + (edge_strengths / edge_max) * 0.4
+            top_indices = np.argpartition(scores, -max_lines)[-max_lines:]
             lines = lines[top_indices]
+
+        return lines, edges
+
+    def _detect_lines_multiscale(self, preprocessed):
+        """Run Hough at full resolution AND 0.5× scale, deduplicate results.
+
+        Dim thin trails are often more visible at reduced resolution where
+        pixel averaging boosts effective SNR. This adds ~10ms/frame.
+
+        Returns:
+            (lines, edges) — same format as detect_lines(), but with
+            additional lines from the half-res pass deduplicated.
+        """
+        # Full-resolution pass
+        lines, edges = self.detect_lines(preprocessed)
+
+        # Half-resolution pass
+        h, w = preprocessed.shape[:2]
+        if h < 200 or w < 200:
+            return lines, edges
+
+        small = cv2.resize(preprocessed, (w // 2, h // 2),
+                           interpolation=cv2.INTER_AREA)
+        small_lines, _ = self.detect_lines(small)
+
+        if small_lines is None or len(small_lines) == 0:
+            return lines, edges
+
+        # Scale half-res lines back to full resolution
+        scaled_lines = small_lines.copy().astype(np.float64)
+        scaled_lines[:, 0, :] *= 2.0
+        scaled_lines = scaled_lines.astype(np.int32)
+
+        # Deduplicate: remove scaled lines that are close to existing full-res lines
+        if lines is not None and len(lines) > 0:
+            import math
+            new_lines = []
+            for sl in scaled_lines:
+                sx1, sy1, sx2, sy2 = sl[0]
+                s_cx, s_cy = (sx1 + sx2) / 2, (sy1 + sy2) / 2
+                s_angle = math.degrees(math.atan2(sy2 - sy1, sx2 - sx1)) % 180
+                is_dup = False
+                for fl in lines:
+                    fx1, fy1, fx2, fy2 = fl[0]
+                    f_cx, f_cy = (fx1 + fx2) / 2, (fy1 + fy2) / 2
+                    f_angle = math.degrees(math.atan2(fy2 - fy1, fx2 - fx1)) % 180
+                    angle_d = abs(s_angle - f_angle) % 180
+                    angle_d = min(angle_d, 180 - angle_d)
+                    center_dist = math.sqrt((s_cx - f_cx) ** 2 + (s_cy - f_cy) ** 2)
+                    if angle_d < 15 and center_dist < 60:
+                        is_dup = True
+                        break
+                if not is_dup:
+                    new_lines.append(sl)
+
+            if new_lines:
+                new_arr = np.array(new_lines, dtype=np.int32)
+                lines = np.concatenate([lines, new_arr], axis=0)
+        else:
+            lines = scaled_lines
 
         return lines, edges
 
@@ -6957,6 +7120,35 @@ class SatelliteTrailDetector:
                 ledger.record_rejection('full_frame', line)
             return None, None
 
+        # Star eccentricity rejection: use image moments on detection ROI.
+        # Stars are circular (eccentricity < 0.6); trails are elongated.
+        # This catches star false positives that pass all other filters.
+        # Only check short detections (< 3× min_line_length) where stars
+        # are most likely to be confused with trail fragments.
+        if length < self.params['min_line_length'] * 3:
+            x_min_roi = max(0, int(min(x1, x2)) - 5)
+            y_min_roi = max(0, int(min(y1, y2)) - 5)
+            x_max_roi = min(gray_frame.shape[1], int(max(x1, x2)) + 6)
+            y_max_roi = min(gray_frame.shape[0], int(max(y1, y2)) + 6)
+            roi = gray_frame[y_min_roi:y_max_roi, x_min_roi:x_max_roi]
+            if roi.size > 0:
+                # Threshold the ROI to isolate the bright feature
+                roi_thresh = (roi > np.percentile(roi, 70)).astype(np.uint8) * 255
+                M = cv2.moments(roi_thresh)
+                if M['m00'] > 0:
+                    mu20 = M['mu20'] / M['m00']
+                    mu02 = M['mu02'] / M['m00']
+                    mu11 = M['mu11'] / M['m00']
+                    # Eccentricity from second central moments
+                    disc = np.sqrt(max(0, (mu20 - mu02) ** 2 + 4 * mu11 ** 2))
+                    lam1 = (mu20 + mu02 + disc) / 2
+                    lam2 = max(0, (mu20 + mu02 - disc) / 2)
+                    eccentricity = np.sqrt(1 - lam2 / (lam1 + 1e-10)) if lam1 > 0 else 0
+                    if eccentricity < 0.6:
+                        if ledger:
+                            ledger.record_rejection('star_like', line)
+                        return None, None
+
         # Use reusable mask if provided, otherwise allocate new one
         if reusable_mask is not None:
             mask = reusable_mask
@@ -6984,6 +7176,19 @@ class SatelliteTrailDetector:
         max_brightness = np.max(trail_pixels_gray)
         brightness_std = np.std(trail_pixels_gray)
 
+        # Adaptive mask thickness: if initial 5px mask shows dim trail,
+        # re-measure with 3px mask to reduce background contamination
+        # (5px mask on a 2-3px trail includes ~2px background per side)
+        if not supplementary and mask_thickness == 5 and avg_brightness < self.params['brightness_threshold'] * 2:
+            mask.fill(0)
+            cv2.line(mask, (x1, y1), (x2, y2), 255, thickness=3)
+            trail_pixels_gray = gray_frame[mask > 0]
+            if len(trail_pixels_gray) >= 15:
+                avg_brightness = np.mean(trail_pixels_gray)
+                max_brightness = np.max(trail_pixels_gray)
+                brightness_std = np.std(trail_pixels_gray)
+                mask_thickness = 3
+
         # Too dark (likely noise) - trails should have some minimum brightness
         if avg_brightness < 5:
             if ledger:
@@ -6991,28 +7196,35 @@ class SatelliteTrailDetector:
             return None, None
 
         # Check minimum contrast - trail should stand out from background
-        # Use per-sensitivity threshold so dim satellite trails aren't rejected
-        surround_sample_size = 50
-        x_center = (x1 + x2) // 2
-        y_center = (y1 + y2) // 2
+        # Use per-sensitivity threshold so dim satellite trails aren't rejected.
+        # Multi-point sampling: sample background from 3 positions along trail
+        # (t=0.25, 0.5, 0.75) with 30px half-window, sigma-clipped for robustness.
+        bg_half = 30
+        bg_samples = []
+        for t in [0.25, 0.5, 0.75]:
+            sx = int(x1 + t * (x2 - x1))
+            sy = int(y1 + t * (y2 - y1))
+            sy0 = max(0, sy - bg_half)
+            sy1 = min(gray_frame.shape[0], sy + bg_half)
+            sx0 = max(0, sx - bg_half)
+            sx1 = min(gray_frame.shape[1], sx + bg_half)
+            bg_region = gray_frame[sy0:sy1, sx0:sx1]
+            bg_mask_crop = mask[sy0:sy1, sx0:sx1]
+            bg_only = bg_region[bg_mask_crop == 0]
+            if len(bg_only) > 10:
+                bg_samples.append(bg_only)
 
-        # Get background brightness from area around the trail, excluding trail
-        # pixels to avoid inflating the background estimate for dim trails
-        bg_x_min = max(0, x_center - surround_sample_size)
-        bg_y_min = max(0, y_center - surround_sample_size)
-        bg_x_max = min(gray_frame.shape[1], x_center + surround_sample_size)
-        bg_y_max = min(gray_frame.shape[0], y_center + surround_sample_size)
-
-        background_region = gray_frame[bg_y_min:bg_y_max, bg_x_min:bg_x_max]
         contrast_ratio = None
-        if background_region.size > 0:
-            # Exclude trail pixels from background estimate for cleaner contrast
-            bg_mask_crop = mask[bg_y_min:bg_y_max, bg_x_min:bg_x_max]
-            bg_only = background_region[bg_mask_crop == 0]
-            if len(bg_only) > 20:
-                background_brightness = np.median(bg_only)
+        if bg_samples:
+            all_bg = np.concatenate(bg_samples)
+            # Sigma-clipping: remove >3σ outliers (stars, other trails)
+            bg_med = np.median(all_bg)
+            bg_std = np.std(all_bg)
+            if bg_std > 0:
+                clipped = all_bg[np.abs(all_bg - bg_med) < 3 * bg_std]
+                background_brightness = np.median(clipped) if len(clipped) > 10 else bg_med
             else:
-                background_brightness = np.median(background_region)
+                background_brightness = bg_med
             contrast_ratio = avg_brightness / (background_brightness + 1e-5)
             min_contrast = self.params.get('satellite_contrast_min', 1.08)
             # Supplementary candidates already passed the matched-filter SNR
@@ -7172,6 +7384,18 @@ class SatelliteTrailDetector:
                 if bright_fraction < 0.15:
                     has_bright_spots = False
                     has_high_variance = False
+                elif has_bright_spots:
+                    # Count distinct bright clusters along the trail.
+                    # If only 1 cluster, it's a single flare point (satellite
+                    # specular reflection), not distributed airplane nav lights.
+                    bright_indices = np.where(bright_mask)[0]
+                    if len(bright_indices) > 0:
+                        gaps = np.diff(bright_indices)
+                        # A cluster break = gap > 10% of sample count
+                        min_gap = max(2, int(len(spread_arr) * 0.10))
+                        n_clusters = 1 + np.sum(gaps > min_gap)
+                        if n_clusters <= 1:
+                            has_bright_spots = False
 
         # SPATIAL ANALYSIS: Detect distinct point-like features along the trail
         num_point_features = self.detect_point_features(line, gray_frame)
@@ -7277,9 +7501,11 @@ class SatelliteTrailDetector:
         # When avg_brightness is very low (e.g. 8), even small noise in pixel
         # values causes brightness_std / avg to spike, falsely failing the
         # smoothness test. Use absolute std as a fallback for dim trails.
-        smooth_threshold = 0.40
+        # Dim trails get widened relative threshold (0.55 vs 0.40) because
+        # noise dominates the relative measure at low signal levels.
+        smooth_threshold = 0.55 if is_dim else 0.40
         is_smooth_relative = brightness_variation < smooth_threshold and not has_bright_spots
-        is_smooth_absolute = brightness_std < 8.0 and not has_bright_spots  # Low absolute variation
+        is_smooth_absolute = brightness_std < 10.0 and not has_bright_spots  # Low absolute variation
         is_smooth = is_smooth_relative or (is_dim and is_smooth_absolute)
 
         is_satellite_length = self.params['satellite_min_length'] <= length <= self.params['satellite_max_length']
@@ -7367,7 +7593,12 @@ class SatelliteTrailDetector:
         # trails that are clearly above the local noise floor.
         if supplementary and not has_dotted_pattern and length >= self.params['satellite_min_length'] and length <= extended_max:
             trail_snr = self._compute_trail_snr(gray_frame, line)
-            if trail_snr >= 2.5 and is_smooth:
+            # Relaxed smoothness gate for SNR-validated trails: accept if
+            # formally smooth OR if absolute std is within 3× estimated noise.
+            # This decouples the SNR path from the relative smoothness check
+            # which is unreliable for dim signals.
+            snr_smooth = is_smooth or (brightness_std < max(10.0, avg_brightness * 0.5))
+            if trail_snr >= 2.5 and snr_smooth:
                 if ledger:
                     ledger.record_classification('satellite')
                 return 'satellite', _make_detection_info(
@@ -7400,6 +7631,107 @@ class SatelliteTrailDetector:
             ledger.record_rejection('unclassifiable', line)
         return None, None
     
+    # ── Line-proximity utilities (shared with RadonStreakDetector) ───
+
+    @staticmethod
+    def _line_angle_base(x1, y1, x2, y2):
+        """Return line angle in [0, 180) degrees."""
+        import math
+        return math.degrees(math.atan2(y2 - y1, x2 - x1)) % 180
+
+    @staticmethod
+    def _angle_diff_base(a1, a2):
+        """Absolute angular difference in [0, 90] degrees, handling 180-wrap."""
+        d = abs(a1 - a2) % 180
+        return min(d, 180 - d)
+
+    @staticmethod
+    def _perp_distance_base(line1, line2):
+        """Perpendicular distance from midpoint of line2 to the infinite line through line1."""
+        import math
+        x1, y1, x2, y2 = line1[:4]
+        dx, dy = x2 - x1, y2 - y1
+        length = math.sqrt(dx * dx + dy * dy)
+        if length < 1e-6:
+            mx, my = (line2[0] + line2[2]) / 2, (line2[1] + line2[3]) / 2
+            return math.sqrt((mx - x1) ** 2 + (my - y1) ** 2)
+        nx, ny = -dy / length, dx / length
+        mx, my = (line2[0] + line2[2]) / 2, (line2[1] + line2[3]) / 2
+        return abs((mx - x1) * nx + (my - y1) * ny)
+
+    @classmethod
+    def _merge_satellites_oriented(cls, satellite_infos, angle_thresh=15, perp_thresh=20):
+        """Merge satellite detections using angle + perpendicular distance.
+
+        Replaces merge_overlapping_boxes() for satellites. Two satellites only
+        merge if their trail angles are within angle_thresh AND perpendicular
+        distance between their lines is within perp_thresh. This prevents
+        parallel diagonal trails with overlapping AABBs from being merged.
+
+        Args:
+            satellite_infos: List of detection_info dicts with 'line', 'angle', etc.
+            angle_thresh: Max angle difference to merge (degrees)
+            perp_thresh: Max perpendicular distance to merge (pixels)
+
+        Returns:
+            List of merged detection_info dicts.
+        """
+        if len(satellite_infos) <= 1:
+            return list(satellite_infos)
+
+        n = len(satellite_infos)
+        parent = list(range(n))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(i, j):
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[ri] = rj
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                info_i, info_j = satellite_infos[i], satellite_infos[j]
+                a_i = info_i.get('angle', cls._line_angle_base(*info_i['line'][:4]))
+                a_j = info_j.get('angle', cls._line_angle_base(*info_j['line'][:4]))
+                if cls._angle_diff_base(a_i, a_j) > angle_thresh:
+                    continue
+                line_i = info_i.get('line', info_i['bbox'])
+                line_j = info_j.get('line', info_j['bbox'])
+                d1 = cls._perp_distance_base(line_i, line_j)
+                d2 = cls._perp_distance_base(line_j, line_i)
+                if min(d1, d2) < perp_thresh:
+                    union(i, j)
+
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for i in range(n):
+            groups[find(i)].append(i)
+
+        merged = []
+        for indices in groups.values():
+            if len(indices) == 1:
+                merged.append(satellite_infos[indices[0]])
+                continue
+            # Pick the longest detection as representative
+            best_idx = max(indices, key=lambda i: satellite_infos[i].get('length', 0))
+            best_info = dict(satellite_infos[best_idx])
+            # Expand bbox to cover all members
+            all_x = []
+            all_y = []
+            for idx in indices:
+                b = satellite_infos[idx]['bbox']
+                all_x.extend([b[0], b[2]])
+                all_y.extend([b[1], b[3]])
+            best_info['bbox'] = (min(all_x), min(all_y), max(all_x), max(all_y))
+            merged.append(best_info)
+
+        return merged
+
     def merge_overlapping_boxes(self, boxes, overlap_threshold=0.3):
         """Merge overlapping bounding boxes.
 
@@ -7606,7 +7938,18 @@ class SatelliteTrailDetector:
                 'velocity': dict or None (angular velocity estimate)
         """
         gray, preprocessed = self.preprocess_frame(frame)
-        lines, edges = self.detect_lines(preprocessed)
+        lines, edges = self._detect_lines_multiscale(preprocessed)
+
+        # PSF estimation: every 10 frames, measure star FWHM to adapt MF kernel
+        self._psf_frame_count += 1
+        if self._psf_frame_count % 10 == 1:
+            psf_sigma = self._estimate_psf_from_stars(gray)
+            if psf_sigma is not None:
+                # Select closest pre-computed sigma from kernel bank options
+                # (0.7, 0.85, 1.0, 1.3) — snap to nearest
+                candidates = [0.7, 0.85, 1.0, 1.3]
+                best_sigma = min(candidates, key=lambda s: abs(s - psf_sigma))
+                self._estimated_psf_sigma = best_sigma
 
         # Pre-compute HSV frame once for all line classifications (performance optimization)
         hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -7692,29 +8035,10 @@ class SatelliteTrailDetector:
             elif t == 'anomalous':
                 anomalous_infos.append(info)
 
-        # Merge overlapping satellite detections (simple box merge)
-        satellite_boxes = [info['bbox'] for info in satellite_infos]
-        merged_satellite_boxes = self.merge_overlapping_boxes(satellite_boxes)
-
-        # Rebuild satellite detection_info from merged boxes (use nearest original info)
-        merged_satellite_infos = []
-        for mbox in merged_satellite_boxes:
-            # Find the original detection whose center is closest to the merged box center
-            mx = (mbox[0] + mbox[2]) / 2
-            my = (mbox[1] + mbox[3]) / 2
-            best = None
-            best_dist = float('inf')
-            for info in satellite_infos:
-                dx = info['center'][0] - mx
-                dy = info['center'][1] - my
-                dist = dx * dx + dy * dy
-                if dist < best_dist:
-                    best_dist = dist
-                    best = info
-            if best:
-                merged_info = dict(best)
-                merged_info['bbox'] = mbox
-                merged_satellite_infos.append(merged_info)
+        # Merge overlapping satellite detections using angle-aware merge
+        # (replaces AABB merge which had no angle check — two parallel diagonal
+        # trails with overlapping bounding boxes would merge into one)
+        merged_satellite_infos = self._merge_satellites_oriented(satellite_infos)
 
         # Merge airplane detections with angle awareness (keeps distinct airplanes separate)
         merged_airplane_infos = self.merge_airplane_detections(airplane_infos)
@@ -7737,6 +8061,35 @@ class SatelliteTrailDetector:
                 merged_info = dict(best)
                 merged_info['bbox'] = mbox
                 merged_anomalous_infos.append(merged_info)
+
+        # --- Cross-type dedup: same trail detected as both satellite & airplane ---
+        # Use classification evidence to decide which to keep.
+        if merged_satellite_infos and merged_airplane_infos:
+            keep_airplanes = []
+            for a_info in merged_airplane_infos:
+                a_line = a_info.get('line', a_info['bbox'])
+                is_dup = False
+                for s_info in merged_satellite_infos:
+                    s_line = s_info.get('line', s_info['bbox'])
+                    # Check if lines are close (same physical trail)
+                    a_angle = a_info.get('angle', self._line_angle_base(*a_line[:4]))
+                    s_angle = s_info.get('angle', self._line_angle_base(*s_line[:4]))
+                    if self._angle_diff_base(a_angle, s_angle) > 10:
+                        continue
+                    d1 = self._perp_distance_base(a_line, s_line)
+                    d2 = self._perp_distance_base(s_line, a_line)
+                    if min(d1, d2) < 20:
+                        # Same trail — prefer airplane if strong airplane evidence
+                        a_has_dots = a_info.get('has_dotted_pattern', False)
+                        a_bright = a_info.get('avg_brightness', 0) > 50
+                        if a_has_dots and a_bright:
+                            merged_satellite_infos = [
+                                s for s in merged_satellite_infos if s is not s_info]
+                        is_dup = True
+                        break
+                if not is_dup:
+                    keep_airplanes.append(a_info)
+            merged_airplane_infos = keep_airplanes
 
         # --- Enrich detections with photometry, curvature, velocity ---
         frame_width = frame.shape[1]
@@ -8164,7 +8517,7 @@ class RadonStreakDetector(SatelliteTrailDetector):
         self.radon_num_angles = 90        # 2-degree angular resolution (fast)
         self.radon_max_dim = 480          # Max short-side pixels for Radon input
         self.radon_snr_threshold = 3.0    # SNR threshold in sinogram space
-        self.pcf_ratio_threshold = 2.5    # Parallel / perpendicular ratio (raised from 2.0 to reject star residuals)
+        self.pcf_ratio_threshold = 2.0    # Parallel / perpendicular ratio (lowered from 2.5 — was too aggressive on dim trails)
         self.pcf_kernel_length = 31       # Matched filter kernel length for PCF
 
         # Overridable from Radon preview (default None = use hardcoded values)
@@ -8815,7 +9168,7 @@ class RadonStreakDetector(SatelliteTrailDetector):
         return min(d1, d2) < dist_thresh
 
     @classmethod
-    def _merge_collinear_segments(cls, segments, angle_thresh=5, perp_thresh=10, gap_thresh=50):
+    def _merge_collinear_segments(cls, segments, angle_thresh=5, perp_thresh=5, gap_thresh=40):
         """Merge collinear LSD segments that belong to the same physical trail.
 
         LSD often splits a long dim trail into 2-5 fragments.  This merges
@@ -8899,10 +9252,12 @@ class RadonStreakDetector(SatelliteTrailDetector):
             # (the overall trail extent), keep the best NFA
             best_nfa = min(segments[idx][4] for idx in indices)
             all_points = []
+            seg_lengths = []
             for idx in indices:
                 s = segments[idx]
                 all_points.append((s[0], s[1]))
                 all_points.append((s[2], s[3]))
+                seg_lengths.append(math.sqrt((s[2]-s[0])**2 + (s[3]-s[1])**2))
 
             # Find the pair of points with maximum distance
             max_dist = 0
@@ -8915,7 +9270,16 @@ class RadonStreakDetector(SatelliteTrailDetector):
                         max_dist = d
                         p_start, p_end = pa, pb
 
-            merged.append((p_start[0], p_start[1], p_end[0], p_end[1], best_nfa))
+            # Only merge if combined length is ≥1.3× the longest constituent.
+            # This prevents two truly separate parallel trails from merging.
+            merged_len = math.sqrt(max_dist)
+            longest_seg = max(seg_lengths) if seg_lengths else 0
+            if longest_seg > 0 and merged_len < longest_seg * 1.3:
+                # Not a meaningful merge — keep segments separate
+                for idx in indices:
+                    merged.append(segments[idx])
+            else:
+                merged.append((p_start[0], p_start[1], p_end[0], p_end[1], best_nfa))
 
         return merged
 
@@ -9048,9 +9412,9 @@ class RadonStreakDetector(SatelliteTrailDetector):
         high_thresh = star_sigma * noise_sigma
         star_mask = residual > high_thresh
 
-        # Dilate to cover halos and spikes — cap at 15 to avoid eating
-        # trail pixels near stars on high-noise frames
-        dilate_size = max(5, min(15, int(noise_sigma * 2)))
+        # Dilate to cover halos and spikes — cap at 10 to preserve dim
+        # trails near stars (was 15 which erased 2px trails within 7-8px)
+        dilate_size = max(3, min(10, int(noise_sigma * 1.5)))
         if dilate_size % 2 == 0:
             dilate_size += 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
@@ -9168,15 +9532,18 @@ class RadonStreakDetector(SatelliteTrailDetector):
 
         # ── Multi-frame residual accumulation (sequential mode only) ──
         # Accumulate star-subtracted residuals across frames to boost Radon
-        # SNR by sqrt(N).  In parallel mode each worker has its own detector
-        # so the buffer stays empty and we fall back to single-frame Radon.
-        self._residual_buffer.append(cleaned)
-        self._residual_star_masks.append(star_mask)
-        if len(self._residual_buffer) > self._residual_buffer_depth:
-            self._residual_buffer.pop(0)
-            self._residual_star_masks.pop(0)
+        # SNR by sqrt(N).  Skip when temporal_context is provided — the
+        # TemporalFrameBuffer already gives multi-frame reference, making
+        # local accumulation redundant.  Also broken in parallel mode where
+        # each worker has its own empty buffer.
+        if temporal_context is None:
+            self._residual_buffer.append(cleaned)
+            self._residual_star_masks.append(star_mask)
+            if len(self._residual_buffer) > self._residual_buffer_depth:
+                self._residual_buffer.pop(0)
+                self._residual_star_masks.pop(0)
 
-        if len(self._residual_buffer) >= 2:
+        if temporal_context is None and len(self._residual_buffer) >= 2:
             # Stack: mean of recent residuals with union star mask
             stacked = np.mean(self._residual_buffer, axis=0).astype(np.float32)
             combined_mask = self._residual_star_masks[0].copy()
@@ -9232,6 +9599,9 @@ class RadonStreakDetector(SatelliteTrailDetector):
             # Sample along the line at 1px steps from center outward
             max_half = int(length * 0.75)  # search up to 1.5x original estimate
             noise_floor = noise_sigma * 1.5  # signal threshold
+            # Adaptive gap tolerance: low-noise frames get precise endpoints,
+            # high-noise frames tolerate larger gaps to avoid early termination
+            gap_tol = max(3, min(8, int(2.0 / (noise_sigma + 0.1))))
 
             def _find_endpoint(direction):
                 """Walk from center in +/- direction, return last above-noise point."""
@@ -9242,8 +9612,8 @@ class RadonStreakDetector(SatelliteTrailDetector):
                     if 0 <= py < h and 0 <= px < w:
                         if cleaned[py, px] > noise_floor:
                             last_good = step
-                        elif step - last_good > 5:
-                            break  # 5px gap → end of trail
+                        elif step - last_good > gap_tol:
+                            break  # gap exceeds tolerance → end of trail
                     else:
                         break
                 return last_good
@@ -9350,7 +9720,7 @@ class RadonStreakDetector(SatelliteTrailDetector):
         merged_anomalous_infos = self._merge_lines_oriented(anomalous_infos)
 
         # ── Cross-type dedup: same trail detected as both satellite & airplane
-        # Keep the detection with the longer trail (more context = more reliable)
+        # Use classification evidence to decide which to keep, not just length.
         if merged_satellite_infos and merged_airplane_infos:
             keep_airplanes = []
             for a_info in merged_airplane_infos:
@@ -9360,13 +9730,17 @@ class RadonStreakDetector(SatelliteTrailDetector):
                     s_line = s_info.get('line', s_info['bbox'])
                     if self._is_duplicate_line(a_line, s_line,
                                                dist_thresh=20, angle_thresh=10):
-                        # Same trail — prefer the longer detection
-                        if a_info.get('length', 0) > s_info.get('length', 0):
-                            # Airplane detection is longer — keep airplane,
-                            # remove the satellite (rare case)
+                        # Same trail — use classification evidence to decide.
+                        # Prefer airplane if it has strong airplane signatures
+                        # (dotted pattern + reasonable brightness), otherwise
+                        # prefer the satellite detection.
+                        a_has_dots = a_info.get('has_dotted_pattern', False)
+                        a_bright = a_info.get('avg_brightness', 0) > 50
+                        if a_has_dots and a_bright:
+                            # Strong airplane evidence — keep airplane, drop satellite
                             merged_satellite_infos = [
                                 s for s in merged_satellite_infos if s is not s_info]
-                        # else: satellite is longer or equal — drop airplane
+                        # else: satellite evidence stronger — drop airplane
                         is_dup = True
                         break
                 if not is_dup:
@@ -11962,15 +12336,19 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     if fov_degrees:
         print(f"Field of view: {fov_degrees}°")
 
-    # ── Temporal detection tracker (Radon pipeline only) ──────────
-    # Filters out single-frame noise and builds tracklets across frames.
-    # Runs post-detection in the main process — works with both sequential
-    # and parallel modes.
+    # ── Temporal detection tracker (all algorithms) ──────────────
+    # Builds tracklets across frames and adds temporal_hits metadata.
+    # Radon: min_hits=2 filters single-frame noise.
+    # Default/NN: min_hits=1 (pass-through) but still builds tracklets.
     detection_tracker = None
     if algorithm == 'radon':
         detection_tracker = DetectionTracker(
             window=4, min_hits=2, angle_thresh=10, dist_thresh=30)
         print("Temporal detection tracker: active (window=4, min_hits=2)")
+    else:
+        detection_tracker = DetectionTracker(
+            window=4, min_hits=1, angle_thresh=10, dist_thresh=30)
+        print("Temporal detection tracker: active (window=4, min_hits=1, tracklet metadata)")
 
     frame_count = 0
     satellites_detected = 0
@@ -12202,9 +12580,10 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
             detected_trails = [(t, b) for t, b in detected_trails if t == 'anomalous']
         # If detect_type == 'both' or 'all', no filtering needed
 
-        # Apply temporal consistency filter (Radon pipeline only).
-        # Requires detections to appear in multiple recent frames to confirm,
-        # suppressing single-frame noise.  Also builds tracklets.
+        # Apply temporal consistency filter and tracklet builder.
+        # Radon: min_hits=2 filters single-frame noise.
+        # Default/NN: min_hits=1 passes everything through but attaches
+        # temporal_hits and tracklet metadata for downstream use.
         if detection_tracker is not None:
             detected_trails = detection_tracker.update(fc, detected_trails)
 
