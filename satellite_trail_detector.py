@@ -123,12 +123,16 @@ def _ensure_nn_backend(name):
     if pkg is None:
         print(f"Error: backend '{name}' is not available and cannot be auto-installed.")
         return False
-    print(f"Backend '{name}' not found. Attempting: pip install {pkg} ...")
+    print(f"Backend '{name}' not found. Required package: {pkg}")
     try:
+        answer = input(f"  Install '{pkg}' via pip now? [y/N]: ").strip().lower()
+        if answer not in ('y', 'yes'):
+            print(f"  Skipped. Please install manually:  pip install {pkg}")
+            return False
         import subprocess
         subprocess.check_call(
             [sys.executable, '-m', 'pip', 'install', pkg, '-q'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stderr=subprocess.DEVNULL)
         # Re-check
         _NN_BACKENDS_CHECKED.pop(name, None)
         if _check_nn_backend(name):
@@ -216,8 +220,17 @@ def save_config(config, path=None):
     fpath = Path(path) if path else _CONFIG_PATH
     fpath.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with open(fpath, 'w') as f:
-            json.dump(config, f, indent=2, default=str)
+        fd, tmp_path = tempfile.mkstemp(suffix='.json', dir=str(fpath.parent))
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump(config, f, indent=2, default=str)
+            os.replace(tmp_path, str(fpath))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
     except Exception as e:
         print(f"Warning: could not save config {fpath}: {e}")
 
@@ -516,6 +529,8 @@ class _NNBackend:
         self._model.setInput(blob)
         out_names = self._model.getUnconnectedOutLayersNames()
         outputs = self._model.forward(out_names)
+        if not outputs or outputs[0].size == 0:
+            return []
         return self._parse_yolo_output(outputs, w, h)
 
     def _predict_onnxruntime(self, frame):
@@ -529,6 +544,8 @@ class _NNBackend:
             img = img.astype(np.float16)
         input_name = self._model.get_inputs()[0].name
         outputs = self._model.run(None, {input_name: img})
+        if not outputs or outputs[0].size == 0:
+            return []
         return self._parse_yolo_output(outputs, w, h)
 
     def _parse_yolo_output(self, outputs, orig_w, orig_h):
@@ -2310,9 +2327,9 @@ def show_radon_preview(video_path, initial_params=None):
         orig_w = int(orig_w * _fit_scale)
         orig_h = int(orig_h * _fit_scale)
 
-    # Bottom row: 4 panels side-by-side
+    # Bottom row: 4 panels side-by-side (within content area, not under sidebar)
     bottom_h = int(orig_h * 0.3)
-    small_w = (orig_w + sidebar_w - 3 * gap) // 4
+    small_w = (orig_w - 3 * gap) // 4
     small_h = bottom_h
     canvas_w = orig_w + sidebar_w
     canvas_h = orig_h + gap + bottom_h + status_bar_h
@@ -2571,7 +2588,7 @@ def show_radon_preview(video_path, initial_params=None):
                 continue
             mean_par = par_sum / count
             mean_perp = perp_sum / count
-            ratio = mean_perp / (abs(mean_par) + 1e-10)
+            ratio = mean_par / (abs(mean_perp) + 1e-10)
             if ratio >= pcf_ratio:
                 pcf_confirmed.append((x1, y1, x2, y2, score))
             else:
@@ -3941,11 +3958,16 @@ class DetectionTracker:
             tracklet_id = None
             tracklet_len = 0
             for t in self._tracklets:
-                if (t['last_frame'] == frame_idx and
-                        t['detections'][-1][2] is info):
-                    tracklet_id = t['id']
-                    tracklet_len = len(t['detections'])
-                    break
+                if t['last_frame'] == frame_idx:
+                    last_info = t['detections'][-1][2]
+                    # Use structural comparison (center + angle) instead of
+                    # identity — objects are deserialized from workers in
+                    # parallel mode so `is` would never match.
+                    if (last_info.get('center') == info.get('center') and
+                            last_info.get('angle') == info.get('angle')):
+                        tracklet_id = t['id']
+                        tracklet_len = len(t['detections'])
+                        break
 
             # Confirm if: enough temporal hits OR strong tracklet
             if hits >= self.min_hits or tracklet_len >= 3:
@@ -4609,8 +4631,18 @@ class AnnotationDatabase:
                 'iscrowd': 0,
             })
             ann_id += 1
-        with open(path, 'w') as f:
-            json.dump(coco, f, indent=2)
+        fd, tmp_path = tempfile.mkstemp(suffix='.json',
+                                        dir=str(Path(path).parent))
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump(coco, f, indent=2)
+            os.replace(tmp_path, str(path))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def undo_last_correction(self):
         """Undo the most recent correction. Returns True if successful."""
@@ -4848,8 +4880,17 @@ class ParameterAdapter:
         }
         profiles['active_profile'] = profile_name
 
-        with open(profile_path, 'w') as f:
-            json.dump(profiles, f, indent=2)
+        fd, tmp_path = tempfile.mkstemp(suffix='.json', dir=str(profile_dir))
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump(profiles, f, indent=2)
+            os.replace(tmp_path, str(profile_path))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def load_profile(self, profile_name='default'):
         """Load learned parameters from profile. Returns True if found."""
@@ -4874,6 +4915,12 @@ class ParameterAdapter:
     @staticmethod
     def compute_confidence(detection_info, params):
         """Compute pseudo-confidence score for a detection."""
+        # If the detection came from a neural network, use its native
+        # confidence directly — the classical metrics are synthesized
+        # from the bbox and would produce misleading scores.
+        nn_conf = detection_info.get('nn_confidence')
+        if nn_conf is not None:
+            return float(nn_conf)
         contrast = detection_info.get('contrast_ratio', 1.0)
         snr = detection_info.get('trail_snr', 0.0) or 0.0
         length = detection_info.get('length', 0.0)
@@ -5531,6 +5578,12 @@ class ReviewUI:
             self.ann_db.record_correction(ann['id'], 'accept')
             self.stats['accepted'] += 1
             self.stats['reviewed'] += 1
+            # Apply Tier 1 learning (accepts reinforce current thresholds)
+            if self.param_adapter:
+                trail_type = AnnotationDatabase.CATEGORY_MAP.get(ann['category_id'], 'satellite')
+                meta = ann['mnemosky_ext'].get('detection_meta', {})
+                self.param_adapter.apply_correction('accept', trail_type, meta)
+                self.stats['param_adjustments'] += 1
             self._toast(f"Accepted #{self.selected_ann_idx+1} {cat}", self.CONFIRMED_COLOR)
             self._reload_current_frame_annotations()
 
@@ -5583,6 +5636,11 @@ class ReviewUI:
                 self.stats['accepted'] += 1
                 self.stats['reviewed'] += 1
                 count += 1
+                if self.param_adapter:
+                    trail_type = AnnotationDatabase.CATEGORY_MAP.get(ann['category_id'], 'satellite')
+                    meta = ann['mnemosky_ext'].get('detection_meta', {})
+                    self.param_adapter.apply_correction('accept', trail_type, meta)
+                    self.stats['param_adjustments'] += 1
         if count:
             self._toast(f"Accepted all {count} detections", self.CONFIRMED_COLOR)
         self._reload_current_frame_annotations()
@@ -5880,6 +5938,7 @@ class SatelliteTrailDetector:
         self.airplane_color = (0, 140, 255)   # Orange/amber for airplanes
         self.anomalous_color = (200, 50, 200)  # Magenta for anomalous (Bowker & Star)
         self.ledger = None  # TranslationLedger instance (set externally if --ledger)
+        self._observer_context = None  # Set by process_video if --observer-context
         self.sensitivity = sensitivity  # Store for inscription metadata
         self.box_thickness = 1
         self.dot_length = 8  # Length of each dash in dotted line
@@ -7473,6 +7532,9 @@ class SatelliteTrailDetector:
                                 (minfo['center'][0] * n + info['center'][0]) / (n + 1),
                                 (minfo['center'][1] * n + info['center'][1]) / (n + 1),
                             )
+                            # Keep line from the longer detection
+                            if info['length'] > minfo['length']:
+                                merged[i]['line'] = info['line']
                             merged[i]['length'] = max(minfo['length'], info['length'])
                             merged[i]['avg_brightness'] = (minfo['avg_brightness'] * n + info['avg_brightness']) / (n + 1)
                             merged[i]['max_brightness'] = max(minfo['max_brightness'], info['max_brightness'])
@@ -7482,29 +7544,18 @@ class SatelliteTrailDetector:
                         # else: angles differ too much - treat as separate airplanes
 
             if not found_overlap:
-                merged.append({
-                    'bbox': list(info['bbox']),
-                    'angle': info['angle'],
-                    'center': info['center'],
-                    'length': info['length'],
-                    'avg_brightness': info['avg_brightness'],
-                    'max_brightness': info['max_brightness'],
-                    'line': info['line'],
-                    '_count': 1,
-                })
+                entry = dict(info)
+                entry['bbox'] = list(info['bbox'])
+                entry['_count'] = 1
+                merged.append(entry)
 
         # Convert bbox lists back to tuples and remove internal _count
         results = []
         for m in merged:
-            results.append({
-                'bbox': tuple(m['bbox']),
-                'angle': m['angle'],
-                'center': m['center'],
-                'length': m['length'],
-                'avg_brightness': m['avg_brightness'],
-                'max_brightness': m['max_brightness'],
-                'line': m['line'],
-            })
+            out = dict(m)
+            out['bbox'] = tuple(m['bbox'])
+            out.pop('_count', None)
+            results.append(out)
         return results
 
     def detect_trails(self, frame, debug_info=None, temporal_context=None,
@@ -9281,15 +9332,22 @@ class RadonStreakDetector(SatelliteTrailDetector):
                 debug_info['temporal_context'] = temporal_context
 
         # ── Merge overlapping detections ────────────────────────────
-        satellite_infos, airplane_infos = [], []
+        satellite_infos, airplane_infos, anomalous_infos = [], [], []
         for t, info in classified_trails:
-            (satellite_infos if t == 'satellite' else airplane_infos).append(info)
+            if t == 'satellite':
+                satellite_infos.append(info)
+            elif t == 'airplane':
+                airplane_infos.append(info)
+            else:
+                anomalous_infos.append(info)
 
         # Use oriented line-proximity merge for satellites (replaces AABB
         # merge which fails for diagonal trails — bloated AABBs cause false
         # merges of parallel trails and missed merges of collinear segments)
         merged_satellite_infos = self._merge_lines_oriented(satellite_infos)
         merged_airplane_infos = self.merge_airplane_detections(airplane_infos)
+        # Anomalous trails merge like satellites (line-oriented)
+        merged_anomalous_infos = self._merge_lines_oriented(anomalous_infos)
 
         # ── Cross-type dedup: same trail detected as both satellite & airplane
         # Keep the detection with the longer trail (more context = more reliable)
@@ -9321,7 +9379,8 @@ class RadonStreakDetector(SatelliteTrailDetector):
 
         all_merged = (
             [('satellite', info) for info in merged_satellite_infos] +
-            [('airplane', info) for info in merged_airplane_infos]
+            [('airplane', info) for info in merged_airplane_infos] +
+            [('anomalous', info) for info in merged_anomalous_infos]
         )
         # Skip expensive enrichment when many detections (same guard as parent)
         do_full_enrichment = len(all_merged) <= 20
@@ -9338,6 +9397,19 @@ class RadonStreakDetector(SatelliteTrailDetector):
             info['velocity'] = self._estimate_angular_velocity(
                 info['length'], frame_width,
                 exposure_time=exposure_time, fov_degrees=fov_degrees)
+            info['inscription'] = {
+                'software_version': __version__,
+                'algorithm': 'radon',
+                'sensitivity': getattr(self, 'sensitivity', 'medium'),
+                'parameters_at_detection': {
+                    'satellite_contrast_min': self.params.get('satellite_contrast_min'),
+                    'radon_snr_threshold': getattr(self, '_radon_snr_threshold', None),
+                    'pcf_ratio_threshold': getattr(self, '_pcf_ratio_threshold', None),
+                    'satellite_min_length': self.params.get('satellite_min_length'),
+                    'satellite_max_length': self.params.get('satellite_max_length'),
+                },
+                'observer_context': getattr(self, '_observer_context', None),
+            }
 
         return all_merged
 
@@ -9646,6 +9718,23 @@ class NeuralNetDetector(SatelliteTrailDetector):
             info['velocity'] = self._estimate_angular_velocity(
                 info['length'], frame_width,
                 exposure_time=exposure_time, fov_degrees=fov_degrees)
+            info['inscription'] = {
+                'software_version': __version__,
+                'algorithm': 'nn',
+                'sensitivity': getattr(self, 'sensitivity', 'medium'),
+                'parameters_at_detection': {
+                    'nn_confidence_threshold': getattr(self, 'confidence', None),
+                    'nn_nms_iou': getattr(self, 'nms_iou', None),
+                    'nn_backend': getattr(self, 'backend_name', None),
+                    'nn_model_path': str(getattr(self, 'model_path', '')),
+                },
+                'observer_context': getattr(self, '_observer_context', None),
+            }
+            if 'epistemic_profile' not in info:
+                info['epistemic_profile'] = {
+                    'source': 'neural_network',
+                    'nn_confidence': info.get('nn_confidence'),
+                }
 
         # ── Debug info ───────────────────────────────────────────────
         if debug_info is not None:
@@ -10410,7 +10499,8 @@ def _extract_exif_from_raw(filepath):
         exp_tag = tags.get('EXIF ExposureTime')
         if exp_tag:
             val = exp_tag.values[0]
-            result['exposure_time'] = float(val.num) / float(val.den)
+            if val.den != 0:
+                result['exposure_time'] = float(val.num) / float(val.den)
         # ISO
         iso_tag = tags.get('EXIF ISOSpeedRatings')
         if iso_tag:
@@ -10419,7 +10509,8 @@ def _extract_exif_from_raw(filepath):
         fl_tag = tags.get('EXIF FocalLength')
         if fl_tag:
             val = fl_tag.values[0]
-            result['focal_length'] = float(val.num) / float(val.den)
+            if val.den != 0:
+                result['focal_length'] = float(val.num) / float(val.den)
         return result
     except Exception:
         return {}
@@ -11889,6 +11980,44 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     # ── HITL review mode: collect detections per frame ────────────
     detections_by_frame = {} if review_mode else None
 
+    # ── review-only: skip video processing, jump straight to review UI
+    if review_only:
+        cap.release()
+        out.release()
+        # Remove the empty output file that the VideoWriter created
+        try:
+            out_p = Path(output_path)
+            if out_p.exists() and out_p.stat().st_size == 0:
+                out_p.unlink()
+        except OSError:
+            pass
+        # Jump to HITL Review Mode section
+        if annotations_path:
+            ann_path = Path(annotations_path)
+        else:
+            ann_path = Path(output_path).with_suffix('.json')
+        if not ann_path.exists():
+            print(f"Error: Annotation file not found: {ann_path}")
+            print("Use --annotations to specify the path, or run processing first.")
+            return
+        ann_db = AnnotationDatabase(ann_path)
+        param_adapter = None
+        if not no_learn:
+            param_adapter = ParameterAdapter(detector.params, PARAMETER_SAFETY_BOUNDS,
+                                              loss_profile=loss_profile)
+            if hitl_profile:
+                param_adapter.load_profile(hitl_profile)
+        review_ui = ReviewUI(
+            str(input_path), {}, detector, ann_db,
+            param_adapter=param_adapter, auto_accept_threshold=auto_accept)
+        review_ui.run()
+        ann_db.save(str(ann_path))
+        ann_db.end_session(param_adapter.get_params() if param_adapter else None)
+        if param_adapter and hitl_profile and not no_learn:
+            param_adapter.save_profile(hitl_profile)
+        print(f"Review session saved to {ann_path}")
+        return
+
     # ── ML dataset setup ───────────────────────────────────────────
     dataset_exporter = None
     if save_dataset:
@@ -12196,7 +12325,12 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
                 actual_region_w = actual_x_max - x_min_c
 
                 if actual_region_h > 0 and actual_region_w > 0:
-                    output_frame[y_min_c:actual_y_max, x_min_c:actual_x_max] = region[:actual_region_h, :actual_region_w]
+                    # Clamp to actual region dimensions (region may be smaller
+                    # than expected if bbox was clipped at frame edge on capture)
+                    rh = min(actual_region_h, region.shape[0])
+                    rw = min(actual_region_w, region.shape[1])
+                    if rh > 0 and rw > 0:
+                        output_frame[y_min_c:y_min_c + rh, x_min_c:x_min_c + rw] = region[:rh, :rw]
 
                 # Decrement frames remaining
                 frozen_data['frames_remaining'] -= 1
