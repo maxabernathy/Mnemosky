@@ -44,6 +44,9 @@ This is a single-file Python application with no additional modules or packages.
 pip install opencv-python numpy
 # Optional: scipy improves Radon NMS quality (falls back to cv2.dilate if absent)
 pip install scipy
+# Optional: RAW image folder input (Sony ARW, Canon CR2, Nikon NEF, DNG)
+pip install rawpy             # Required for RAW decoding (wraps LibRaw)
+pip install exifread          # Optional: EXIF metadata extraction (timestamps, exposure)
 # Optional: neural network backends for --algorithm nn (auto-installed on first use)
 pip install ultralytics       # Primary NN backend (YOLOv8/v11)
 pip install onnxruntime       # Alternative ONNX backend
@@ -133,6 +136,10 @@ pip install onnxruntime       # Alternative ONNX backend
 - `show_radon_preview()` - Interactive GUI for tuning the Radon detection pipeline (Radon SNR, PCF ratio, star mask sigma, LSD significance, PCF kernel, min length). Same dark-grey/fluorescent theme. Four diagnostic panels: Residual (star-cleaned), Sinogram (SNR heatmap with peaks), LSD Lines, and Detections (PCF-confirmed vs rejected). Activated by `--preview` with `--algorithm radon`.
 - `show_nn_preview()` - Interactive GUI for tuning neural network detection parameters (confidence, NMS IoU). Same dark-grey/fluorescent theme. Main frame panel with detection overlays, sidebar with model info card, sliders, class mapping, confidence bars, inference FPS. Activated by `--preview` with `--algorithm nn`.
 - `load_config()` / `save_config()` - Application-wide config persistence to `~/.mnemosky/config.json`. Stores all algorithm parameters (default, radon, nn), model paths, backend choice. Deep-merges user config with defaults.
+- `_detect_hardware()` - Detects CPU count, RAM, and GPU (CUDA) capabilities. Cached after first call. Used for adaptive parameter selection.
+- `_optimal_raw_params()` - Computes optimal RAW conversion parameters (target height, thread count, GPU usage) based on detected hardware.
+- `_extract_exif_from_raw()` - Extracts EXIF metadata (DateTimeOriginal, ExposureTime, ISO, FocalLength) from RAW image files via exifread.
+- `convert_raw_folder_to_video()` - Converts a folder of RAW images (ARW, CR2, NEF, DNG) to an MP4 video with 16-bit CLAHE + percentile stretch enhancement for dim trail visibility. Parallel RAW decoding via ThreadPoolExecutor, GPU-accelerated enhancement, live progress window with frame preview, EXIF info, stats, and L-channel histogram.
 - `_worker_init()` / `_worker_detect()` - Multiprocessing worker functions for parallel frame detection
 - `process_video()` - Main video processing pipeline (handles I/O, frame iteration, output, optional YOLO dataset export, parallel dispatch)
 - `main()` - CLI entry point with argument parsing
@@ -353,6 +360,9 @@ When `--review` is used, detections are stored in a COCO-compatible JSON annotat
 
 ```bash
 python satellite_trail_detector.py input.mp4 output.mp4
+
+# RAW image folder input (Sony A7III, Canon, Nikon, etc.)
+python satellite_trail_detector.py /mnt/sdcard/DCIM/101SONY/ output.mp4
 ```
 
 ### Common Options
@@ -448,6 +458,17 @@ python satellite_trail_detector.py input.mp4 output.mp4 --show-processing
 
 # Preview + processing dashboard (seamless transition: --preview auto-enables dashboard)
 python satellite_trail_detector.py input.mp4 output.mp4 --preview
+
+# RAW image folder input (auto-detects hardware, applies 16-bit enhancement)
+python satellite_trail_detector.py /mnt/sdcard/DCIM/101SONY/ output.mp4
+
+# RAW folder with custom options
+python satellite_trail_detector.py ./night_sky/ output.mp4 --half-size-raw --keep-video
+python satellite_trail_detector.py ./arw_folder/ output.mp4 --target-height 2160
+python satellite_trail_detector.py ./arw_folder/ output.mp4 --no-raw-enhance --fps 30
+
+# RAW folder with preview tuning (operates on the converted intermediate video)
+python satellite_trail_detector.py ./arw_folder/ output.mp4 --preview
 
 # HITL review mode: process video, then open interactive review UI
 python satellite_trail_detector.py input.mp4 output.mp4 --review
@@ -595,6 +616,12 @@ class CustomDetectionAlgorithm(BaseDetectionAlgorithm):
 
 28. **Processing window (`--show-processing`)**: The `ProcessingWindow` class provides a live dashboard during video processing.  Four panels: LIVE FRAME (thumbnailed current frame with detection boxes), TRAIL MAP (2-D scatter of all trail centre positions plotted over normalised frame space with aspect-ratio-preserving grid), DETECTION TIMELINE (stacked satellite/airplane bar chart bucketed across the video duration, with a waveform overlay showing per-second detection density and a progress playhead), and STATUS BAR (progress ring with percentage, processing FPS, algorithm label, satellite/airplane counts with colour-coded dots, ETA, and abort hint).  Throttled to ~20 fps redraw; always redraws immediately on detection events.  Automatically enabled when `--preview` is used (seamless transition from preview to processing).  Press Q/ESC to abort.
 
+29. **RAW image folder input**: When the input path is a directory, `main()` auto-detects RAW files (ARW/CR2/NEF/DNG), runs `convert_raw_folder_to_video()` to produce an intermediate MP4, then feeds it into the existing pipeline unchanged. The conversion step applies 16-bit CLAHE + percentile stretch in LAB space to maximize dim trail visibility from the 14-bit sensor data. Parallel RAW decoding via `ThreadPoolExecutor` (rawpy releases the GIL). GPU-accelerated enhancement when CUDA is available. A live progress window shows frame preview, EXIF info, conversion stats, and L-channel histogram. The intermediate MP4 is deleted after processing unless `--keep-video` is set.
+
+30. **Hardware detection**: `_detect_hardware()` probes CPU count, system RAM, and CUDA GPU capabilities (name, VRAM) at startup. Results are cached in `_HARDWARE_PROFILE`. `_optimal_raw_params()` uses the hardware profile to automatically select target resolution, thread count, and GPU usage for RAW conversion. CLI flags always override auto-detected parameters.
+
+31. **RAW 16-bit enhancement pipeline**: During RAW→MP4 conversion, frames are decoded to 16-bit RGB via rawpy, converted to LAB colour space, and enhanced on the L channel only (preserving colour for airplane classification). CLAHE at 16-bit has 256x the precision of 8-bit CLAHE. Percentile stretching (p2→p99.5) maximizes dynamic range usage before 8-bit quantization. The `--no-raw-enhance` flag skips this step.
+
 ## Common Tasks
 
 ### Adding a new sensitivity preset
@@ -632,7 +659,11 @@ Add to the `main()` function's argument parser, then handle in `process_video()`
 |-----------|----------|
 | Config system | `satellite_trail_detector.py:load_config()` / `save_config()` (line ~163) |
 | Config defaults | `satellite_trail_detector.py:_DEFAULT_CONFIG` (line ~132) |
-| NN backend abstraction | `satellite_trail_detector.py:_NNBackend` (line ~221) |
+| Hardware detection | `satellite_trail_detector.py:_detect_hardware()` / `_optimal_raw_params()` (line ~232) |
+| RAW EXIF extraction | `satellite_trail_detector.py:_extract_exif_from_raw()` (line ~10015) |
+| RAW folder conversion | `satellite_trail_detector.py:convert_raw_folder_to_video()` (line ~10095) |
+| RAW 16-bit enhancement | `satellite_trail_detector.py:_enhance_raw_frame_16bit()` (line ~10060) |
+| NN backend abstraction | `satellite_trail_detector.py:_NNBackend` (line ~350) |
 | NN backend lazy import | `satellite_trail_detector.py:_check_nn_backend()` / `_ensure_nn_backend()` (line ~66) |
 | Preprocessing preview | `satellite_trail_detector.py:show_preprocessing_preview()` (line ~475) |
 | Radon debug preview | `satellite_trail_detector.py:show_radon_preview()` (line ~1517) |
