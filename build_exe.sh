@@ -145,6 +145,17 @@ CMD=(
     --enable-plugin=multiprocessing
 )
 
+# cv2's bootstrap reads config.py / config-3.py from disk via
+# exec_file_wrapper.  Nuitka compiles them into the binary by default,
+# so force them onto disk as data files or the built exe fails at
+# import with "DLL load failed while importing cv2".
+CV2_DIR=$(python -c "import cv2, os, sys; sys.stdout.write(os.path.dirname(cv2.__file__))")
+for name in config.py config-3.py load_config_py3.py load_config_py2.py; do
+    if [[ -f "${CV2_DIR}/${name}" ]]; then
+        CMD+=("--include-data-files=${CV2_DIR}/${name}=cv2/${name}")
+    fi
+done
+
 # ── Optional dependencies ──────────────────────────────────────────────
 if [[ $FULL -eq 1 && ${OPT_AVAILABLE[scipy]} -eq 1 ]]; then
     CMD+=(--include-package=scipy)

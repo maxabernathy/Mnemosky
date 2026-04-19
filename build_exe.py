@@ -182,6 +182,24 @@ def main():
         "--enable-plugin=multiprocessing",
     ]
 
+    # ── OpenCV bootstrap files (must be on disk, not compiled in) ───────
+    # cv2.__init__.bootstrap() uses exec_file_wrapper to read config.py
+    # and config-3.py directly from the filesystem.  Nuitka would compile
+    # them into the binary by default, so we force them back onto disk
+    # as data files.  Without this the built exe dies at import with
+    # "ImportError: DLL load failed while importing cv2".
+    try:
+        import cv2
+        cv2_dir = Path(cv2.__file__).parent
+        for name in ("config.py", "config-3.py",
+                     "load_config_py3.py", "load_config_py2.py"):
+            src = cv2_dir / name
+            if src.exists():
+                cmd.append(f"--include-data-files={src}=cv2/{name}")
+    except ImportError:
+        pass  # preflight already bailed
+
+
     # ── Optional dependencies ───────────────────────────────────────
     # Only include what's actually installed AND requested
 
