@@ -34,9 +34,23 @@ Notes:
 
 import argparse
 import importlib
+import re
 import shutil
 import subprocess
 import sys
+from pathlib import Path
+
+SOURCE = Path(__file__).parent / "satellite_trail_detector.py"
+
+
+def read_source_version():
+    """Pull __version__ from satellite_trail_detector.py."""
+    try:
+        text = SOURCE.read_text(encoding="utf-8")
+    except OSError:
+        return "0.0.0"
+    match = re.search(r"^__version__\s*=\s*['\"]([^'\"]+)['\"]", text, re.MULTILINE)
+    return match.group(1) if match else "0.0.0"
 
 
 def check_dependency(name, package=None):
@@ -55,8 +69,8 @@ def main():
     parser.add_argument(
         "--full",
         action="store_true",
-        help="Include optional deps (scipy, onnxruntime). Without this flag, "
-             "only classical detection (OpenCV + NumPy) is bundled.",
+        help="Include optional deps (scipy, onnxruntime, rawpy, exifread). "
+             "Without this flag, only classical detection (OpenCV + NumPy) is bundled.",
     )
     parser.add_argument(
         "--include-torch",
@@ -65,10 +79,24 @@ def main():
     )
     parser.add_argument(
         "--output-name",
-        default="mnemosky",
-        help="Base name for the output executable (default: mnemosky)",
+        default=None,
+        help="Override the output executable name. Defaults to "
+             "'mnemosky-<tag>' when --tag is set, else 'mnemosky'.",
+    )
+    parser.add_argument(
+        "--tag",
+        default=None,
+        help="Release tag to embed in the exe filename and product version "
+             "metadata (e.g. 'alpha-april'). Also accepted as part of the "
+             "exe filename if --output-name is not explicitly provided.",
     )
     args = parser.parse_args()
+
+    source_version = read_source_version()
+    # Resolve the actual output name: explicit --output-name wins, else
+    # mnemosky-<tag> if --tag given, else just mnemosky.
+    if args.output_name is None:
+        args.output_name = f"mnemosky-{args.tag}" if args.tag else "mnemosky"
 
     if args.include_torch:
         args.full = True
@@ -96,14 +124,30 @@ def main():
     # Check optional deps
     optional_available = {}
     for name, pkg in [("scipy", "scipy"), ("onnxruntime", "onnxruntime"),
-                      ("ultralytics", "ultralytics")]:
+                      ("ultralytics", "ultralytics"), ("rawpy", "rawpy"),
+                      ("exifread", "exifread")]:
         optional_available[name] = check_dependency(name, pkg)
         status = "OK" if optional_available[name] else "not installed (skipped)"
         print(f"[{'OK' if optional_available[name] else '--'}] {name}: {status}")
 
     print()
+    print(f"Source version: {source_version}")
+    if args.tag:
+        print(f"Build tag:      {args.tag}")
+    print(f"Output name:    {args.output_name}.exe")
+    print()
 
     # ── Build Nuitka command ────────────────────────────────────────────
+    # Nuitka --product-version must be digits-and-dots only.  Strip any
+    # non-numeric characters from the source version and append .0 to pad
+    # to four fields.  Keep the full human-readable string in
+    # --file-version / file-description instead.
+    numeric_version = re.sub(r"[^0-9.]", "", source_version) or "0.0.0"
+    while numeric_version.count(".") < 3:
+        numeric_version += ".0"
+    descriptor = f"Satellite and Airplane Trail Detector (v{source_version}"
+    descriptor += f", {args.tag})" if args.tag else ")"
+
     cmd = [
         sys.executable, "-m", "nuitka",
         "--onefile",
@@ -116,8 +160,8 @@ def main():
 
         # Product metadata (embedded in exe properties)
         "--product-name=Mnemosky",
-        "--product-version=1.0.0",
-        "--file-description=Satellite and Airplane Trail Detector",
+        f"--product-version={numeric_version}",
+        f"--file-description={descriptor}",
 
         # ── Core dependencies ───────────────────────────────────────
         # OpenCV: include the full package (ships ffmpeg DLLs, data files)
@@ -166,6 +210,19 @@ def main():
             "--nofollow-import-to=torchvision",
             "--nofollow-import-to=torchaudio",
         ]
+
+    # rawpy — RAW image decoding (ARW, CR2, NEF, DNG)
+    if args.full and optional_available["rawpy"]:
+        cmd += [
+            "--include-package=rawpy",
+            "--include-package-data=rawpy",
+        ]
+        print("Including: rawpy")
+
+    # exifread — EXIF metadata for RAW files
+    if args.full and optional_available["exifread"]:
+        cmd += ["--include-package=exifread"]
+        print("Including: exifread")
 
     # Always exclude test/debug bloat
     cmd += [

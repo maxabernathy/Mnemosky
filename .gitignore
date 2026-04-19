@@ -211,3 +211,13 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Nuitka build artifacts
+*.exe
+*.bin
+mnemosky-*.dist/
+mnemosky-*.build/
+
+# Processed / large media
+odysseyoutput.mp4
+*.pseudo.json

@@ -17,7 +17,8 @@ set -euo pipefail
 # ── Defaults ────────────────────────────────────────────────────────────
 FULL=0
 INCLUDE_TORCH=0
-OUTPUT_NAME="mnemosky"
+OUTPUT_NAME=""
+TAG=""
 
 # ── Parse arguments ─────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -26,17 +27,42 @@ while [[ $# -gt 0 ]]; do
         --include-torch) INCLUDE_TORCH=1; FULL=1; shift ;;
         --output-name)   OUTPUT_NAME="$2"; shift 2 ;;
         --output-name=*) OUTPUT_NAME="${1#*=}"; shift ;;
+        --tag)           TAG="$2"; shift 2 ;;
+        --tag=*)         TAG="${1#*=}"; shift ;;
         -h|--help)
-            echo "Usage: $0 [--full] [--include-torch] [--output-name NAME]"
+            echo "Usage: $0 [--full] [--include-torch] [--tag NAME] [--output-name NAME]"
             echo ""
-            echo "  --full            Include optional deps (scipy, onnxruntime)"
+            echo "  --full            Include optional deps (scipy, onnxruntime, rawpy, exifread)"
             echo "  --include-torch   Include ultralytics + PyTorch (implies --full, very large)"
-            echo "  --output-name     Base name for the exe (default: mnemosky)"
+            echo "  --tag NAME        Release tag, embedded in exe filename and metadata"
+            echo "  --output-name     Explicit exe base name (overrides --tag-derived name)"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+# Resolve output name: explicit --output-name wins, else mnemosky-<tag>, else mnemosky.
+if [[ -z "$OUTPUT_NAME" ]]; then
+    if [[ -n "$TAG" ]]; then
+        OUTPUT_NAME="mnemosky-${TAG}"
+    else
+        OUTPUT_NAME="mnemosky"
+    fi
+fi
+
+# Extract __version__ from the source file.
+SOURCE_VERSION=$(python -c "import re, pathlib; t = pathlib.Path('satellite_trail_detector.py').read_text(encoding='utf-8'); m = re.search(r'^__version__\s*=\s*[\x27\x22]([^\x27\x22]+)[\x27\x22]', t, re.MULTILINE); print(m.group(1) if m else '0.0.0')")
+NUMERIC_VERSION=$(echo "$SOURCE_VERSION" | tr -cd '0-9.')
+# Pad to four numeric fields for Nuitka --product-version.
+while [[ $(echo "$NUMERIC_VERSION" | tr -cd '.' | wc -c) -lt 3 ]]; do
+    NUMERIC_VERSION="${NUMERIC_VERSION}.0"
+done
+if [[ -n "$TAG" ]]; then
+    DESCRIPTOR="Satellite and Airplane Trail Detector (v${SOURCE_VERSION}, ${TAG})"
+else
+    DESCRIPTOR="Satellite and Airplane Trail Detector (v${SOURCE_VERSION})"
+fi
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 check_python_pkg() {
@@ -73,7 +99,7 @@ ok "opencv-python, numpy"
 
 # Check optional deps
 declare -A OPT_AVAILABLE
-for dep in scipy onnxruntime ultralytics; do
+for dep in scipy onnxruntime ultralytics rawpy exifread; do
     if check_python_pkg "$dep"; then
         OPT_AVAILABLE[$dep]=1
         ok "$dep"
@@ -83,6 +109,12 @@ for dep in scipy onnxruntime ultralytics; do
     fi
 done
 
+echo ""
+echo "Source version: ${SOURCE_VERSION}"
+if [[ -n "$TAG" ]]; then
+    echo "Build tag:      ${TAG}"
+fi
+echo "Output name:    ${OUTPUT_NAME}.exe"
 echo ""
 
 # ── Build Nuitka command ────────────────────────────────────────────────
@@ -98,8 +130,8 @@ CMD=(
 
     # Exe metadata
     --product-name=Mnemosky
-    --product-version=1.0.0
-    "--file-description=Satellite and Airplane Trail Detector"
+    "--product-version=${NUMERIC_VERSION}"
+    "--file-description=${DESCRIPTOR}"
 
     # Core dependencies
     --include-package=cv2
@@ -134,6 +166,16 @@ else
         --nofollow-import-to=torchvision
         --nofollow-import-to=torchaudio
     )
+fi
+
+if [[ $FULL -eq 1 && ${OPT_AVAILABLE[rawpy]} -eq 1 ]]; then
+    CMD+=(--include-package=rawpy --include-package-data=rawpy)
+    echo "Including: rawpy"
+fi
+
+if [[ $FULL -eq 1 && ${OPT_AVAILABLE[exifread]} -eq 1 ]]; then
+    CMD+=(--include-package=exifread)
+    echo "Including: exifread"
 fi
 
 # Exclude unnecessary bloat
