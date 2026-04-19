@@ -3686,13 +3686,22 @@ class TemporalFrameBuffer:
                 # ctx['diff_image'], ctx['noise_map'], ctx['reference']
     """
 
-    def __init__(self, capacity=7):
+    def __init__(self, capacity=7, residual_ring_depth=4, enable_long_bg=False,
+                 long_bg_warmup=30):
         """
         Args:
             capacity: Number of frames to keep in the buffer.  Should be odd
                 so the current frame sits at the centre.  Larger values give
                 cleaner backgrounds but use more RAM (~4 MB per 1080p frame).
                 7 frames ≈ 28 MB for 1080p — a reasonable default.
+            residual_ring_depth: Number of past diff-images to stack for the
+                Radon √N SNR boost (I2).  Set to 0 to disable.
+            enable_long_bg: If True, also maintain a long-horizon per-pixel
+                median via the P² algorithm (I5).  Recovers GEO/high-altitude
+                satellites that the 7-frame short median would subtract from
+                themselves.
+            long_bg_warmup: Frames before the long-BG residual is considered
+                reliable.
         """
         self.capacity = capacity
         self._frames = []           # List of uint8 grayscale arrays
@@ -3702,6 +3711,15 @@ class TemporalFrameBuffer:
         # Pre-allocated arrays to avoid repeated ~58MB allocations per frame
         self._stack = None          # float32 (capacity, H, W) — reused
         self._abs_dev = None        # float32 (capacity, H, W) — reused
+        # I2: ring of recent diff-images for √N multi-frame SNR boost.
+        # Stored in the main process so the Radon detector benefits even in
+        # parallel mode (workers were computing empty local buffers).
+        self._residual_ring_depth = int(max(0, residual_ring_depth))
+        self._diff_ring = []        # list of float32 (H, W) diff-images
+        self._last_noise_sigma = None
+        # I5: long-horizon per-pixel median for GEO / slow-object rescue.
+        self._long_bg = (LongBackgroundModel(warmup_frames=long_bg_warmup)
+                         if enable_long_bg else None)
 
     def add(self, gray_frame):
         """Add a grayscale frame to the buffer, evicting the oldest if full."""
@@ -3709,6 +3727,13 @@ class TemporalFrameBuffer:
         if len(self._frames) > self.capacity:
             self._frames.pop(0)
         self._dirty = True
+        if self._long_bg is not None:
+            try:
+                self._long_bg.add(gray_frame)
+            except Exception:
+                # Long-BG is best-effort: one bad frame should not break
+                # the primary short-horizon buffer.
+                pass
 
     def is_ready(self):
         """True once the buffer has at least 5 frames for a meaningful median."""
@@ -3776,11 +3801,40 @@ class TemporalFrameBuffer:
         diff = current_gray.astype(np.float32) - self._reference
         diff = np.clip(diff, 0, None)
 
+        # I2: maintain a rolling ring of recent diff-images.  Radon stacks
+        # these (mean + star-mask) to recover the √N SNR boost that the
+        # worker-local buffer had in sequential mode but lost in parallel.
+        diff_stack = None
+        stack_noise = None
+        base_noise = float(np.median(self._noise_map))
+        self._last_noise_sigma = base_noise
+        if self._residual_ring_depth > 0:
+            self._diff_ring.append(diff.copy())
+            if len(self._diff_ring) > self._residual_ring_depth:
+                self._diff_ring.pop(0)
+            if len(self._diff_ring) >= 2:
+                # Stacked into an (N, H, W) array lazily for the consumer
+                diff_stack = np.stack(self._diff_ring, axis=0)
+                stack_noise = base_noise / float(np.sqrt(len(self._diff_ring)))
+
+        # I5: long-horizon residual — only emitted when the estimator is
+        # warmed up and has enough samples for its quantile to stabilise.
+        long_residual = None
+        if self._long_bg is not None and self._long_bg.ready:
+            try:
+                long_residual = self._long_bg.residual(current_gray)
+            except Exception:
+                long_residual = None
+
         return {
             'diff_image': diff,
             'noise_map': self._noise_map,
             'reference': self._reference,
             'buffer_depth': len(self._frames),
+            'diff_stack': diff_stack,
+            'stack_noise': stack_noise,
+            'long_residual': long_residual,
+            'base_noise_sigma': base_noise,
         }
 
 
@@ -3989,6 +4043,14 @@ class DetectionTracker:
                 confirmed.append((trail_type, info))
 
         return confirmed
+
+    def finalized_tracklets(self, min_length=3):
+        """Emit tracklets with length >= min_length (parity with IMMKalmanTracker).
+
+        Used by TrackletPseudoLabeler (I7a) and TrackletSequenceHead (I7b)
+        so both tracker implementations expose the same API.
+        """
+        return [t for t in self._tracklets if len(t['detections']) >= int(min_length)]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -4682,7 +4744,8 @@ class ParameterAdapter:
     Tier 2: Batch coordinate-wise golden section search over calibration set.
     """
 
-    def __init__(self, initial_params, safety_bounds=None, loss_profile='balanced'):
+    def __init__(self, initial_params, safety_bounds=None, loss_profile='balanced',
+                 use_trust_region=False, tier2_optimizer='golden'):
         """Initialize with starting parameters and safety bounds.
 
         Args:
@@ -4690,6 +4753,10 @@ class ParameterAdapter:
             safety_bounds: Hard min/max per parameter (prevents drift).
             loss_profile: Named loss profile from LOSS_PROFILES (Winner).
                 Controls the FP/FN/misclassification tradeoff during Tier 2 learning.
+            use_trust_region: If True, Tier-1 corrections are batched and
+                applied via TrustRegionAdapter (I6b) — robust to mis-clicks.
+            tier2_optimizer: 'golden' (coordinate-wise golden-section) or 'tpe'
+                (Tree-structured Parzen Estimator, I6a) — joint-space BayesOpt.
         """
         self.params = dict(initial_params)
         self.safety_bounds = safety_bounds or PARAMETER_SAFETY_BOUNDS
@@ -4700,9 +4767,27 @@ class ParameterAdapter:
         profile = LOSS_PROFILES.get(loss_profile, LOSS_PROFILES['balanced'])
         self.loss_weights = profile['weights']
         self.loss_profile_name = loss_profile
+        # I6b: trust-region Tier 1 wrapper
+        self.use_trust_region = bool(use_trust_region)
+        self._trust_region = None  # lazy — needs self
+        # I6a: Tier 2 optimizer choice
+        self.tier2_optimizer = str(tier2_optimizer).lower()
 
     def apply_correction(self, correction_action, trail_type, detection_meta):
-        """Tier 1: Apply single correction via EMA. Returns {param: new_value} updates."""
+        """Tier 1: Apply single correction via EMA. Returns {param: new_value} updates.
+
+        I6b: when ``use_trust_region`` is enabled, corrections are batched
+        and applied via ``TrustRegionAdapter.record`` — which flushes and
+        returns the aggregated update once the batch fills, else {}.
+        """
+        if self.use_trust_region:
+            if self._trust_region is None:
+                self._trust_region = TrustRegionAdapter(self)
+            return self._trust_region.record(correction_action, trail_type, detection_meta)
+        return self._apply_correction_ema(correction_action, trail_type, detection_meta)
+
+    def _apply_correction_ema(self, correction_action, trail_type, detection_meta):
+        """Underlying EMA update — shared by direct path and TrustRegionAdapter."""
         key = (correction_action, trail_type)
         rules = CORRECTION_RULES.get(key, [])
 
@@ -4732,11 +4817,16 @@ class ParameterAdapter:
         return updates
 
     def optimize_batch(self, calibration_set):
-        """Tier 2: Run coordinate-wise golden section search.
+        """Tier 2: Run coordinate-wise golden section search (or TPE if
+        ``tier2_optimizer='tpe'``).
         Uses the situated loss weights from the active loss profile (Winner).
         Returns optimized parameters dict."""
         if len(calibration_set) < 10:
             return dict(self.params)
+
+        # I6a: TPE joint-space BayesOpt path
+        if self.tier2_optimizer == 'tpe':
+            return self._optimize_batch_tpe(calibration_set, n_trials=40)
 
         params = dict(self.params)
         best_loss = self._compute_loss(params, calibration_set, weights=self.loss_weights)
@@ -4799,6 +4889,60 @@ class ParameterAdapter:
 
         self.params = params
         return dict(params)
+
+    def _optimize_batch_tpe(self, calibration_set, n_trials=40):
+        """Tier 2 via TPE (I6a): joint-space BayesOpt over the optimizable
+        parameter subset.  Falls back to current params if improvement is
+        not statistically meaningful (>5% better than current loss)."""
+        optimizable = [p for p in [
+            'satellite_contrast_min', 'satellite_min_length', 'satellite_max_length',
+            'canny_low', 'canny_high', 'hough_threshold', 'min_line_length',
+            'max_line_gap', 'brightness_threshold', 'airplane_brightness_min',
+            'airplane_saturation_min', 'min_aspect_ratio', 'mf_snr_threshold',
+        ] if p in self.params and p in self.safety_bounds]
+        if not optimizable:
+            return dict(self.params)
+
+        int_params = {'satellite_min_length', 'satellite_max_length',
+                      'canny_low', 'canny_high', 'hough_threshold',
+                      'min_line_length', 'max_line_gap',
+                      'brightness_threshold', 'airplane_brightness_min',
+                      'airplane_saturation_min'}
+        space = {}
+        for p in optimizable:
+            lo, hi = self.safety_bounds[p]
+            kind = 'int' if p in int_params else 'float'
+            space[p] = (kind, float(lo), float(hi))
+
+        tpe = TPEOptimizer(space, gamma=0.25, n_candidates=48, seed=0)
+        # Seed with current params — guarantees the optimizer knows the incumbent
+        baseline_loss = self._compute_loss(self.params, calibration_set, weights=self.loss_weights)
+        seed_cfg = {p: (int(self.params[p]) if p in int_params else float(self.params[p]))
+                    for p in optimizable}
+        tpe.tell(seed_cfg, baseline_loss)
+
+        for _ in range(n_trials):
+            cfg = tpe.ask()
+            trial = dict(self.params)
+            trial.update(cfg)
+            # Hard clamp into safety bounds (TPE can propose at-or-near bounds)
+            for p in optimizable:
+                lo, hi = self.safety_bounds[p]
+                trial[p] = max(lo, min(hi, trial[p]))
+            loss = self._compute_loss(trial, calibration_set, weights=self.loss_weights)
+            tpe.tell(cfg, loss)
+
+        best_cfg, best_loss = tpe.best()
+        # Reversion safety — same spirit as the golden-section path
+        if best_loss >= baseline_loss * 0.95:
+            return dict(self.params)
+
+        new_params = dict(self.params)
+        for p, v in best_cfg.items():
+            lo, hi = self.safety_bounds[p]
+            new_params[p] = max(lo, min(hi, v))
+        self.params = new_params
+        return dict(new_params)
 
     @staticmethod
     def _simulate_classify(meta, params):
@@ -4918,39 +5062,1511 @@ class ParameterAdapter:
             pass
         return False
 
-    @staticmethod
-    def compute_confidence(detection_info, params):
-        """Compute pseudo-confidence score for a detection."""
+    _platt_calibrator = None        # lazy-loaded I6c PlattCalibrator
+
+    @classmethod
+    def _get_platt(cls):
+        """Lazy-load ~/.mnemosky/platt.json for confidence calibration."""
+        if cls._platt_calibrator is not None:
+            return cls._platt_calibrator
+        try:
+            p = Path.home() / '.mnemosky' / 'platt.json'
+            if p.exists():
+                with open(p, 'r') as f:
+                    cls._platt_calibrator = PlattCalibrator.from_dict(json.load(f))
+            else:
+                cls._platt_calibrator = PlattCalibrator()
+        except (OSError, json.JSONDecodeError, KeyError, ValueError):
+            cls._platt_calibrator = PlattCalibrator()
+        return cls._platt_calibrator
+
+    @classmethod
+    def compute_confidence(cls, detection_info, params):
+        """Compute pseudo-confidence score for a detection.
+
+        I6c: if a Platt calibration has been fitted from past HITL
+        corrections, post-process the raw sigmoid through it so the
+        returned value is interpretable as P(confirmed | score).
+        """
         # If the detection came from a neural network, use its native
         # confidence directly — the classical metrics are synthesized
         # from the bbox and would produce misleading scores.
         nn_conf = detection_info.get('nn_confidence')
         if nn_conf is not None:
-            return float(nn_conf)
-        contrast = detection_info.get('contrast_ratio', 1.0)
-        snr = detection_info.get('trail_snr', 0.0) or 0.0
-        length = detection_info.get('length', 0.0)
-        brightness = detection_info.get('avg_brightness', 0.0)
-        brightness_std = detection_info.get('brightness_std', 0.0)
+            base = float(nn_conf)
+        else:
+            contrast = detection_info.get('contrast_ratio', 1.0)
+            snr = detection_info.get('trail_snr', 0.0) or 0.0
+            length = detection_info.get('length', 0.0)
+            brightness = detection_info.get('avg_brightness', 0.0)
+            brightness_std = detection_info.get('brightness_std', 0.0)
 
-        contrast_min = params.get('satellite_contrast_min', 1.08)
-        contrast_margin = (contrast - contrast_min) / max(contrast_min, 0.01)
-        snr_margin = (snr - 2.5) / 2.5 if snr > 0 else 0
+            contrast_min = params.get('satellite_contrast_min', 1.08)
+            contrast_margin = (contrast - contrast_min) / max(contrast_min, 0.01)
+            snr_margin = (snr - 2.5) / 2.5 if snr > 0 else 0
 
-        min_len = params.get('satellite_min_length', 60)
-        max_len = params.get('satellite_max_length', 1400)
-        len_mid = (min_len + max_len) / 2
-        len_range = max_len - min_len
-        length_score = 1.0 - min(1.0, 2 * abs(length - len_mid) / max(len_range, 1)) if len_range > 0 else 0.5
+            min_len = params.get('satellite_min_length', 60)
+            max_len = params.get('satellite_max_length', 1400)
+            len_mid = (min_len + max_len) / 2
+            len_range = max_len - min_len
+            length_score = 1.0 - min(1.0, 2 * abs(length - len_mid) / max(len_range, 1)) if len_range > 0 else 0.5
 
-        smoothness = 1.0 - min(1.0, brightness_std / (brightness + 1e-5) / 0.4)
+            smoothness = 1.0 - min(1.0, brightness_std / (brightness + 1e-5) / 0.4)
 
-        raw = (0.30 * max(0, min(1, contrast_margin * 5))
-             + 0.25 * max(0, min(1, snr_margin * 2))
-             + 0.20 * max(0, length_score)
-             + 0.25 * max(0, smoothness))
+            raw = (0.30 * max(0, min(1, contrast_margin * 5))
+                 + 0.25 * max(0, min(1, snr_margin * 2))
+                 + 0.20 * max(0, length_score)
+                 + 0.25 * max(0, smoothness))
 
-        return 1.0 / (1.0 + np.exp(-6 * (raw - 0.5)))
+            base = 1.0 / (1.0 + np.exp(-6 * (raw - 0.5)))
+
+        # I6c: calibrate if Platt is fitted
+        platt = cls._get_platt()
+        if platt.fitted:
+            return platt.calibrate(base)
+        return float(base)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Next-Level Learning Infrastructure (v0.3.0-learn)
+#
+#  Seven initiatives from the 2026-04 audit turning Mnemosky from a
+#  rule-based detector with a rule-based learning loop into a detector
+#  whose thresholds, rejections, tracker, confidence scores, and
+#  architecture-level fusion are all learnable from existing signals
+#  (TranslationLedger, DetectionTracker, AnnotationDatabase).
+#
+#    I1  RescueClassifier           — MLP over per-rejection feature log
+#    I2  residual-stack passthrough — see TemporalFrameBuffer below
+#    I3  ThresholdHyperNet          — per-frame adaptive thresholds
+#    I4  IMMKalmanTracker           — motion tracker + orbital-class prior
+#    I5  LongBackgroundModel        — two-background temporal (GEO rescue)
+#    I6  PlattCalibrator / TPE      — calibrated confidence + BayesOpt
+#        TrustRegionAdapter         — robust batched Tier 1
+#        BALDQueue                  — uncertainty-ranked review order
+#    I7  TrackletPseudoLabeler      — auto-labels from 3+ frame tracklets
+#        TrackletSequenceHead       — temporal classifier over tracklets
+#        AlgorithmFusionHead        — logistic fusion across detectors
+#
+#  All components are pure-numpy. scipy is used only if available; a
+#  correct-but-slower fallback exists for every scipy call.
+# ═══════════════════════════════════════════════════════════════════════
+
+
+# ── I5: Long-horizon background model (two-background temporal) ─────────
+
+class P2QuantileEstimator:
+    """P² algorithm (Jain & Chlamtac 1985) — online median/quantile estimation.
+
+    Updates a running estimate of a fixed quantile using O(1) memory
+    per series, regardless of stream length.  We run one estimator per
+    pixel to build a long-horizon (hundreds-of-frames) per-pixel median
+    that captures truly-static scene content — including geosynchronous
+    satellites that the 7-frame median eats itself against.
+
+    For the pixel-wise case we vectorise the entire update across an
+    (H, W) array so a 1080p frame updates in ~15 ms on CPU.
+    """
+
+    def __init__(self, shape, quantile=0.5):
+        self.q = float(quantile)
+        self._n = 0
+        # Five marker positions per pixel (q_n in the P² paper).
+        # Heights (marker values) are initialised lazily once we have 5 samples.
+        self._heights = None         # (5, H, W) float32
+        self._init_buf = []          # first 5 frames, collected then sorted
+        self._shape = tuple(shape)
+        # Desired marker positions (fixed) for q = quantile.
+        # Standard P² markers: [0, q/2, q, (1+q)/2, 1]
+        self._desired = np.array([0.0, self.q * 0.5, self.q,
+                                  (1.0 + self.q) * 0.5, 1.0], dtype=np.float64)
+        # Marker indices (n_i in the paper) start at [1,2,3,4,5]
+        self._npos = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float64)
+        # Increment for desired positions per new observation
+        self._dn = np.array([0.0, self.q * 0.5, self.q,
+                             (1.0 + self.q) * 0.5, 1.0], dtype=np.float64)
+
+    @property
+    def ready(self):
+        return self._heights is not None
+
+    def update(self, frame_f32):
+        """Ingest one frame (H, W) float32 and update the running quantile."""
+        if self._heights is None:
+            self._init_buf.append(frame_f32.astype(np.float32, copy=True))
+            if len(self._init_buf) >= 5:
+                stack = np.stack(self._init_buf, axis=0)
+                stack.sort(axis=0)
+                self._heights = stack.astype(np.float32)
+                self._init_buf = []
+                self._n = 5
+            else:
+                self._n += 1
+            return
+
+        self._n += 1
+        h = self._heights
+        x = frame_f32
+
+        # Find cell k where x falls (vectorised per pixel).
+        #   k=0 if x < h[0];  k=4 if x >= h[4]; otherwise k where h[k-1] <= x < h[k]
+        # We encode this as an int index per pixel.
+        k = np.full(self._shape, 2, dtype=np.int8)
+        k = np.where(x < h[0], 0, k)
+        k = np.where((x >= h[0]) & (x < h[1]), 1, k)
+        k = np.where((x >= h[1]) & (x < h[2]), 2, k)
+        k = np.where((x >= h[2]) & (x < h[3]), 3, k)
+        k = np.where(x >= h[3], 4, k)
+
+        # Clamp extremes into the outer markers (standard P² boundary handling)
+        h[0] = np.where(x < h[0], x, h[0])
+        h[4] = np.where(x >= h[4], x, h[4])
+
+        # Increment marker positions: markers after k advance by 1
+        # self._npos is shape (5,); broadcast against k per pixel
+        # For scalar npos this is easier — we keep npos scalar and track
+        # per-pixel "count above" via k in a vectorised way below.
+        # In the scalar-npos formulation the marker position increments
+        # are deterministic as long as the desired-position adjustment is
+        # per-pixel.  We treat the 5 npos values as shared (a reasonable
+        # approximation since the stream length is identical per pixel).
+        self._npos[1] += (k <= 0).mean()  # fraction in k=0 region
+        self._npos[2] += (k <= 1).mean()
+        self._npos[3] += (k <= 2).mean()
+        self._npos[4] += 1.0
+
+        # Update desired positions (shared)
+        self._desired += self._dn / float(self._n)
+
+        # Adjust interior markers (i = 1, 2, 3)
+        for i in (1, 2, 3):
+            d = self._desired[i] - self._npos[i]
+            # Trigger when |d| >= 1 and we still have room to move
+            move_up = (d >= 1.0) and (self._npos[i + 1] - self._npos[i] > 1)
+            move_dn = (d <= -1.0) and (self._npos[i - 1] - self._npos[i] < -1)
+            if not (move_up or move_dn):
+                continue
+            sign = 1.0 if move_up else -1.0
+            # Parabolic prediction
+            np_m1 = self._npos[i - 1]
+            np_p1 = self._npos[i + 1]
+            np_i = self._npos[i]
+            h_m1 = h[i - 1]
+            h_p1 = h[i + 1]
+            h_i = h[i]
+            num = ((np_i - np_m1 + sign) * (h_p1 - h_i) / (np_p1 - np_i) +
+                   (np_p1 - np_i - sign) * (h_i - h_m1) / (np_i - np_m1))
+            parabolic = h_i + (sign / (np_p1 - np_m1)) * num
+            # Fall back to linear if parabolic would violate monotonicity
+            linear = np.where(
+                sign > 0,
+                h_i + sign * (h_p1 - h_i) / (np_p1 - np_i),
+                h_i + sign * (h_i - h_m1) / (np_i - np_m1),
+            )
+            ok = (parabolic > h_m1) & (parabolic < h_p1)
+            h[i] = np.where(ok, parabolic, linear).astype(np.float32)
+            self._npos[i] += sign
+
+    def value(self):
+        """Return current quantile estimate (H, W) float32, or None if not ready."""
+        return None if self._heights is None else self._heights[2].copy()
+
+
+class LongBackgroundModel:
+    """Long-horizon per-pixel background via online quantile.
+
+    Complements the 7-frame short median.  The short median removes fast
+    scene motion (stars, jitter) while the long median removes the slow
+    persistent content the short median fails to subtract — notably
+    geostationary and high-altitude-debris trails that sit in the 7-frame
+    buffer long enough to be subtracted from themselves.
+
+    The diff against the long median is emitted on ``temporal_context
+    ['long_residual']`` so downstream stages (Radon, classifier) can
+    combine it with the short-residual via ``max()``.
+    """
+
+    def __init__(self, quantile=0.5, warmup_frames=30):
+        self._est = None
+        self.quantile = quantile
+        self.warmup_frames = int(warmup_frames)
+        self._count = 0
+        self._last_ref = None
+
+    def add(self, gray_u8):
+        self._count += 1
+        if self._est is None:
+            self._est = P2QuantileEstimator(gray_u8.shape, quantile=self.quantile)
+        self._est.update(gray_u8.astype(np.float32))
+        if self._count % 8 == 0:
+            self._last_ref = self._est.value()
+
+    @property
+    def ready(self):
+        return self._count >= self.warmup_frames and self._est is not None and self._est.ready
+
+    def residual(self, gray_u8):
+        """Return current - long_median, clipped at 0."""
+        ref = self._last_ref if self._last_ref is not None else (
+            self._est.value() if self._est is not None else None)
+        if ref is None:
+            return None
+        diff = gray_u8.astype(np.float32) - ref
+        np.clip(diff, 0, None, out=diff)
+        return diff
+
+
+# ── I1: Rescue classifier over the translation ledger ───────────────────
+
+class _TinyMLP:
+    """Pure-numpy 2-layer MLP with ReLU hidden layer and sigmoid output.
+
+    Trained by mini-batch SGD with momentum and L2 regularisation.
+    Deliberately tiny (32–64 hidden units) because the training sets
+    from HITL review tend to be in the low thousands.
+    """
+
+    def __init__(self, n_in, n_hidden=32, l2=1e-4, seed=0xC0FFEE):
+        rng = np.random.default_rng(seed)
+        # He initialisation for ReLU layer
+        self.W1 = rng.standard_normal((n_in, n_hidden)).astype(np.float32) * np.sqrt(2.0 / max(1, n_in))
+        self.b1 = np.zeros((n_hidden,), dtype=np.float32)
+        self.W2 = rng.standard_normal((n_hidden, 1)).astype(np.float32) * np.sqrt(2.0 / n_hidden)
+        self.b2 = np.zeros((1,), dtype=np.float32)
+        self.l2 = float(l2)
+        self._mu = None
+        self._sigma = None
+
+    def _standardise(self, X):
+        if self._mu is None:
+            self._mu = X.mean(axis=0)
+            self._sigma = X.std(axis=0) + 1e-6
+        return (X - self._mu) / self._sigma
+
+    def _forward(self, X):
+        Z1 = X @ self.W1 + self.b1
+        A1 = np.maximum(Z1, 0.0)
+        Z2 = A1 @ self.W2 + self.b2
+        P = 1.0 / (1.0 + np.exp(-np.clip(Z2, -30, 30)))
+        return Z1, A1, P
+
+    def fit(self, X, y, *, epochs=60, batch=64, lr=0.02, momentum=0.9,
+            class_balance=True, verbose=False):
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y, dtype=np.float32).reshape(-1, 1)
+        if X.shape[0] < 4:
+            return False
+        X = self._standardise(X)
+
+        # Class-balancing weights — essential: rejected >> confirmed
+        if class_balance:
+            n_pos = float(y.sum()) + 1e-6
+            n_neg = float(len(y) - n_pos) + 1e-6
+            w_pos = 0.5 / n_pos * (n_pos + n_neg)
+            w_neg = 0.5 / n_neg * (n_pos + n_neg)
+            W = np.where(y > 0.5, w_pos, w_neg)
+        else:
+            W = np.ones_like(y)
+
+        vW1 = np.zeros_like(self.W1); vb1 = np.zeros_like(self.b1)
+        vW2 = np.zeros_like(self.W2); vb2 = np.zeros_like(self.b2)
+        rng = np.random.default_rng(0)
+        n = X.shape[0]
+        for ep in range(epochs):
+            idx = rng.permutation(n)
+            for s in range(0, n, batch):
+                i = idx[s:s + batch]
+                Xi = X[i]; yi = y[i]; Wi = W[i]
+                Z1, A1, P = self._forward(Xi)
+                # dL/dZ2 = (P - y) * W
+                dZ2 = (P - yi) * Wi
+                dW2 = A1.T @ dZ2 / len(i) + self.l2 * self.W2
+                db2 = dZ2.mean(axis=0)
+                dA1 = dZ2 @ self.W2.T
+                dZ1 = dA1 * (Z1 > 0)
+                dW1 = Xi.T @ dZ1 / len(i) + self.l2 * self.W1
+                db1 = dZ1.mean(axis=0)
+                vW1 = momentum * vW1 + lr * dW1; self.W1 -= vW1
+                vb1 = momentum * vb1 + lr * db1; self.b1 -= vb1
+                vW2 = momentum * vW2 + lr * dW2; self.W2 -= vW2
+                vb2 = momentum * vb2 + lr * db2; self.b2 -= vb2
+            if verbose and ep % 10 == 0:
+                _, _, P_all = self._forward(X)
+                loss = -(y * np.log(P_all + 1e-8) + (1 - y) * np.log(1 - P_all + 1e-8)).mean()
+                print(f"  [mlp] epoch {ep} loss={float(loss):.4f}")
+        return True
+
+    def predict(self, X):
+        if self._mu is None:
+            return np.zeros((len(X),), dtype=np.float32)
+        X = (np.asarray(X, dtype=np.float32) - self._mu) / self._sigma
+        _, _, P = self._forward(X)
+        return P.ravel()
+
+    def to_dict(self):
+        return {
+            'W1': self.W1.tolist(), 'b1': self.b1.tolist(),
+            'W2': self.W2.tolist(), 'b2': self.b2.tolist(),
+            'mu': None if self._mu is None else self._mu.tolist(),
+            'sigma': None if self._sigma is None else self._sigma.tolist(),
+            'l2': self.l2,
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        n_in = len(d['W1']); n_hidden = len(d['W1'][0])
+        m = cls(n_in, n_hidden, l2=d.get('l2', 1e-4))
+        m.W1 = np.array(d['W1'], dtype=np.float32)
+        m.b1 = np.array(d['b1'], dtype=np.float32)
+        m.W2 = np.array(d['W2'], dtype=np.float32)
+        m.b2 = np.array(d['b2'], dtype=np.float32)
+        if d.get('mu') is not None:
+            m._mu = np.array(d['mu'], dtype=np.float32)
+            m._sigma = np.array(d['sigma'], dtype=np.float32)
+        return m
+
+
+# Feature vector schema for the rescue classifier.  Every ledger write
+# logs a dict keyed by these names; missing values default to 0.
+_RESCUE_FEATURES = (
+    'contrast_ratio', 'trail_snr', 'length', 'avg_brightness',
+    'max_brightness', 'brightness_std', 'aspect_ratio', 'angle',
+    'smoothness_score', 'peak_separation', 'star_eccentricity',
+    'surround_std', 'supplementary', 'reason_code',
+)
+
+_REASON_CODES = {
+    'too_short': 1, 'too_long': 2, 'full_frame': 3,
+    'low_contrast': 4, 'too_dark': 5, 'too_few_pixels': 6,
+    'cloud_texture': 7, 'too_bright': 8, 'segment_variation': 9,
+    'aspect_ratio': 10, 'unclassifiable': 11, 'star_like': 12,
+    'accepted_satellite': 100, 'accepted_airplane': 101, 'accepted_anomalous': 102,
+}
+
+
+def _features_to_vec(features):
+    """Convert a feature dict (possibly with missing keys) to a fixed-length vector."""
+    return np.array([float(features.get(k, 0.0) or 0.0) for k in _RESCUE_FEATURES],
+                    dtype=np.float32)
+
+
+class RescueClassifier:
+    """Rescues near-boundary rejections by learning from the ledger.
+
+    Training corpus
+    ---------------
+    * Positives: detections the ledger logged as accepted + detections
+      the AnnotationDatabase confirms + tracklet-pseudo-labelled members.
+    * Negatives: detections the ledger rejected (by reason) + detections
+      the AnnotationDatabase rejects.
+
+    Rescue rule
+    -----------
+    Only fires on candidates within a small boundary band around the
+    rejection threshold for the specific reason (e.g. contrast within
+    10% of threshold, SNR within 20% of threshold).  Promotes to
+    detection only if predicted probability exceeds a per-reason
+    conformal threshold fit on the validation fold.
+    """
+
+    def __init__(self, path=None):
+        self.path = Path(path) if path else (Path.home() / '.mnemosky' / 'rescue.json')
+        self.mlp = None
+        # Per-reason-code confidence threshold for promotion.  Default 0.9
+        # means "only promote if classifier is very sure" — conservative.
+        self.per_reason_threshold = {}
+        self.default_threshold = 0.90
+        self.trained_on = 0
+        if self.path.exists():
+            self.load()
+
+    def fit_from_corpus(self, positives, negatives, verbose=False):
+        """Train from lists of feature dicts.
+
+        positives: list of {feature_name: value} dicts for real trails.
+        negatives: list of {feature_name: value} dicts for rejections.
+        """
+        if len(positives) < 10 or len(negatives) < 10:
+            return False
+        X_pos = np.stack([_features_to_vec(f) for f in positives])
+        X_neg = np.stack([_features_to_vec(f) for f in negatives])
+        X = np.concatenate([X_pos, X_neg], axis=0)
+        y = np.concatenate([np.ones(len(X_pos)), np.zeros(len(X_neg))], axis=0)
+
+        # Split for per-reason threshold calibration
+        rng = np.random.default_rng(0)
+        idx = rng.permutation(len(X))
+        cut = int(len(X) * 0.8)
+        tr, va = idx[:cut], idx[cut:]
+
+        self.mlp = _TinyMLP(n_in=len(_RESCUE_FEATURES), n_hidden=min(64, max(16, len(X) // 20)))
+        self.mlp.fit(X[tr], y[tr], verbose=verbose)
+        self.trained_on = int(len(tr))
+
+        # Calibrate per-reason thresholds on validation set: choose the
+        # threshold that yields FPR <= 5% for each reason code.
+        preds = self.mlp.predict(X[va])
+        reasons = X[va, _RESCUE_FEATURES.index('reason_code')]
+        labels = y[va]
+        self.per_reason_threshold = {}
+        for code in np.unique(reasons.astype(int)):
+            if code == 0:
+                continue
+            mask = (reasons.astype(int) == code) & (labels < 0.5)  # negatives with this reason
+            if mask.sum() < 5:
+                continue
+            neg_preds = preds[mask]
+            # FPR <= 5% → threshold = 95th percentile of negative scores
+            thr = float(np.percentile(neg_preds, 95))
+            self.per_reason_threshold[int(code)] = min(0.98, max(0.70, thr))
+        return True
+
+    def can_rescue(self, features, reason_code):
+        """True if the classifier would promote this rejection."""
+        if self.mlp is None:
+            return False
+        x = _features_to_vec({**features, 'reason_code': reason_code}).reshape(1, -1)
+        p = float(self.mlp.predict(x)[0])
+        thr = self.per_reason_threshold.get(int(reason_code), self.default_threshold)
+        return p >= thr, p
+
+    def save(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                'version': 1,
+                'mlp': None if self.mlp is None else self.mlp.to_dict(),
+                'per_reason_threshold': self.per_reason_threshold,
+                'default_threshold': self.default_threshold,
+                'trained_on': self.trained_on,
+                'features': list(_RESCUE_FEATURES),
+            }
+            with open(self.path, 'w') as f:
+                json.dump(payload, f, indent=2)
+        except OSError:
+            pass
+
+    def load(self):
+        try:
+            with open(self.path, 'r') as f:
+                p = json.load(f)
+            if p.get('mlp'):
+                self.mlp = _TinyMLP.from_dict(p['mlp'])
+            self.per_reason_threshold = {int(k): float(v) for k, v in
+                                         p.get('per_reason_threshold', {}).items()}
+            self.default_threshold = float(p.get('default_threshold', 0.90))
+            self.trained_on = int(p.get('trained_on', 0))
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
+            pass
+
+
+# ── I6c: Platt / Isotonic calibration for detection confidence ─────────
+
+class PlattCalibrator:
+    """Two-parameter sigmoid calibration ``σ(a·s + b) → P(confirmed|s)``.
+
+    Fit on (score, confirmed?) pairs from the annotation database.
+    Uses Newton-Raphson on the log-likelihood for stability with
+    the moderate sample sizes typical of HITL workflows.
+    """
+
+    def __init__(self):
+        self.a = 1.0
+        self.b = 0.0
+        self.fitted = False
+
+    def fit(self, scores, labels, iters=50, reg=1e-4):
+        s = np.asarray(scores, dtype=np.float64)
+        y = np.asarray(labels, dtype=np.float64)
+        if len(s) < 10 or y.sum() == 0 or y.sum() == len(y):
+            return False
+        a, b = 1.0, -np.log(max(1e-6, y.mean()) / max(1e-6, 1 - y.mean()))
+        for _ in range(iters):
+            z = a * s + b
+            p = 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
+            # Gradient
+            g_a = ((p - y) * s).sum() + reg * a
+            g_b = (p - y).sum() + reg * b
+            # Hessian diagonals (approximation, neglect off-diagonal)
+            w = p * (1 - p)
+            h_a = (w * s * s).sum() + reg
+            h_b = w.sum() + reg
+            da = g_a / max(h_a, 1e-6)
+            db = g_b / max(h_b, 1e-6)
+            a -= da; b -= db
+            if abs(da) < 1e-5 and abs(db) < 1e-5:
+                break
+        self.a = float(a); self.b = float(b)
+        self.fitted = True
+        return True
+
+    def calibrate(self, score):
+        if not self.fitted:
+            return float(score)
+        z = self.a * float(score) + self.b
+        return float(1.0 / (1.0 + np.exp(-max(-30, min(30, z)))))
+
+    def to_dict(self):
+        return {'a': self.a, 'b': self.b, 'fitted': self.fitted}
+
+    @classmethod
+    def from_dict(cls, d):
+        c = cls()
+        c.a = float(d.get('a', 1.0))
+        c.b = float(d.get('b', 0.0))
+        c.fitted = bool(d.get('fitted', False))
+        return c
+
+
+# ── I3: Per-frame feature extraction + HyperNet adaptive thresholds ────
+
+_HYPERNET_FEATURES = (
+    'log_resolution', 'grad_p70', 'grad_p95', 'grad_p99',
+    'brightness_mean', 'brightness_std', 'brightness_p05', 'brightness_p95',
+    'cloud_score', 'star_density_estimate', 'temporal_noise_sigma',
+    'bortle_hint', 'exposure_seconds', 'psf_sigma_estimate',
+    'recent_detection_rate', 'supplementary_mode',
+)
+
+
+class FrameFeatureExtractor:
+    """Computes a 16-dim context vector summarising a frame.
+
+    All features are scale-invariant and robust to typical
+    preprocessing artifacts.  Used by the HyperNet and (optionally)
+    logged to the ledger for offline analysis.
+    """
+
+    @staticmethod
+    def extract(gray, *, temporal_noise=None, bortle=None, exposure=13.0,
+                psf_sigma=None, recent_detection_rate=0.0, supplementary=False):
+        h, w = gray.shape[:2]
+        g = gray.astype(np.float32) if gray.dtype != np.float32 else gray
+
+        # Gradient percentiles (sharpness / edge density)
+        gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+        gmag = np.sqrt(gx * gx + gy * gy, dtype=np.float32)
+        gp = np.percentile(gmag, [70, 95, 99])
+
+        bp = np.percentile(g, [5, 95])
+        b_mean = float(g.mean()); b_std = float(g.std())
+
+        # Cheap cloud score: variance of low-pass residual
+        small = cv2.resize(g, (max(16, w // 16), max(16, h // 16)),
+                           interpolation=cv2.INTER_AREA)
+        lp_var = float(small.var())
+        cloud_score = lp_var / (b_mean + 1e-3)
+
+        # Star density estimate: count of local maxima above 3σ
+        try:
+            kmax = cv2.dilate(g, np.ones((5, 5), np.uint8))
+            peaks = (g == kmax) & (g > b_mean + 3.0 * max(1.0, b_std))
+            star_est = float(peaks.sum()) / max(1.0, h * w / 10000.0)
+        except cv2.error:
+            star_est = 0.0
+
+        return {
+            'log_resolution': float(np.log2(max(1.0, h * w / (1080.0 * 1920.0)))),
+            'grad_p70': float(gp[0]),
+            'grad_p95': float(gp[1]),
+            'grad_p99': float(gp[2]),
+            'brightness_mean': b_mean,
+            'brightness_std': b_std,
+            'brightness_p05': float(bp[0]),
+            'brightness_p95': float(bp[1]),
+            'cloud_score': cloud_score,
+            'star_density_estimate': star_est,
+            'temporal_noise_sigma': float(temporal_noise) if temporal_noise is not None else -1.0,
+            'bortle_hint': float(bortle) if bortle is not None else 5.0,
+            'exposure_seconds': float(exposure),
+            'psf_sigma_estimate': float(psf_sigma) if psf_sigma is not None else 1.0,
+            'recent_detection_rate': float(recent_detection_rate),
+            'supplementary_mode': 1.0 if supplementary else 0.0,
+        }
+
+    @staticmethod
+    def to_vec(features):
+        return np.array([float(features.get(k, 0.0)) for k in _HYPERNET_FEATURES],
+                        dtype=np.float32)
+
+
+# Parameters the HyperNet is allowed to perturb.  Each entry has a
+# delta scale ``s``: the output of the network is tanh-clamped to
+# [-s, +s] so the network never crosses the safety bounds by itself.
+_HYPERNET_DELTAS = (
+    ('satellite_contrast_min',  0.04),
+    ('satellite_min_length',    20.0),
+    ('canny_low',               5.0),
+    ('canny_high',              30.0),
+    ('hough_threshold',         10.0),
+    ('min_line_length',         15.0),
+    ('max_line_gap',            15.0),
+    ('brightness_threshold',    8.0),
+    ('airplane_brightness_min', 15.0),
+    ('airplane_saturation_min', 5.0),
+    ('mf_snr_threshold',        0.6),
+    ('mf_sigma_perp',           0.3),
+)
+
+
+class ThresholdHyperNet:
+    """Outputs per-frame parameter deltas from a frame feature vector.
+
+    Architecture: 16 → 32 → len(deltas).  Output is tanh then scaled by
+    per-parameter delta budget.  Final params = base + delta, clamped
+    to PARAMETER_SAFETY_BOUNDS.
+    """
+
+    def __init__(self, seed=0xABCDEF):
+        n_in = len(_HYPERNET_FEATURES)
+        n_hidden = 32
+        n_out = len(_HYPERNET_DELTAS)
+        rng = np.random.default_rng(seed)
+        self.W1 = rng.standard_normal((n_in, n_hidden)).astype(np.float32) * np.sqrt(2.0 / n_in)
+        self.b1 = np.zeros((n_hidden,), dtype=np.float32)
+        self.W2 = rng.standard_normal((n_hidden, n_out)).astype(np.float32) * np.sqrt(2.0 / n_hidden) * 0.1
+        self.b2 = np.zeros((n_out,), dtype=np.float32)
+        self._mu = None
+        self._sigma = None
+        self.path = Path.home() / '.mnemosky' / 'hypernet.json'
+        self.trained_on = 0
+
+    def _standardise(self, X):
+        if self._mu is None:
+            self._mu = X.mean(axis=0)
+            self._sigma = X.std(axis=0) + 1e-6
+        return (X - self._mu) / self._sigma
+
+    def forward(self, features):
+        x = FrameFeatureExtractor.to_vec(features).reshape(1, -1)
+        if self._mu is not None:
+            x = (x - self._mu) / self._sigma
+        h = np.maximum(x @ self.W1 + self.b1, 0.0)
+        raw = h @ self.W2 + self.b2
+        # tanh then per-parameter scale
+        deltas = np.tanh(raw).ravel()
+        return {name: float(deltas[i] * scale)
+                for i, (name, scale) in enumerate(_HYPERNET_DELTAS)}
+
+    def adapt(self, base_params, features, safety_bounds):
+        """Apply hypernet deltas to base_params, respecting safety bounds."""
+        deltas = self.forward(features)
+        out = dict(base_params)
+        for name, delta in deltas.items():
+            if name not in out:
+                continue
+            lo, hi = safety_bounds.get(name, (float('-inf'), float('inf')))
+            out[name] = float(max(lo, min(hi, out[name] + delta)))
+        return out
+
+    def fit_from_tuples(self, tuples, epochs=40, lr=0.01):
+        """Supervised fit on (features, target_params) tuples.
+
+        ``target_params`` is the delta the user effectively applied by
+        tuning preprocessing preview or correcting detections.
+        Training target: the same delta the user arrived at.  We
+        optimise MSE on the delta vector.
+        """
+        if len(tuples) < 20:
+            return False
+        n_in = len(_HYPERNET_FEATURES)
+        n_out = len(_HYPERNET_DELTAS)
+        X = np.stack([FrameFeatureExtractor.to_vec(f) for f, _ in tuples])
+        Y = np.zeros((len(tuples), n_out), dtype=np.float32)
+        for i, (_, target_params) in enumerate(tuples):
+            for j, (name, scale) in enumerate(_HYPERNET_DELTAS):
+                if name in target_params:
+                    Y[i, j] = float(target_params[name]) / max(scale, 1e-6)
+            # Clamp into valid tanh range with margin
+            Y[i] = np.clip(Y[i], -0.99, 0.99)
+        X = self._standardise(X)
+        # atanh maps targets back to pre-tanh space
+        Z_target = np.arctanh(Y)
+
+        rng = np.random.default_rng(1)
+        vW1 = np.zeros_like(self.W1); vb1 = np.zeros_like(self.b1)
+        vW2 = np.zeros_like(self.W2); vb2 = np.zeros_like(self.b2)
+        mom = 0.9
+        for ep in range(epochs):
+            idx = rng.permutation(len(X))
+            for s in range(0, len(X), 32):
+                i = idx[s:s + 32]
+                Xi = X[i]; Zt = Z_target[i]
+                Z1 = Xi @ self.W1 + self.b1
+                H = np.maximum(Z1, 0)
+                Z2 = H @ self.W2 + self.b2
+                d2 = (Z2 - Zt) / len(i)
+                dW2 = H.T @ d2; db2 = d2.sum(axis=0)
+                dH = d2 @ self.W2.T; dZ1 = dH * (Z1 > 0)
+                dW1 = Xi.T @ dZ1; db1 = dZ1.sum(axis=0)
+                vW1 = mom * vW1 + lr * dW1; self.W1 -= vW1.astype(np.float32)
+                vb1 = mom * vb1 + lr * db1; self.b1 -= vb1.astype(np.float32)
+                vW2 = mom * vW2 + lr * dW2; self.W2 -= vW2.astype(np.float32)
+                vb2 = mom * vb2 + lr * db2; self.b2 -= vb2.astype(np.float32)
+        self.trained_on = len(tuples)
+        return True
+
+    def save(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                'version': 1,
+                'W1': self.W1.tolist(), 'b1': self.b1.tolist(),
+                'W2': self.W2.tolist(), 'b2': self.b2.tolist(),
+                'mu': None if self._mu is None else self._mu.tolist(),
+                'sigma': None if self._sigma is None else self._sigma.tolist(),
+                'trained_on': self.trained_on,
+                'feature_names': list(_HYPERNET_FEATURES),
+                'delta_names': [n for n, _ in _HYPERNET_DELTAS],
+            }
+            with open(self.path, 'w') as f:
+                json.dump(payload, f, indent=2)
+        except OSError:
+            pass
+
+    def load(self):
+        if not self.path.exists():
+            return False
+        try:
+            with open(self.path, 'r') as f:
+                p = json.load(f)
+            self.W1 = np.array(p['W1'], dtype=np.float32)
+            self.b1 = np.array(p['b1'], dtype=np.float32)
+            self.W2 = np.array(p['W2'], dtype=np.float32)
+            self.b2 = np.array(p['b2'], dtype=np.float32)
+            if p.get('mu') is not None:
+                self._mu = np.array(p['mu'], dtype=np.float32)
+                self._sigma = np.array(p['sigma'], dtype=np.float32)
+            self.trained_on = int(p.get('trained_on', 0))
+            return True
+        except (OSError, json.JSONDecodeError, KeyError, ValueError):
+            return False
+
+
+# ── I4: IMM Kalman tracker with orbital-class prior ─────────────────────
+
+class _LinearKalman2D:
+    """Constant-velocity 2D Kalman filter on trail centers.
+
+    State: [x, y, vx, vy] — pixel position and pixel-per-frame velocity.
+    """
+
+    def __init__(self, process_noise, measurement_noise):
+        self.x = None      # (4,) state
+        self.P = np.eye(4, dtype=np.float64) * 100.0
+        self.Q = np.eye(4, dtype=np.float64) * float(process_noise)
+        self.R = np.eye(2, dtype=np.float64) * float(measurement_noise)
+        self.F = np.eye(4, dtype=np.float64)
+        self.F[0, 2] = 1.0  # x += vx
+        self.F[1, 3] = 1.0  # y += vy
+        self.H = np.zeros((2, 4), dtype=np.float64)
+        self.H[0, 0] = 1.0; self.H[1, 1] = 1.0
+
+    def init(self, cx, cy):
+        self.x = np.array([cx, cy, 0.0, 0.0], dtype=np.float64)
+        self.P = np.eye(4, dtype=np.float64) * 100.0
+
+    def predict(self):
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+
+    def update(self, meas):
+        y = np.asarray(meas, dtype=np.float64) - self.H @ self.x
+        S = self.H @ self.P @ self.H.T + self.R
+        # 2x2 inverse by hand for speed
+        d = S[0, 0] * S[1, 1] - S[0, 1] * S[1, 0]
+        if abs(d) < 1e-9:
+            return 0.0
+        S_inv = np.array([[S[1, 1], -S[0, 1]], [-S[1, 0], S[0, 0]]]) / d
+        K = self.P @ self.H.T @ S_inv
+        self.x = self.x + K @ y
+        self.P = (np.eye(4) - K @ self.H) @ self.P
+        # Likelihood of this measurement (used for model weighting)
+        mahal = float(y.T @ S_inv @ y)
+        return float(np.exp(-0.5 * mahal) / max(1e-9, np.sqrt(abs(d))))
+
+    def predicted_position(self):
+        x_pred = self.F @ self.x
+        return float(x_pred[0]), float(x_pred[1])
+
+
+class IMMKalmanTracker:
+    """Interacting Multiple Model tracker with LEO/MEO/GEO priors.
+
+    Three motion hypotheses per track, each a constant-velocity Kalman
+    filter with different process-noise variances:
+      * LEO:  high process noise (~0.05-0.15°/s, ~5-20 px/frame)
+      * MEO:  medium (~0.01°/s, ~1-3 px/frame)
+      * GEO:  near-zero (<0.002°/s, <0.3 px/frame)
+
+    The class posterior ``P(LEO|history)``, ``P(MEO|history)``,
+    ``P(GEO|history)`` is maintained per track and attached to every
+    confirmed detection as ``tracklet_motion_class``.
+
+    Association uses a greedy Mahalanobis-distance minimum on predicted
+    positions (adequate for ~5-50 simultaneous tracks; scales O(N²)
+    which is fine at these sizes).
+    """
+
+    _MODELS = {
+        'LEO': {'q': 25.0, 'r': 16.0, 'prior': 0.55},
+        'MEO': {'q': 2.0,  'r': 16.0, 'prior': 0.25},
+        'GEO': {'q': 0.01, 'r': 16.0, 'prior': 0.20},
+    }
+
+    def __init__(self, window=8, min_hits=2, gate_px=60.0, angle_thresh=12.0):
+        self.window = window
+        self.min_hits = min_hits
+        self.gate_px = gate_px
+        self.angle_thresh = angle_thresh
+        self._tracks = []   # list of track dicts
+        self._next_id = 1
+
+    def _new_track(self, frame_idx, trail_type, info):
+        cx, cy = self._center(info)
+        track = {
+            'id': self._next_id,
+            'detections': [(frame_idx, trail_type, info)],
+            'last_frame': frame_idx,
+            'hits': 1,
+            'angle': self._angle(info),
+            'class_weights': {k: v['prior'] for k, v in self._MODELS.items()},
+            'filters': {},
+        }
+        for name, cfg in self._MODELS.items():
+            f = _LinearKalman2D(cfg['q'], cfg['r'])
+            f.init(cx, cy)
+            track['filters'][name] = f
+        self._next_id += 1
+        self._tracks.append(track)
+        return track
+
+    @staticmethod
+    def _center(info):
+        if 'center' in info:
+            return float(info['center'][0]), float(info['center'][1])
+        b = info['bbox']
+        return (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0
+
+    @staticmethod
+    def _angle(info):
+        a = info.get('angle')
+        if a is not None:
+            return float(a) % 180.0
+        line = info.get('line')
+        if line is not None:
+            try:
+                x1, y1, x2, y2 = line[:4] if len(line) >= 4 else line[0]
+                import math
+                return math.degrees(math.atan2(y2 - y1, x2 - x1)) % 180.0
+            except (TypeError, ValueError, IndexError):
+                return 0.0
+        return 0.0
+
+    def _angle_diff(self, a, b):
+        d = abs(a - b) % 180.0
+        return min(d, 180.0 - d)
+
+    def _associate(self, frame_idx, detections):
+        """Greedy association on predicted positions using the dominant motion model."""
+        for t in self._tracks:
+            for f in t['filters'].values():
+                f.predict()
+
+        used = set()
+        matches = {}  # track_idx -> detection_idx
+        costs = []
+        for ti, t in enumerate(self._tracks):
+            best_model = max(t['class_weights'].items(), key=lambda kv: kv[1])[0]
+            px, py = t['filters'][best_model].predicted_position()
+            for di, (_, info) in enumerate(detections):
+                if di in used:
+                    continue
+                cx, cy = self._center(info)
+                dist = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
+                if dist > self.gate_px:
+                    continue
+                if self._angle_diff(t['angle'], self._angle(info)) > self.angle_thresh:
+                    continue
+                costs.append((dist, ti, di))
+        costs.sort()
+        for dist, ti, di in costs:
+            if ti in matches or di in used:
+                continue
+            matches[ti] = di
+            used.add(di)
+        return matches, used
+
+    def update(self, frame_idx, detections):
+        if not detections:
+            # Age out tracks
+            self._tracks = [t for t in self._tracks
+                            if frame_idx - t['last_frame'] <= self.window]
+            return []
+
+        matches, used = self._associate(frame_idx, detections)
+
+        # Update matched tracks
+        for ti, di in matches.items():
+            trail_type, info = detections[di]
+            cx, cy = self._center(info)
+            # Each model gets the same measurement; likelihoods update class weights
+            likelihoods = {}
+            for name, f in self._tracks[ti]['filters'].items():
+                likelihoods[name] = max(1e-9, f.update((cx, cy)))
+            # Update class posterior via Bayes rule
+            t = self._tracks[ti]
+            total = sum(t['class_weights'][k] * likelihoods[k] for k in likelihoods)
+            if total > 0:
+                for k in likelihoods:
+                    t['class_weights'][k] = (t['class_weights'][k] * likelihoods[k]) / total
+            t['detections'].append((frame_idx, trail_type, info))
+            t['last_frame'] = frame_idx
+            t['hits'] += 1
+            t['angle'] = self._angle(info)
+
+        # Start new tracks for unmatched detections
+        for di, (trail_type, info) in enumerate(detections):
+            if di not in used:
+                self._new_track(frame_idx, trail_type, info)
+
+        # Age out tracks
+        self._tracks = [t for t in self._tracks
+                        if frame_idx - t['last_frame'] <= self.window]
+
+        # Confirm detections: a detection is confirmed if the track it
+        # belongs to has >= min_hits or is high-confidence single-frame
+        confirmed = []
+        current_dets_with_track = {}
+        for ti, di in matches.items():
+            current_dets_with_track[di] = ti
+        for di, (trail_type, info) in enumerate(detections):
+            track = None
+            if di in current_dets_with_track:
+                track = self._tracks[current_dets_with_track[di]] if \
+                    current_dets_with_track[di] < len(self._tracks) else None
+            # High-confidence single-frame bypass
+            snr = info.get('trail_snr', 0) or 0
+            cr = info.get('contrast_ratio', 0) or 0
+            high_conf = (snr >= 4.0 or cr >= 1.15)
+            if track and track['hits'] >= self.min_hits:
+                enriched = dict(info)
+                enriched['tracklet_id'] = track['id']
+                enriched['tracklet_length'] = track['hits']
+                # Attach motion-class posterior
+                enriched['tracklet_motion_class'] = dict(track['class_weights'])
+                dominant = max(track['class_weights'].items(), key=lambda kv: kv[1])
+                enriched['tracklet_motion_dominant'] = dominant[0]
+                confirmed.append((trail_type, enriched))
+            elif high_conf or trail_type == 'airplane':
+                confirmed.append((trail_type, info))
+        return confirmed
+
+    def finalized_tracklets(self, min_length=3):
+        """Emit tracklets with length >= min_length after processing ends."""
+        return [t for t in self._tracks if len(t['detections']) >= min_length]
+
+
+# ── I6a: TPE (Tree-structured Parzen Estimator) — joint-space BayesOpt ──
+
+class TPEOptimizer:
+    """Lightweight pure-numpy TPE for detection parameter tuning.
+
+    Classic reference: Bergstra et al. 2011 "Algorithms for Hyper-
+    Parameter Optimization".  We model the joint distribution over
+    parameters by two kernel density estimates — ``l(x)`` over the
+    top-γ configurations ("good") and ``g(x)`` over the rest.  The
+    next candidate maximises ``l(x)/g(x)``.
+
+    For continuous params we use Gaussian kernels; for integer params
+    we round after sampling.  No scipy dependency.
+    """
+
+    def __init__(self, space, gamma=0.25, n_candidates=48, seed=0):
+        """
+        space: dict of name -> ('int'|'float', low, high).
+        """
+        self.space = space
+        self.gamma = gamma
+        self.n_candidates = n_candidates
+        self.rng = np.random.default_rng(seed)
+        self.trials = []      # list of (config_dict, loss_value)
+
+    def _sample_from_prior(self):
+        out = {}
+        for name, (kind, lo, hi) in self.space.items():
+            v = self.rng.uniform(lo, hi)
+            if kind == 'int':
+                v = int(round(v))
+            out[name] = v
+        return out
+
+    def _kde_log_pdf(self, x, samples, lo, hi):
+        """Gaussian KDE (log) with bandwidth = 1.06 * σ * n^(-1/5) (Silverman)."""
+        if not samples:
+            return -np.log(max(1e-9, hi - lo))  # uniform prior fallback
+        s = np.array(samples, dtype=np.float64)
+        sig = max(1e-6, s.std()) * max(1.0, (hi - lo) / 20.0)
+        bw = 1.06 * sig * max(1, len(s)) ** (-0.2)
+        z = (x - s) / max(bw, 1e-6)
+        log_k = -0.5 * z * z - np.log(bw * np.sqrt(2 * np.pi))
+        m = log_k.max()
+        return float(m + np.log(np.exp(log_k - m).mean()))
+
+    def ask(self):
+        """Propose the next configuration to evaluate."""
+        if len(self.trials) < 5:
+            return self._sample_from_prior()
+
+        # Split trials into good (top γ) and bad
+        sorted_trials = sorted(self.trials, key=lambda t: t[1])
+        n_good = max(1, int(len(sorted_trials) * self.gamma))
+        good = sorted_trials[:n_good]
+        bad = sorted_trials[n_good:]
+
+        best_cfg = None
+        best_score = -np.inf
+        for _ in range(self.n_candidates):
+            cfg = self._sample_from_prior()
+            log_l = 0.0; log_g = 0.0
+            for name, (kind, lo, hi) in self.space.items():
+                v = cfg[name]
+                good_vals = [c[0][name] for c in good]
+                bad_vals = [c[0][name] for c in bad] if bad else good_vals
+                log_l += self._kde_log_pdf(v, good_vals, lo, hi)
+                log_g += self._kde_log_pdf(v, bad_vals, lo, hi)
+            score = log_l - log_g
+            if score > best_score:
+                best_score = score
+                best_cfg = cfg
+        return best_cfg or self._sample_from_prior()
+
+    def tell(self, cfg, loss):
+        self.trials.append((dict(cfg), float(loss)))
+
+    def best(self):
+        if not self.trials:
+            return None, float('inf')
+        return min(self.trials, key=lambda t: t[1])
+
+
+# ── I6b: TrustRegionAdapter — robust replacement for Tier-1 EMA ────────
+
+class TrustRegionAdapter:
+    """Batches Tier-1 corrections and applies a single trust-region update.
+
+    Rationale: the original EMA moves one parameter per correction with
+    an assumed causal direction from ``CORRECTION_RULES``.  That's
+    fragile to mis-clicks and to wrongly-encoded causal assumptions.
+    We accumulate a small batch of corrections and compute a proposed
+    parameter step that minimises simulated loss over the batch, but
+    only apply it if the step's norm is smaller than a trust-region
+    radius — otherwise we shrink it.
+    """
+
+    def __init__(self, param_adapter, batch_size=10, max_step_frac=0.15):
+        self.pa = param_adapter
+        self.batch_size = batch_size
+        self.max_step_frac = max_step_frac
+        self._pending = []    # (correction_action, trail_type, detection_meta)
+
+    def record(self, correction_action, trail_type, detection_meta):
+        self._pending.append((correction_action, trail_type, dict(detection_meta)))
+        if len(self._pending) >= self.batch_size:
+            return self.flush()
+        return {}
+
+    def flush(self):
+        if not self._pending:
+            return {}
+        # Run the parent's EMA once per queued correction to collect
+        # the proposed direction, but with a freshly-reset param copy.
+        base = dict(self.pa.params)
+        # Compute aggregate update from all pending corrections
+        proposals = {p: [] for p in base}
+        for action, ttype, meta in self._pending:
+            self.pa.params = dict(base)
+            # Call the raw EMA directly so use_trust_region=True on the
+            # adapter doesn't cause infinite recursion through apply_correction.
+            updates = self.pa._apply_correction_ema(action, ttype, meta)
+            for k, v in updates.items():
+                proposals[k].append(v)
+        self.pa.params = dict(base)
+        # Aggregate: take the median of the proposed values (robust)
+        applied = {}
+        for k, vals in proposals.items():
+            if not vals:
+                continue
+            target = float(np.median(vals))
+            lo, hi = self.pa.safety_bounds.get(k, (float('-inf'), float('inf')))
+            # Trust-region clamp — step at most max_step_frac of the param range
+            rng = hi - lo
+            max_step = self.max_step_frac * max(abs(rng), abs(base[k]))
+            step = np.clip(target - base[k], -max_step, max_step)
+            new_val = base[k] + step
+            new_val = max(lo, min(hi, new_val))
+            self.pa.params[k] = new_val
+            applied[k] = new_val
+        self._pending = []
+        return applied
+
+
+# ── I6d: BALD — Bayesian Active Learning by Disagreement ───────────────
+
+class BALDQueue:
+    """Rank frames by predictive entropy / model disagreement.
+
+    Implementation detail: in the absence of multiple model replicas
+    we approximate BALD by combining calibrated confidence distance-
+    to-0.5 with rescue classifier disagreement — frames where the
+    rescue classifier and the calibrated confidence disagree about
+    borderline detections carry the most information per correction.
+
+    Returns frame indices sorted by expected information gain
+    (highest first).
+    """
+
+    @staticmethod
+    def rank(frame_confidence_lists, rescue_scores=None):
+        """frame_confidence_lists: {frame_idx: [detection_conf, ...]}
+        rescue_scores: optional {frame_idx: [rescue_p, ...]} — aligned per detection.
+        Returns: list of frame indices, most-informative first.
+        """
+        entropies = {}
+        for fi, confs in frame_confidence_lists.items():
+            if not confs:
+                continue
+            p = np.clip(np.asarray(confs, dtype=np.float64), 1e-6, 1 - 1e-6)
+            # Average per-detection entropy (predictive) …
+            ent = -(p * np.log(p) + (1 - p) * np.log(1 - p)).mean()
+            # … minus disagreement with rescue classifier (higher = more informative)
+            disagree = 0.0
+            if rescue_scores and fi in rescue_scores:
+                r = np.asarray(rescue_scores[fi], dtype=np.float64)
+                m = min(len(r), len(p))
+                if m:
+                    disagree = float(np.abs(p[:m] - r[:m]).mean())
+            # Distance from 0.5 — borderline cases most informative
+            borderline = float(1.0 - np.abs(p - 0.5).mean() * 2.0)
+            entropies[fi] = ent + 0.5 * disagree + 0.3 * borderline
+        return sorted(entropies.keys(), key=lambda k: -entropies[k])
+
+
+# ── I7a: Tracklet pseudo-labeler ────────────────────────────────────────
+
+class TrackletPseudoLabeler:
+    """Auto-labels 3+ frame tracklet members into AnnotationDatabase.
+
+    A detection that appears in 3 or more temporally-consistent frames
+    is near-certainly a true positive.  This lets us build a training
+    corpus without any explicit human review — critical for the cold-
+    start of the rescue classifier, HyperNet, and Platt calibrator.
+    """
+
+    def __init__(self, annotation_db, min_length=3,
+                 source='tracklet_pseudo', confidence=0.95):
+        self.db = annotation_db
+        self.min_length = int(min_length)
+        self.source = source
+        self.confidence = float(confidence)
+        self.labeled = 0
+
+    def emit_from_tracker(self, tracker, video_source, video_w, video_h):
+        if not hasattr(tracker, 'finalized_tracklets'):
+            return 0
+        for t in tracker.finalized_tracklets(self.min_length):
+            for frame_idx, trail_type, info in t['detections']:
+                img_id = self.db.add_image(frame_idx, video_source, video_w, video_h)
+                cat_id = AnnotationDatabase.CATEGORY_ID.get(trail_type, 0)
+                bbox = info.get('bbox')
+                if bbox is None:
+                    continue
+                ann_id = self.db.add_detection(
+                    img_id, cat_id, bbox, info, params_snapshot=None,
+                    confidence=self.confidence)
+                # Mark as pseudo-confirmed
+                ann = self.db._get_annotation(ann_id)
+                if ann:
+                    ann['mnemosky_ext']['source'] = self.source
+                    ann['mnemosky_ext']['status'] = 'confirmed'
+                    ann['mnemosky_ext']['review_action'] = 'auto_tracklet'
+                self.labeled += 1
+        return self.labeled
+
+
+# ── I7b: Tracklet sequence head — temporal classifier ──────────────────
+
+class TrackletSequenceHead:
+    """Classifies a tracklet (sequence of feature vectors) into
+    {satellite, airplane, meteor, artifact}.
+
+    Because tracklets are short (4–12 frames) we avoid a full RNN and
+    instead compute temporal summary statistics — mean, std, min, max,
+    slope — across the sequence, then feed a small MLP head.
+    """
+
+    CLASSES = ('satellite', 'airplane', 'meteor', 'artifact')
+    _FEATURES = ('angle', 'length', 'avg_brightness', 'brightness_std',
+                 'trail_snr', 'contrast_ratio')
+
+    def __init__(self):
+        self._W = None
+        self._b = None
+        self._mu = None
+        self._sigma = None
+        self.path = Path.home() / '.mnemosky' / 'tracklet_head.json'
+
+    @staticmethod
+    def _summarise(sequence):
+        """sequence: list of info dicts. Returns (30,) feature vector."""
+        arr = np.zeros((len(sequence), len(TrackletSequenceHead._FEATURES)), dtype=np.float32)
+        for i, info in enumerate(sequence):
+            for j, k in enumerate(TrackletSequenceHead._FEATURES):
+                v = info.get(k, 0.0)
+                try:
+                    arr[i, j] = float(v) if v is not None else 0.0
+                except (TypeError, ValueError):
+                    arr[i, j] = 0.0
+        if len(sequence) == 0:
+            return np.zeros(30, dtype=np.float32)
+        # Summary: mean, std, min, max, slope (first-to-last delta)
+        mean = arr.mean(axis=0)
+        std = arr.std(axis=0)
+        mn = arr.min(axis=0)
+        mx = arr.max(axis=0)
+        slope = arr[-1] - arr[0]
+        return np.concatenate([mean, std, mn, mx, slope]).astype(np.float32)
+
+    def _standardise(self, X):
+        if self._mu is None:
+            self._mu = X.mean(axis=0); self._sigma = X.std(axis=0) + 1e-6
+        return (X - self._mu) / self._sigma
+
+    def fit(self, labeled_tracklets, epochs=80, lr=0.02):
+        """labeled_tracklets: list of (sequence_of_info_dicts, class_name)."""
+        X, y = [], []
+        for seq, cls in labeled_tracklets:
+            if cls not in self.CLASSES:
+                continue
+            X.append(self._summarise(seq))
+            y.append(self.CLASSES.index(cls))
+        if len(X) < 20:
+            return False
+        X = np.stack(X); y = np.array(y, dtype=np.int64)
+        X = self._standardise(X)
+        n_in = X.shape[1]; n_out = len(self.CLASSES)
+        rng = np.random.default_rng(2)
+        # Single softmax layer — the summary statistics are already quite rich
+        self._W = rng.standard_normal((n_in, n_out)).astype(np.float32) * 0.01
+        self._b = np.zeros((n_out,), dtype=np.float32)
+        vW = np.zeros_like(self._W); vb = np.zeros_like(self._b)
+        for ep in range(epochs):
+            idx = rng.permutation(len(X))
+            for s in range(0, len(X), 32):
+                i = idx[s:s + 32]
+                Xi = X[i]; yi = y[i]
+                logits = Xi @ self._W + self._b
+                ex = np.exp(logits - logits.max(axis=1, keepdims=True))
+                P = ex / ex.sum(axis=1, keepdims=True)
+                Y1 = np.zeros_like(P); Y1[np.arange(len(i)), yi] = 1.0
+                dlogits = (P - Y1) / len(i)
+                dW = Xi.T @ dlogits + 1e-4 * self._W
+                db = dlogits.sum(axis=0)
+                vW = 0.9 * vW + lr * dW; self._W -= vW
+                vb = 0.9 * vb + lr * db; self._b -= vb
+        return True
+
+    def predict(self, sequence):
+        if self._W is None:
+            return None
+        x = self._summarise(sequence)
+        x = (x - self._mu) / self._sigma
+        logits = x @ self._W + self._b
+        ex = np.exp(logits - logits.max())
+        p = ex / ex.sum()
+        idx = int(p.argmax())
+        return self.CLASSES[idx], float(p[idx]), {c: float(p[i]) for i, c in enumerate(self.CLASSES)}
+
+    def save(self):
+        if self._W is None:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path, 'w') as f:
+                json.dump({
+                    'W': self._W.tolist(), 'b': self._b.tolist(),
+                    'mu': self._mu.tolist(), 'sigma': self._sigma.tolist(),
+                    'classes': list(self.CLASSES),
+                    'features': list(self._FEATURES),
+                }, f)
+        except OSError:
+            pass
+
+    def load(self):
+        if not self.path.exists():
+            return False
+        try:
+            with open(self.path, 'r') as f:
+                d = json.load(f)
+            self._W = np.array(d['W'], dtype=np.float32)
+            self._b = np.array(d['b'], dtype=np.float32)
+            self._mu = np.array(d['mu'], dtype=np.float32)
+            self._sigma = np.array(d['sigma'], dtype=np.float32)
+            return True
+        except (OSError, json.JSONDecodeError, KeyError, ValueError):
+            return False
+
+
+# ── I7c: Algorithm fusion head — logistic regression over detectors ────
+
+class AlgorithmFusionHead:
+    """Fuses detections from default + radon + nn into a single probability.
+
+    Features (per detection candidate aligned by bbox-IoU):
+      - default_score, radon_score, nn_score (0 if absent)
+      - iou_default_radon, iou_radon_nn, iou_default_nn
+      - agreement_count (number of detectors that fired)
+
+    Learns a 7-parameter logistic regression via IRLS.  Trained offline
+    from labeled annotations.  At inference we compute the scores from
+    the three detectors' outputs and emit the fused probability.
+    """
+
+    _FEATURES = ('default_score', 'radon_score', 'nn_score',
+                 'iou_default_radon', 'iou_radon_nn', 'iou_default_nn',
+                 'agreement_count')
+
+    def __init__(self):
+        self.w = None
+        self.b = 0.0
+        self.path = Path.home() / '.mnemosky' / 'fusion_head.json'
+
+    @staticmethod
+    def _bbox_iou(a, b):
+        if a is None or b is None:
+            return 0.0
+        xa1, ya1, xa2, ya2 = a; xb1, yb1, xb2, yb2 = b
+        ix1, iy1 = max(xa1, xb1), max(ya1, yb1)
+        ix2, iy2 = min(xa2, xb2), min(ya2, yb2)
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        a_area = (xa2 - xa1) * (ya2 - ya1)
+        b_area = (xb2 - xb1) * (yb2 - yb1)
+        return inter / max(1.0, (a_area + b_area - inter))
+
+    @classmethod
+    def features_for(cls, default_det, radon_det, nn_det):
+        ds = float(default_det.get('nn_confidence', default_det.get('trail_snr', 0.0) or 0.0)) if default_det else 0.0
+        rs = float(radon_det.get('trail_snr', 0.0) or 0.0) if radon_det else 0.0
+        ns = float(nn_det.get('nn_confidence', 0.0) or 0.0) if nn_det else 0.0
+        bd = default_det.get('bbox') if default_det else None
+        br = radon_det.get('bbox') if radon_det else None
+        bn = nn_det.get('bbox') if nn_det else None
+        iou_dr = cls._bbox_iou(bd, br)
+        iou_rn = cls._bbox_iou(br, bn)
+        iou_dn = cls._bbox_iou(bd, bn)
+        agree = int(default_det is not None) + int(radon_det is not None) + int(nn_det is not None)
+        return np.array([ds, rs, ns, iou_dr, iou_rn, iou_dn, float(agree)],
+                        dtype=np.float32)
+
+    def fit(self, X, y, iters=50, reg=1e-3):
+        """X: (N, 7) feature matrix. y: (N,) 0/1 labels."""
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        if len(X) < 10:
+            return False
+        # Add intercept
+        X1 = np.concatenate([X, np.ones((len(X), 1))], axis=1)
+        w = np.zeros(X1.shape[1])
+        for _ in range(iters):
+            z = X1 @ w
+            p = 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
+            W = p * (1 - p) + 1e-6
+            # Newton step: w -= (X' W X)^-1 X'(p - y)
+            g = X1.T @ (p - y) + reg * w
+            H = X1.T @ (X1 * W[:, None]) + reg * np.eye(X1.shape[1])
+            try:
+                step = np.linalg.solve(H, g)
+            except np.linalg.LinAlgError:
+                break
+            w -= step
+            if np.max(np.abs(step)) < 1e-6:
+                break
+        self.w = w[:-1].astype(np.float32)
+        self.b = float(w[-1])
+        return True
+
+    def predict_proba(self, features_vec):
+        if self.w is None:
+            # Default: majority-score fusion
+            return float(features_vec[:3].max())
+        z = float(features_vec @ self.w) + self.b
+        return float(1.0 / (1.0 + np.exp(-max(-30, min(30, z)))))
+
+    def save(self):
+        if self.w is None:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path, 'w') as f:
+                json.dump({'w': self.w.tolist(), 'b': self.b,
+                           'features': list(self._FEATURES)}, f)
+        except OSError:
+            pass
+
+    def load(self):
+        if not self.path.exists():
+            return False
+        try:
+            with open(self.path, 'r') as f:
+                d = json.load(f)
+            self.w = np.array(d['w'], dtype=np.float32)
+            self.b = float(d['b'])
+            return True
+        except (OSError, json.JSONDecodeError, KeyError):
+            return False
+
+
+# ── Learning corpus builder: harvests training data from the DB ────────
+
+def _build_training_corpus(annotation_db, ledger_jsonl=None):
+    """Assemble positives/negatives for the rescue classifier.
+
+    Positives: confirmed annotations + tracklet pseudo-labels + ledger
+    'accepted_*' entries.
+    Negatives: rejected annotations + every ledger rejection entry.
+    """
+    positives, negatives = [], []
+    if annotation_db is not None:
+        for ann in annotation_db.data.get('annotations', []):
+            ext = ann.get('mnemosky_ext', {})
+            meta = ext.get('detection_meta', {})
+            if ext.get('status') == 'confirmed':
+                positives.append(dict(meta))
+            elif ext.get('status') == 'rejected':
+                negatives.append(dict(meta))
+    if ledger_jsonl and Path(ledger_jsonl).exists():
+        try:
+            with open(ledger_jsonl, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    rc = int(row.get('reason_code', 0))
+                    if rc >= 100:   # 'accepted_*'
+                        positives.append(row)
+                    else:
+                        negatives.append(row)
+        except OSError:
+            pass
+    return positives, negatives
 
 
 class ReviewUI:
@@ -5046,26 +6662,58 @@ class ReviewUI:
         return reviewed
 
     def _build_review_queue(self):
-        """Build frame review queue sorted by minimum confidence."""
+        """Build frame review queue sorted by expected information gain.
+
+        I6d: when a RescueClassifier is available, use BALDQueue to rank
+        by predictive entropy + rescue-classifier disagreement (borderline
+        frames surface first).  Otherwise fall back to min-confidence sort.
+        """
         frames_with_detections = sorted(self.detections_by_frame.keys())
         if not frames_with_detections:
             self.review_queue = []
             return
 
-        # Build confidence map from annotation DB
-        frame_confs = {}
+        # Build per-frame confidence lists + rescue score lists
+        frame_conf_lists = {}
+        frame_rescue_lists = {}
+        min_frame_confs = {}
+        rescue = SatelliteTrailDetector._get_rescue_classifier()
+
         for img in self.ann_db.data['images']:
             fi = img['frame_index']
             pending = self.ann_db.get_pending_annotations(img['id'])
-            if pending:
-                confs = [a.get('mnemosky_ext', {}).get('confidence', 0.5) for a in pending]
-                if confs:
-                    frame_confs[fi] = min(confs)
+            if not pending:
+                continue
+            confs, rescues = [], []
+            for a in pending:
+                ext = a.get('mnemosky_ext', {})
+                confs.append(float(ext.get('confidence', 0.5)))
+                if rescue is not None:
+                    meta = ext.get('detection_meta', {}) or {}
+                    try:
+                        decision = rescue.can_rescue(
+                            meta, _REASON_CODES.get('unclassifiable', 11))
+                        rescues.append(float(decision[1]) if isinstance(decision, tuple) else 0.5)
+                    except Exception:
+                        rescues.append(0.5)
+            if confs:
+                frame_conf_lists[fi] = confs
+                min_frame_confs[fi] = min(confs)
+                if rescues:
+                    frame_rescue_lists[fi] = rescues
 
-        # Sort by confidence (lowest first), then by frame index
-        self.review_queue = sorted(
-            frames_with_detections,
-            key=lambda fi: (frame_confs.get(fi, 1.0), fi))
+        if rescue is not None and frame_conf_lists:
+            # I6d: BALD — entropy + rescue disagreement
+            ranked = BALDQueue.rank(frame_conf_lists, frame_rescue_lists)
+            # Append any detection frames missing from the ranking (e.g. no annotations yet)
+            ranked_set = set(ranked)
+            tail = [fi for fi in frames_with_detections if fi not in ranked_set]
+            self.review_queue = ranked + tail
+        else:
+            # Fallback: min-confidence first, then frame index
+            self.review_queue = sorted(
+                frames_with_detections,
+                key=lambda fi: (min_frame_confs.get(fi, 1.0), fi))
 
     def run(self):
         """Main event loop."""
@@ -5947,6 +7595,10 @@ class SatelliteTrailDetector:
         self.ledger = None  # TranslationLedger instance (set externally if --ledger)
         self._observer_context = None  # Set by process_video if --observer-context
         self.sensitivity = sensitivity  # Store for inscription metadata
+        # I1: lazy-loaded RescueClassifier for near-boundary rejections.
+        # None = not yet probed; False = probed and absent/untrained;
+        # otherwise a trained RescueClassifier instance.
+        self._rescue_classifier = None
         self.box_thickness = 1
         self.dot_length = 8  # Length of each dash in dotted line
         self.gap_length = 4  # Gap between dashes
@@ -7627,10 +9279,66 @@ class SatelliteTrailDetector:
                     ('is_dim', is_dim), ('is_smooth', is_smooth),
                     ('satellite_length', is_satellite_length)] if not v])
 
+        # I1: RescueClassifier — consult a trained MLP before we finally
+        # discard this candidate.  Only fires if a model has been trained
+        # from prior corrections (--train-rescue) AND the classifier is
+        # sufficiently confident for this rejection reason.
+        rescue = self._get_rescue_classifier()
+        if rescue is not None:
+            feats = {
+                'contrast_ratio': float(contrast_ratio) if contrast_ratio is not None else 1.0,
+                'trail_snr': 0.0,
+                'length': float(length),
+                'avg_brightness': float(avg_brightness),
+                'max_brightness': float(max_brightness),
+                'brightness_std': float(brightness_std),
+                'aspect_ratio': float((x_max - x_min) / max(1, y_max - y_min)),
+                'angle': float(angle) % 180.0,
+                'smoothness_score': 1.0 if is_smooth else 0.0,
+                'supplementary': 1.0 if supplementary else 0.0,
+            }
+            try:
+                decision = rescue.can_rescue(feats, _REASON_CODES.get('unclassifiable', 11))
+                # can_rescue returns (bool, prob) when mlp is fitted
+                if isinstance(decision, tuple) and decision[0]:
+                    if ledger:
+                        ledger.record_classification('anomalous')
+                    info = _make_detection_info(
+                        detection_path='rescue_classifier',
+                        extra_criteria_met=[f'rescue_p={decision[1]:.2f}'])
+                    info['rescue_score'] = float(decision[1])
+                    info['rescue_reason_code'] = _REASON_CODES.get('unclassifiable', 11)
+                    return 'anomalous', info
+            except Exception:
+                # Rescue is best-effort — a failure must not poison detection
+                pass
+
         if ledger:
             ledger.record_rejection('unclassifiable', line)
         return None, None
-    
+
+    # ── I1: RescueClassifier lazy loader (class-level cache) ─────────
+
+    _RESCUE_CACHE = None  # shared across instances: None | False | RescueClassifier
+
+    @classmethod
+    def _get_rescue_classifier(cls):
+        """Return a ready-to-use RescueClassifier, or None if unavailable."""
+        if cls._RESCUE_CACHE is False:
+            return None
+        if cls._RESCUE_CACHE is not None:
+            return cls._RESCUE_CACHE
+        try:
+            rc = RescueClassifier()
+            if rc.mlp is None:
+                cls._RESCUE_CACHE = False
+                return None
+            cls._RESCUE_CACHE = rc
+            return rc
+        except Exception:
+            cls._RESCUE_CACHE = False
+            return None
+
     # ── Line-proximity utilities (shared with RadonStreakDetector) ───
 
     @staticmethod
@@ -9530,32 +11238,69 @@ class RadonStreakDetector(SatelliteTrailDetector):
             if trail_type and detection_info:
                 classified_trails.append((trail_type, detection_info))
 
-        # ── Multi-frame residual accumulation (sequential mode only) ──
-        # Accumulate star-subtracted residuals across frames to boost Radon
-        # SNR by sqrt(N).  Skip when temporal_context is provided — the
-        # TemporalFrameBuffer already gives multi-frame reference, making
-        # local accumulation redundant.  Also broken in parallel mode where
-        # each worker has its own empty buffer.
-        if temporal_context is None:
+        # ── Multi-frame residual accumulation (I2 — parallel-safe) ────
+        # Two paths, with the new main-process stack taking precedence:
+        #
+        # 1. Main-process stack (NEW, I2): TemporalFrameBuffer keeps a ring
+        #    of recent diff-images and emits them on temporal_context.
+        #    This path works identically in sequential and parallel mode,
+        #    because the buffer lives in the main process and the ring is
+        #    shipped to workers alongside the per-frame diff.  Stack, apply
+        #    star mask, divide noise by sqrt(N).  Recovers ~6 dB that was
+        #    silently lost in parallel mode.
+        #
+        # 2. Worker-local stack (legacy): only fires when no temporal_context
+        #    is available (user explicitly disabled the temporal buffer).
+        #    Preserved for compatibility; redundant when #1 is active.
+        #
+        # I5: if the temporal buffer also supplies a long-horizon residual
+        # (built from hundreds of frames by LongBackgroundModel), we fuse
+        # it in via pixelwise max() — this recovers GEO/high-altitude
+        # satellites that sit in the 7-frame buffer and get subtracted from
+        # themselves.
+        radon_input = cleaned
+        radon_noise = noise_sigma
+
+        diff_stack = (temporal_context.get('diff_stack')
+                      if temporal_context is not None else None)
+        if diff_stack is not None and len(diff_stack) >= 2:
+            # Stack recent diff-images → apply current-frame star mask.
+            # The mean of N background-subtracted frames has √N less
+            # noise; keeping the star mask on the current frame is
+            # intentional — the mask is what the Radon sees right now.
+            stacked = np.mean(diff_stack, axis=0).astype(np.float32)
+            stacked[star_mask] = 0.0
+            radon_input = stacked
+            stack_noise = temporal_context.get('stack_noise')
+            if stack_noise is not None:
+                radon_noise = float(stack_noise)
+            else:
+                radon_noise = noise_sigma / float(np.sqrt(len(diff_stack)))
+        elif temporal_context is None:
+            # Legacy worker-local accumulation (no temporal buffer at all)
             self._residual_buffer.append(cleaned)
             self._residual_star_masks.append(star_mask)
             if len(self._residual_buffer) > self._residual_buffer_depth:
                 self._residual_buffer.pop(0)
                 self._residual_star_masks.pop(0)
+            if len(self._residual_buffer) >= 2:
+                stacked = np.mean(self._residual_buffer, axis=0).astype(np.float32)
+                combined_mask = self._residual_star_masks[0].copy()
+                for m in self._residual_star_masks[1:]:
+                    combined_mask = combined_mask | m
+                stacked[combined_mask] = 0.0
+                radon_input = stacked
+                radon_noise = noise_sigma / np.sqrt(len(self._residual_buffer))
 
-        if temporal_context is None and len(self._residual_buffer) >= 2:
-            # Stack: mean of recent residuals with union star mask
-            stacked = np.mean(self._residual_buffer, axis=0).astype(np.float32)
-            combined_mask = self._residual_star_masks[0].copy()
-            for m in self._residual_star_masks[1:]:
-                combined_mask = combined_mask | m
-            stacked[combined_mask] = 0.0
-            radon_input = stacked
-            # Noise reduces by sqrt(N) when averaging N frames
-            radon_noise = noise_sigma / np.sqrt(len(self._residual_buffer))
-        else:
-            radon_input = cleaned
-            radon_noise = noise_sigma
+        long_residual = (temporal_context.get('long_residual')
+                         if temporal_context is not None else None)
+        if long_residual is not None and long_residual.shape == radon_input.shape:
+            # Blend: take the pixelwise maximum so slow (long-bg residual)
+            # and fast (short-bg residual) trails both survive.  Apply the
+            # star mask to the long-residual first so stars don't leak back.
+            long_masked = long_residual.astype(np.float32, copy=True)
+            long_masked[star_mask] = 0.0
+            radon_input = np.maximum(radon_input, long_masked)
 
         # ── Stage 2: Radon transform detection ──────────────────────
         # Downsample: cap total pixel area to ~500k pixels (increased from
@@ -9825,7 +11570,7 @@ class NeuralNetDetector(SatelliteTrailDetector):
                  model_path=None, backend='ultralytics', device='auto',
                  confidence=0.25, nms_iou=0.45, input_size=640,
                  half_precision=False, class_map=None, hybrid_mode=False,
-                 no_gpu=False):
+                 no_gpu=False, fusion_enabled=False):
         """
         Args:
             model_path: Path to model file (.pt, .onnx, .engine, etc.).
@@ -9839,6 +11584,9 @@ class NeuralNetDetector(SatelliteTrailDetector):
                 e.g. ``{'satellite': [0], 'airplane': [1]}``.
             hybrid_mode: Also run classical pipeline and merge results.
             no_gpu: Force CPU inference even if GPU is available.
+            fusion_enabled: I7c — attach AlgorithmFusionHead fused score to
+                each merged detection.  Lazy-loaded per-worker; only fires
+                in hybrid mode (needs multiple detectors to score).
         """
         super().__init__(sensitivity, preprocessing_params,
                          skip_aspect_ratio_check, signal_envelope)
@@ -9852,6 +11600,8 @@ class NeuralNetDetector(SatelliteTrailDetector):
         self.class_map = class_map or {'satellite': [0], 'airplane': [1]}
         self.hybrid_mode = hybrid_mode
         self._no_gpu = no_gpu
+        self.fusion_enabled = bool(fusion_enabled)
+        self._fusion_head = None  # lazy-loaded AlgorithmFusionHead
 
         # Invert class_map for fast lookup: model_class_id → trail_type
         self._class_id_to_type = {}
@@ -9958,25 +11708,75 @@ class NeuralNetDetector(SatelliteTrailDetector):
         version is kept since it has an explicit class prediction).
         Classical detections that do not overlap are added (the model
         may have missed them).
+
+        I7c — when ``fusion_enabled`` and an ``AlgorithmFusionHead`` is
+        loaded, each merged detection gets a ``fusion_score`` field: the
+        calibrated probability computed from the aligned
+        (default, radon, nn) scores + cross-IoU features.  The NN bbox
+        overlap search doubles as the alignment step.
         """
         if not classical_trails:
-            return nn_trails
-        if not nn_trails:
-            return classical_trails
+            merged = list(nn_trails)
+        elif not nn_trails:
+            merged = list(classical_trails)
+        else:
+            nn_bboxes = [info['bbox'] for _, info in nn_trails]
+            nn_overlap_classical = [None] * len(nn_trails)  # pair NN→classical
+            merged = list(nn_trails)
+            for trail_type, info in classical_trails:
+                cx = (info['bbox'][0] + info['bbox'][2]) / 2.0
+                cy = (info['bbox'][1] + info['bbox'][3]) / 2.0
+                overlap_idx = None
+                for i, nb in enumerate(nn_bboxes):
+                    if nb[0] <= cx <= nb[2] and nb[1] <= cy <= nb[3]:
+                        overlap_idx = i
+                        break
+                if overlap_idx is None:
+                    merged.append((trail_type, info))
+                elif nn_overlap_classical[overlap_idx] is None:
+                    nn_overlap_classical[overlap_idx] = info
 
-        nn_bboxes = [info['bbox'] for _, info in nn_trails]
-        merged = list(nn_trails)
-        for trail_type, info in classical_trails:
-            cx = (info['bbox'][0] + info['bbox'][2]) / 2.0
-            cy = (info['bbox'][1] + info['bbox'][3]) / 2.0
-            overlap = False
-            for nb in nn_bboxes:
-                if nb[0] <= cx <= nb[2] and nb[1] <= cy <= nb[3]:
-                    overlap = True
-                    break
-            if not overlap:
-                merged.append((trail_type, info))
+            # I7c: attach fusion score to each NN detection using its
+            # paired classical detection (if any).  Classical-only
+            # entries get fusion from (None, None, classical) — the head
+            # treats missing detectors as zero-score.
+            if self.fusion_enabled:
+                fh = self._get_fusion_head()
+                if fh is not None:
+                    for i, (_, nn_info) in enumerate(nn_trails):
+                        cls_info = nn_overlap_classical[i]
+                        feats = AlgorithmFusionHead.features_for(
+                            cls_info, None, nn_info)
+                        nn_info['fusion_score'] = fh.predict_proba(feats)
+                    for k in range(len(nn_trails), len(merged)):
+                        _, cls_info = merged[k]
+                        feats = AlgorithmFusionHead.features_for(
+                            cls_info, None, None)
+                        cls_info['fusion_score'] = fh.predict_proba(feats)
+
+        # Classical-only path (no NN hits): still emit fusion if enabled.
+        if self.fusion_enabled and not nn_trails and classical_trails:
+            fh = self._get_fusion_head()
+            if fh is not None:
+                for _, info in merged:
+                    feats = AlgorithmFusionHead.features_for(info, None, None)
+                    info['fusion_score'] = fh.predict_proba(feats)
         return merged
+
+    def _get_fusion_head(self):
+        """Lazy-load AlgorithmFusionHead per worker.  Returns None once
+        loading is known to fail, so the cost is paid at most once."""
+        if self._fusion_head is False:
+            return None
+        if self._fusion_head is None:
+            try:
+                fh = AlgorithmFusionHead()
+                fh.load()  # falls back to max-score if no saved weights
+                self._fusion_head = fh
+            except Exception:
+                self._fusion_head = False
+                return None
+        return self._fusion_head
 
     # ── Main detection pipeline ──────────────────────────────────────
 
@@ -10193,6 +11993,7 @@ def _worker_init(algorithm, sensitivity, preprocessing_params,
             class_map=nn_params.get('class_map'),
             hybrid_mode=nn_params.get('hybrid_mode', False),
             no_gpu=not use_gpu,
+            fusion_enabled=nn_params.get('fusion', False),
         )
     elif algorithm == 'radon':
         # Pass groundtruth_dir=None to skip per-worker calibration;
@@ -12116,7 +13917,11 @@ class ProcessingWindow:
                     cv2.FONT_HERSHEY_SIMPLEX, scale, text_color, 1, cv2.LINE_AA)
 
 
-def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=7, algorithm='default', groundtruth_dir=None, num_workers=0, no_gpu=False, review_mode=False, review_only=False, annotations_path=None, hitl_profile='default', auto_accept=0.9, no_learn=False, dataset_format='aabb', dataset_split=(0.7, 0.2, 0.1), dataset_skip=0, dataset_dedup=5, dataset_negatives=0.2, dataset_image_format='jpg', dataset_image_quality=95, dataset_dir_override=None, radon_params=None, nn_params=None, show_processing=False, enable_ledger=False, loss_profile='balanced', observer_context=None):
+def process_video(input_path, output_path, sensitivity='medium', freeze_duration=1.0, max_duration=None, detect_type='both', show_labels=True, debug_mode=False, debug_only=False, preprocessing_params=None, skip_aspect_ratio_check=False, signal_envelope=None, save_dataset=False, exposure_time=13.0, fov_degrees=None, temporal_buffer_size=7, algorithm='default', groundtruth_dir=None, num_workers=0, no_gpu=False, review_mode=False, review_only=False, annotations_path=None, hitl_profile='default', auto_accept=0.9, no_learn=False, dataset_format='aabb', dataset_split=(0.7, 0.2, 0.1), dataset_skip=0, dataset_dedup=5, dataset_negatives=0.2, dataset_image_format='jpg', dataset_image_quality=95, dataset_dir_override=None, radon_params=None, nn_params=None, show_processing=False, enable_ledger=False, loss_profile='balanced', observer_context=None,
+                  tracker_kind='default', enable_long_bg=False,
+                  enable_hypernet=False, enable_pseudo_label=False,
+                  train_rescue=False, tier2_optimizer='golden',
+                  use_trust_region=False, enable_fusion=False):
     """
     Process video to detect and highlight satellite and airplane trails.
 
@@ -12268,12 +14073,18 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
             class_map=nn_params.get('class_map'),
             hybrid_mode=nn_params.get('hybrid_mode', False),
             no_gpu=no_gpu,
+            fusion_enabled=nn_params.get('fusion', False),
         )
         backend_label = nn_params['backend']
         model_label = Path(nn_params['model_path']).name
         print(f"Algorithm: Neural Network ({backend_label}, model={model_label})")
         if nn_params.get('hybrid_mode'):
             print(f"  Hybrid mode: classical pipeline also active")
+        if nn_params.get('fusion'):
+            fh_path = Path.home() / '.mnemosky' / 'fusion_head.json'
+            print(f"  Fusion head: "
+                  + ("loaded from " + str(fh_path) if fh_path.exists()
+                     else "no trained weights — max-score fallback"))
     elif algorithm == 'radon':
         detector = RadonStreakDetector(
             sensitivity, preprocessing_params=preprocessing_params,
@@ -12328,8 +14139,12 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     # features (trails).  This is the single biggest SNR improvement.
     temporal_buffer = None
     if temporal_buffer_size >= 5:
-        temporal_buffer = TemporalFrameBuffer(capacity=temporal_buffer_size)
-        print(f"Temporal integration: {temporal_buffer_size}-frame rolling buffer")
+        temporal_buffer = TemporalFrameBuffer(
+            capacity=temporal_buffer_size,
+            residual_ring_depth=4,
+            enable_long_bg=enable_long_bg)
+        print(f"Temporal integration: {temporal_buffer_size}-frame rolling buffer"
+              + (" + long-horizon background (I5)" if enable_long_bg else ""))
     else:
         print("Temporal integration: disabled")
     print(f"Exposure time: {exposure_time}s")
@@ -12340,8 +14155,19 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     # Builds tracklets across frames and adds temporal_hits metadata.
     # Radon: min_hits=2 filters single-frame noise.
     # Default/NN: min_hits=1 (pass-through) but still builds tracklets.
+    #
+    # I4: --tracker imm swaps the greedy linker for an IMM Kalman tracker
+    # with LEO/MEO/GEO motion priors.  Handles crossing trails, bridges
+    # 1-3 frame gaps, and attaches a motion-class posterior to every
+    # confirmed detection.
     detection_tracker = None
-    if algorithm == 'radon':
+    min_hits = 2 if algorithm == 'radon' else 1
+    if tracker_kind == 'imm':
+        detection_tracker = IMMKalmanTracker(
+            window=8, min_hits=min_hits, gate_px=60.0, angle_thresh=12.0)
+        print(f"Temporal detection tracker: IMM Kalman (window=8, min_hits={min_hits}, "
+              f"LEO/MEO/GEO class posterior)")
+    elif algorithm == 'radon':
         detection_tracker = DetectionTracker(
             window=4, min_hits=2, angle_thresh=10, dist_thresh=30)
         print("Temporal detection tracker: active (window=4, min_hits=2)")
@@ -12349,6 +14175,27 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         detection_tracker = DetectionTracker(
             window=4, min_hits=1, angle_thresh=10, dist_thresh=30)
         print("Temporal detection tracker: active (window=4, min_hits=1, tracklet metadata)")
+
+    # I3: HyperNet for per-frame adaptive thresholds
+    hypernet = None
+    if enable_hypernet:
+        hypernet = ThresholdHyperNet()
+        if hypernet.load():
+            print(f"HyperNet: loaded (trained on {hypernet.trained_on} samples)")
+        else:
+            print("HyperNet: untrained — using zero-delta identity (pass-through)")
+
+    # I7b: TrackletSequenceHead — refines the tracklet's class once it
+    # has enough temporal evidence.  Silently skipped if untrained.
+    sequence_head = TrackletSequenceHead()
+    if not sequence_head.load():
+        sequence_head = None
+    else:
+        print("Tracklet sequence head: loaded")
+    # Base params snapshot so the hypernet can reset before each frame
+    _hypernet_base_params = dict(detector.params) if hypernet else None
+    # Rolling count of detections in the last N frames (for HyperNet context)
+    _recent_det_history = deque(maxlen=30)
 
     frame_count = 0
     satellites_detected = 0
@@ -12382,7 +14229,9 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         param_adapter = None
         if not no_learn:
             param_adapter = ParameterAdapter(detector.params, PARAMETER_SAFETY_BOUNDS,
-                                              loss_profile=loss_profile)
+                                              loss_profile=loss_profile,
+                                              use_trust_region=use_trust_region,
+                                              tier2_optimizer=tier2_optimizer)
             if hitl_profile:
                 param_adapter.load_profile(hitl_profile)
         review_ui = ReviewUI(
@@ -12501,7 +14350,10 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
                                 temporal_context = \
                                     temporal_buffer.get_temporal_context(gray_fb)
 
-                        # Copy temporal context arrays for the worker process
+                        # Copy temporal context arrays for the worker process.
+                        # I2: diff_stack + stack_noise carry the √N SNR boost
+                        #     across process boundaries.
+                        # I5: long_residual enables GEO detection in workers.
                         tc_copy = None
                         if temporal_context is not None:
                             tc_copy = {
@@ -12510,6 +14362,14 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
                                 'reference': temporal_context['reference'].copy(),
                                 'buffer_depth': temporal_context['buffer_depth'],
                             }
+                            ds = temporal_context.get('diff_stack')
+                            if ds is not None:
+                                tc_copy['diff_stack'] = ds.copy()
+                                tc_copy['stack_noise'] = temporal_context.get('stack_noise')
+                            lr = temporal_context.get('long_residual')
+                            if lr is not None:
+                                tc_copy['long_residual'] = lr.copy()
+                            tc_copy['base_noise_sigma'] = temporal_context.get('base_noise_sigma')
 
                         async_result = pool.apply_async(
                             _worker_detect,
@@ -12542,12 +14402,29 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
                     break
 
                 temporal_context = None
+                gray_fb = None
                 if temporal_buffer is not None:
                     gray_fb = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                     temporal_buffer.add(gray_fb)
                     if temporal_buffer.is_ready():
                         temporal_context = \
                             temporal_buffer.get_temporal_context(gray_fb)
+
+                # I3: HyperNet per-frame parameter adaptation (sequential only)
+                if hypernet is not None and _hypernet_base_params is not None:
+                    if gray_fb is None:
+                        gray_fb = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    _base_noise = temporal_context.get('base_noise_sigma') if temporal_context else None
+                    _rate = (sum(_recent_det_history) / max(1, len(_recent_det_history))
+                             if _recent_det_history else 0.0)
+                    feats = FrameFeatureExtractor.extract(
+                        gray_fb,
+                        temporal_noise=_base_noise,
+                        bortle=(observer_context or {}).get('bortle_class') if observer_context else None,
+                        exposure=exposure_time,
+                        recent_detection_rate=_rate)
+                    detector.params = hypernet.adapt(
+                        _hypernet_base_params, feats, PARAMETER_SAFETY_BOUNDS)
 
                 dbg_info = {} if debug_mode else None
                 det_trails = detector.detect_trails(
@@ -12586,6 +14463,45 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         # temporal_hits and tracklet metadata for downstream use.
         if detection_tracker is not None:
             detected_trails = detection_tracker.update(fc, detected_trails)
+
+            # I7b: attach sequence-head prediction when a tracklet has at
+            # least 3 frames of evidence.  Overrides trail_type only when
+            # the head is strongly confident (>= 0.85) and disagrees with
+            # the per-frame classifier — stable tracklets get to refine
+            # noisy single-frame labels (e.g. flicker → satellite).
+            if sequence_head is not None:
+                tracks_attr = (getattr(detection_tracker, '_tracklets', None)
+                               or getattr(detection_tracker, '_tracks', None))
+                if tracks_attr:
+                    tracks_by_id = {t['id']: t for t in tracks_attr}
+                    for i, (ttype, info) in enumerate(detected_trails):
+                        tid = info.get('tracklet_id')
+                        if tid is None or tid not in tracks_by_id:
+                            continue
+                        track = tracks_by_id[tid]
+                        if len(track['detections']) < 3:
+                            continue
+                        seq_infos = [d[2] for d in track['detections']]
+                        try:
+                            pred = sequence_head.predict(seq_infos)
+                        except Exception:
+                            pred = None
+                        if pred is None:
+                            continue
+                        cls_name, prob, dist = pred
+                        enriched = dict(info)
+                        enriched['sequence_class'] = cls_name
+                        enriched['sequence_class_prob'] = float(prob)
+                        enriched['sequence_class_dist'] = dist
+                        if prob >= 0.85 and cls_name in ('satellite', 'airplane') \
+                                and cls_name != ttype:
+                            detected_trails[i] = (cls_name, enriched)
+                        else:
+                            detected_trails[i] = (ttype, enriched)
+
+        # I3: update rolling detection rate (feeds HyperNet on next frame)
+        if hypernet is not None:
+            _recent_det_history.append(1 if detected_trails else 0)
 
         # ── Processing window update ──────────────────────────────────
         if proc_win is not None:
@@ -12789,6 +14705,125 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
     if dataset_exporter is not None:
         dataset_exporter.finalize()
 
+    # ── I7a: Tracklet pseudo-labeling ─────────────────────────────
+    # A tracklet with 3+ confirmed appearances across frames is near-
+    # certainly a true positive.  Auto-emit those into a sidecar
+    # annotation DB so downstream learning (rescue classifier, Platt
+    # calibrator, tracklet sequence head) has a labelled corpus to
+    # train from — with zero human effort.
+    if enable_pseudo_label and detection_tracker is not None:
+        pseudo_path = Path(output_path).with_suffix('.pseudo.json')
+        pseudo_db = AnnotationDatabase(pseudo_path if pseudo_path.exists() else None)
+        pseudo_db._path = pseudo_path
+        pseudo_db.start_session(str(input_path), sensitivity, algorithm,
+                                 detector.params, observer_context=observer_context,
+                                 loss_profile=loss_profile)
+        labeler = TrackletPseudoLabeler(pseudo_db, min_length=3)
+        n_labeled = labeler.emit_from_tracker(detection_tracker,
+                                               str(input_path), width, height)
+        pseudo_db.end_session(detector.params)
+        pseudo_db.save()
+        print(f"\nPseudo-labeling: {n_labeled} tracklet members auto-confirmed → {pseudo_path}")
+
+    # ── I1/I6c: Offline training of rescue classifier + Platt calibration ──
+    # Trains from the union of (a) this run's annotation DB, (b) the
+    # pseudo-label DB just emitted, (c) any prior annotation files next
+    # to the output.  Writes ~/.mnemosky/rescue.json for future runs.
+    if train_rescue:
+        print("\nTraining rescue classifier + confidence calibration…")
+        positives, negatives = [], []
+        # Gather from whatever annotation files exist alongside the output
+        candidate_jsons = []
+        out_dir = Path(output_path).parent
+        for p in out_dir.glob('*.json'):
+            if p.name.endswith('.pseudo.json') or p.stem == Path(output_path).stem:
+                candidate_jsons.append(p)
+        for jp in candidate_jsons:
+            try:
+                db = AnnotationDatabase(jp)
+                pos, neg = _build_training_corpus(db)
+                positives.extend(pos); negatives.extend(neg)
+            except Exception as e:
+                print(f"  [skip {jp.name}: {e}]")
+        print(f"  Training corpus: {len(positives)} positives, {len(negatives)} negatives")
+        rc = RescueClassifier()
+        if rc.fit_from_corpus(positives, negatives):
+            rc.save()
+            print(f"  Rescue classifier trained (saved to {rc.path})")
+            if rc.per_reason_threshold:
+                print(f"  Per-reason thresholds: {rc.per_reason_threshold}")
+        else:
+            print("  Rescue classifier: insufficient data (need ≥10 each class)")
+
+        # Platt calibration for confidence scores
+        cal_scores, cal_labels = [], []
+        for jp in candidate_jsons:
+            try:
+                db = AnnotationDatabase(jp)
+                for ann in db.data.get('annotations', []):
+                    ext = ann.get('mnemosky_ext', {})
+                    s = ext.get('confidence')
+                    if s is None:
+                        continue
+                    if ext.get('status') == 'confirmed':
+                        cal_scores.append(float(s)); cal_labels.append(1)
+                    elif ext.get('status') == 'rejected':
+                        cal_scores.append(float(s)); cal_labels.append(0)
+            except Exception:
+                pass
+        if len(cal_scores) >= 10:
+            pc = PlattCalibrator()
+            if pc.fit(cal_scores, cal_labels):
+                try:
+                    calib_path = Path.home() / '.mnemosky' / 'platt.json'
+                    calib_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(calib_path, 'w') as f:
+                        json.dump(pc.to_dict(), f)
+                    print(f"  Platt calibration: a={pc.a:.3f} b={pc.b:.3f} → {calib_path}")
+                except OSError:
+                    pass
+        else:
+            print(f"  Platt calibration: need ≥10 labeled scores (have {len(cal_scores)})")
+
+        # I7c: also train the algorithm fusion head when --fusion is on.
+        # Each annotation's detection_meta carries whichever detector(s)
+        # fired for it; we build (default, radon, nn) feature vectors
+        # with zeros for missing detectors and fit the logistic head.
+        if enable_fusion:
+            fh_X, fh_y = [], []
+            for jp in candidate_jsons:
+                try:
+                    db = AnnotationDatabase(jp)
+                    for ann in db.data.get('annotations', []):
+                        ext = ann.get('mnemosky_ext', {})
+                        if ext.get('status') not in ('confirmed', 'rejected'):
+                            continue
+                        meta = ext.get('detection_meta', {}) or {}
+                        default_det = ({'trail_snr': meta.get('trail_snr'),
+                                         'bbox': meta.get('bbox')}
+                                        if meta.get('trail_snr') else None)
+                        nn_det = ({'nn_confidence': meta.get('nn_confidence'),
+                                    'bbox': meta.get('bbox')}
+                                   if meta.get('nn_confidence') else None)
+                        if default_det is None and nn_det is None:
+                            continue
+                        feats = AlgorithmFusionHead.features_for(
+                            default_det, None, nn_det)
+                        fh_X.append(feats)
+                        fh_y.append(1 if ext['status'] == 'confirmed' else 0)
+                except Exception:
+                    pass
+            if len(fh_X) >= 10:
+                fh = AlgorithmFusionHead()
+                if fh.fit(np.asarray(fh_X, dtype=np.float32),
+                          np.asarray(fh_y, dtype=np.float32)):
+                    fh.save()
+                    print(f"  Fusion head: trained on {len(fh_X)} samples → {fh.path}")
+                else:
+                    print("  Fusion head: IRLS did not converge")
+            else:
+                print(f"  Fusion head: need ≥10 labeled samples (have {len(fh_X)})")
+
     # ── HITL Review Mode ──────────────────────────────────────────
     if review_mode or review_only:
         if annotations_path:
@@ -12805,7 +14840,9 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         param_adapter = None
         if not no_learn:
             param_adapter = ParameterAdapter(detector.params, PARAMETER_SAFETY_BOUNDS,
-                                              loss_profile=loss_profile)
+                                              loss_profile=loss_profile,
+                                              use_trust_region=use_trust_region,
+                                              tier2_optimizer=tier2_optimizer)
             if hitl_profile:
                 param_adapter.load_profile(hitl_profile)
 
@@ -13318,6 +15355,82 @@ Notes:
         help='Free-text observation notes (e.g. "4-inch Newtonian, partly cloudy")'
     )
 
+    # --- Next-Level Learning (v0.3.0) -----------------------------------
+    parser.add_argument(
+        '--tracker',
+        choices=['default', 'imm'],
+        default='default',
+        help='Temporal tracker: "default" (greedy linker), "imm" (Kalman '
+             'filter with LEO/MEO/GEO motion priors — handles crossing '
+             'trails and 1-3 frame gaps, attaches motion-class posterior).'
+    )
+
+    parser.add_argument(
+        '--long-bg',
+        action='store_true',
+        help='Enable long-horizon per-pixel background model alongside the '
+             '7-frame median. Recovers geosynchronous / slow-moving trails '
+             'that would otherwise subtract themselves from the short buffer.'
+    )
+
+    parser.add_argument(
+        '--hypernet',
+        action='store_true',
+        help='Enable per-frame adaptive detection thresholds via ThresholdHyperNet. '
+             'Loads a trained model from ~/.mnemosky/hypernet.json if present; '
+             'otherwise runs as zero-delta pass-through. Sequential-mode only.'
+    )
+
+    parser.add_argument(
+        '--pseudo-label',
+        action='store_true',
+        help='Emit 3+ frame tracklet members as auto-confirmed annotations '
+             'to <output>.pseudo.json after processing. Builds a training '
+             'corpus for the rescue classifier with zero human effort.'
+    )
+
+    parser.add_argument(
+        '--train-rescue',
+        action='store_true',
+        help='After processing, train the rescue classifier + Platt calibrator '
+             'from any annotation JSON files next to the output (including the '
+             'just-emitted pseudo-label DB). Saves to ~/.mnemosky/rescue.json '
+             'and ~/.mnemosky/platt.json for use on subsequent runs. When '
+             'combined with --fusion, also trains the algorithm fusion head '
+             'to ~/.mnemosky/fusion_head.json.'
+    )
+
+    parser.add_argument(
+        '--tier2-optimizer',
+        choices=['golden', 'tpe'],
+        default='golden',
+        help='Tier-2 batch learning optimizer used by HITL review: '
+             '"golden" (coordinate-wise golden-section search, default), '
+             '"tpe" (Tree-structured Parzen Estimator — joint-space BayesOpt, '
+             'better with ≥50 calibration samples).'
+    )
+
+    parser.add_argument(
+        '--use-trust-region',
+        action='store_true',
+        help='Wrap Tier-1 EMA updates with a trust-region adapter that '
+             'batches corrections and rejects updates that would regress '
+             'loss on the calibration set. More robust to mis-clicks during '
+             'HITL review at the cost of slower adaptation.'
+    )
+
+    parser.add_argument(
+        '--fusion',
+        action='store_true',
+        help='Enable the algorithm fusion head — a logistic-regression '
+             'classifier over (default, radon, nn) per-detector scores plus '
+             'cross-detector IoU. Attaches a calibrated fusion_score to each '
+             'detection_info. Only meaningful with --algorithm nn --nn-hybrid '
+             '(needs multiple detectors firing on the same frame). Loads '
+             '~/.mnemosky/fusion_head.json if present; otherwise degrades to '
+             'max-score fusion.'
+    )
+
     args = parser.parse_args()
 
     # Validate parameter ranges
@@ -13367,7 +15480,11 @@ Notes:
             'half_precision': nn_config.get('half_precision', False),
             'class_map': class_map,
             'hybrid_mode': args.nn_hybrid,
+            'fusion': args.fusion and args.nn_hybrid,
         }
+        if args.fusion and not args.nn_hybrid:
+            print("Warning: --fusion has no effect without --nn-hybrid "
+                  "(fusion needs classical + NN both firing). Ignoring.")
 
     # ── Save config if requested ─────────────────────────────────────
     if args.save_config:
@@ -13565,6 +15682,14 @@ Notes:
             enable_ledger=args.ledger,
             loss_profile=args.loss_profile,
             observer_context=_observer_context,
+            tracker_kind=args.tracker,
+            enable_long_bg=args.long_bg,
+            enable_hypernet=args.hypernet,
+            enable_pseudo_label=args.pseudo_label,
+            train_rescue=args.train_rescue,
+            tier2_optimizer=args.tier2_optimizer,
+            use_trust_region=args.use_trust_region,
+            enable_fusion=args.fusion,
         )
     finally:
         # Clean up temporary intermediate video from RAW conversion
