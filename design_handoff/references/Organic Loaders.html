@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>mnemozine · tracksuit · loaders</title>
+<style>
+  :root{
+    --tile: 280px;
+    --gap: 40px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    font-family: "Times New Roman", Times, serif;
+    color: #1a231b;
+    min-height: 100vh;
+    background:
+      radial-gradient(1400px 900px at 12% 18%, #e9f0df 0%, transparent 55%),
+      radial-gradient(1000px 800px at 88% 8%,  #d0dcbe 0%, transparent 60%),
+      radial-gradient(1200px 1000px at 68% 88%,#9aad86 0%, transparent 60%),
+      radial-gradient(900px 700px at 8% 92%,   #b7c5a1 0%, transparent 55%),
+      linear-gradient(180deg, #aec099 0%, #7c9270 100%);
+    background-attachment: fixed;
+    filter: saturate(1.03);
+  }
+  body::before{
+    content:"";
+    position: fixed; inset:0;
+    pointer-events:none; z-index:0;
+    background:
+      radial-gradient(220px 220px at 10% 28%, rgba(255,255,255,.58), transparent 70%),
+      radial-gradient(170px 170px at 22% 80%, rgba(255,255,255,.48), transparent 70%),
+      radial-gradient(260px 260px at 80% 22%, rgba(255,255,255,.38), transparent 70%),
+      radial-gradient(200px 200px at 90% 72%, rgba(255,255,255,.42), transparent 70%),
+      radial-gradient(120px 120px at 50% 52%, rgba(255,255,255,.30), transparent 70%);
+    filter: blur(26px);
+  }
+
+  header, footer{
+    position: relative; z-index: 2;
+    max-width: calc((var(--tile) + var(--gap)) * 2 + 120px);
+    margin: 0 auto;
+    padding: 64px 40px 10px;
+    display:flex; align-items:baseline; justify-content: space-between;
+  }
+  header .wordmark{
+    font-family: "Times New Roman", serif;
+    font-style: italic;
+    font-size: 38px;
+    color: #1a271d;
+    text-shadow: 0 1px 0 rgba(255,255,255,.35);
+  }
+  header .meta, footer .meta{
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    letter-spacing: .22em;
+    text-transform: uppercase;
+    color: #243428;
+    opacity:.78;
+  }
+  footer{
+    padding: 24px 40px 56px;
+  }
+
+  .grid{
+    position: relative; z-index: 2;
+    max-width: calc((var(--tile) + var(--gap)) * 2 + 120px);
+    margin: 16px auto 0;
+    padding: 24px 40px 40px;
+    display:grid;
+    grid-template-columns: repeat(auto-fill, var(--tile));
+    gap: var(--gap);
+    justify-content: center;
+  }
+
+  .tile{
+    width: var(--tile);
+    display: flex; flex-direction: column; align-items: center; gap: 14px;
+  }
+  .stage{
+    width: var(--tile); height: var(--tile);
+    position: relative;
+    border-radius: 18px;
+    overflow: hidden;
+    isolation: isolate;
+    box-shadow:
+      inset 0 0 0 1px rgba(255,255,255,.22),
+      0 16px 40px -22px rgba(0,0,0,.38);
+    /* subtle inner bokeh so each tile feels like a window into the same atmosphere */
+    background:
+      radial-gradient(120% 90% at 20% 25%, rgba(255,255,255,.18), transparent 55%),
+      radial-gradient(140% 110% at 80% 85%, rgba(60,84,52,.18), transparent 55%),
+      linear-gradient(180deg, rgba(255,255,255,.04), rgba(0,0,0,.05));
+  }
+  .stage svg{ width:100%; height:100%; display:block; }
+
+  /* global speed knob for the meditative default and the hover-to-speed-up */
+  .stage{ --speed: 1; }              /* 1 = slow meditative */
+  .stage:hover{ --speed: 2.6; }      /* hover = lively */
+  .stage, .stage *{ transition: animation-duration .4s ease; }
+
+  .caption{
+    display: flex; align-items: center; justify-content: space-between;
+    width: 100%;
+    padding: 0 4px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 10.5px;
+    letter-spacing: .22em;
+    text-transform: uppercase;
+    color: #1c2a1f;
+    opacity: .82;
+  }
+  .caption .name{
+    letter-spacing: .24em;
+  }
+  .caption .tag{
+    display: inline-flex; align-items: center; gap: 8px;
+    color: #28382b;
+    opacity: .75;
+  }
+  .caption .dot{
+    width: 6px; height: 6px; border-radius: 50%;
+    background: #2b3a2d;
+    box-shadow: 0 0 0 3px rgba(255,255,255,.25);
+  }
+
+  /* ---------- loader-specific keyframes ---------- */
+  /* All durations multiply by 1/var(--speed) via the local CSS vars below */
+
+  /* trefoil */
+  @keyframes tref_0 { 0%,100%{transform:translate(0,0) scale(1)} 50%{transform:translate(0,56px) scale(.5)} }
+  @keyframes tref_1 { 0%,100%{transform:translate(0,0) scale(1)} 50%{transform:translate(50px,-28px) scale(.5)} }
+  @keyframes tref_2 { 0%,100%{transform:translate(0,0) scale(1)} 50%{transform:translate(-50px,-28px) scale(.5)} }
+  @keyframes breathe { 0%,100%{transform:scale(.92)} 50%{transform:scale(1.06)} }
+
+  /* gather */
+  @keyframes gather_A { 0%,100%{transform:translate(-60px,-44px) scale(.85)} 46%,54%{transform:translate(0,0) scale(1)} }
+  @keyframes gather_B { 0%,100%{transform:translate(58px,-46px) scale(.82)} 46%,54%{transform:translate(0,0) scale(1)} }
+  @keyframes gather_C { 0%,100%{transform:translate(-48px,52px) scale(.86)} 46%,54%{transform:translate(0,0) scale(1)} }
+  @keyframes gather_D { 0%,100%{transform:translate(50px,48px) scale(.78)} 46%,54%{transform:translate(0,0) scale(1)} }
+  @keyframes gather_core { 0%,100%{transform:scale(.9)} 50%{transform:scale(1.12)} }
+
+  /* drip */
+  @keyframes drip {
+    0%   { transform: translateY(-16px) scaleY(.9); opacity: 0; }
+    12%  { opacity: 1; }
+    60%  { transform: translateY(120px) scaleY(1.25); }
+    86%  { transform: translateY(172px) scaleY(.85); }
+    100% { transform: translateY(190px) scaleY(.6); opacity: 0; }
+  }
+  @keyframes drip_neck { 0%,100%{transform:scaleY(.85) scaleX(1.05)} 50%{transform:scaleY(1.25) scaleX(.88)} }
+  @keyframes drip_pool { 0%,100%{transform:scale(1,1)} 50%{transform:scale(1.06,.85)} }
+
+  /* eye */
+  @keyframes eye_iris { 0%,100%{transform:translateX(-50px) scale(.88)} 50%{transform:translateX(50px) scale(1.06)} }
+  @keyframes eye_s0   { 0%,100%{transform:translate(-86px,-10px) scale(.3); opacity:.0} 20%{opacity:1} 50%{transform:translate(0,0) scale(1); opacity:1} 80%{opacity:1} }
+  @keyframes eye_s1   { 0%,100%{transform:translate(84px,14px) scale(.3); opacity:.0}  20%{opacity:1} 50%{transform:translate(0,0) scale(1); opacity:1} 80%{opacity:1} }
+  @keyframes eye_s2   { 0%,100%{transform:translate(10px,-30px) scale(.2); opacity:.0} 20%{opacity:1} 50%{transform:translate(0,0) scale(1); opacity:1} 80%{opacity:1} }
+
+  /* slowed master tempo — use CSS variables so hover can retarget */
+  .stage .anim{
+    animation-duration: calc(var(--dur, 3s) / var(--speed));
+    animation-timing-function: cubic-bezier(.5,.0,.5,1);
+    animation-iteration-count: infinite;
+  }
+</style>
+</head>
+<body>
+
+<!-- ======== shared SVG defs: warmer mercury + green reflections + goo ======== -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <!-- Warmer mercury — slight green highlight, warm midtones, deep base -->
+    <radialGradient id="merc" cx="38%" cy="28%" r="85%">
+      <stop offset="0%"   stop-color="#fbfdf6"/>
+      <stop offset="14%"  stop-color="#e9efdf"/>
+      <stop offset="34%"  stop-color="#a9b8a2"/>
+      <stop offset="58%"  stop-color="#5b6a5a"/>
+      <stop offset="82%"  stop-color="#2e3830"/>
+      <stop offset="100%" stop-color="#141a16"/>
+    </radialGradient>
+    <radialGradient id="mercB" cx="68%" cy="72%" r="90%">
+      <stop offset="0%"   stop-color="#f4f7ec"/>
+      <stop offset="18%"  stop-color="#c9d3ba"/>
+      <stop offset="46%"  stop-color="#6f7e69"/>
+      <stop offset="74%"  stop-color="#333e34"/>
+      <stop offset="100%" stop-color="#111614"/>
+    </radialGradient>
+    <linearGradient id="mercStripe" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"   stop-color="#eef2e3"/>
+      <stop offset="26%"  stop-color="#8a9881"/>
+      <stop offset="52%"  stop-color="#24302a"/>
+      <stop offset="72%"  stop-color="#7e8d78"/>
+      <stop offset="100%" stop-color="#121815"/>
+    </linearGradient>
+
+    <!-- gooey filter (standard) -->
+    <filter id="goo">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="7"/>
+      <feColorMatrix values="
+        1 0 0 0 0
+        0 1 0 0 0
+        0 0 1 0 0
+        0 0 0 22 -11"/>
+      <feComposite in="SourceGraphic" operator="atop"/>
+    </filter>
+    <filter id="gooStrong">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="10"/>
+      <feColorMatrix values="
+        1 0 0 0 0
+        0 1 0 0 0
+        0 0 1 0 0
+        0 0 0 26 -13"/>
+      <feComposite in="SourceGraphic" operator="atop"/>
+    </filter>
+    <filter id="gooSoft">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="5"/>
+      <feColorMatrix values="
+        1 0 0 0 0
+        0 1 0 0 0
+        0 0 1 0 0
+        0 0 0 20 -10"/>
+      <feComposite in="SourceGraphic" operator="atop"/>
+    </filter>
+
+    <!-- subtle green "world reflection" overlay applied on top of each blob,
+         multiplied in so it tints only the highlights -->
+    <radialGradient id="worldTint" cx="30%" cy="20%" r="90%">
+      <stop offset="0%"   stop-color="#dff0c6" stop-opacity=".55"/>
+      <stop offset="45%"  stop-color="#a9c48f" stop-opacity=".18"/>
+      <stop offset="100%" stop-color="#3a4e36" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+</svg>
+
+<header>
+  <div class="wordmark">mnemozine</div>
+  <div class="meta">tracksuit &nbsp;/&nbsp; loading &nbsp;·&nbsp; v.02</div>
+</header>
+
+<section class="grid" id="grid"></section>
+
+<footer>
+  <span class="meta">mnemozine · tracksuit</span>
+  <span class="meta">280 × 280 · indeterminate · hover to speed up</span>
+</footer>
+
+<script>
+const svgNS = "http://www.w3.org/2000/svg";
+const grid = document.getElementById('grid');
+
+function tileEl(name, builder){
+  const wrap = document.createElement('div');
+  wrap.className = 'tile';
+  const stage = document.createElement('div');
+  stage.className = 'stage';
+  const svg = document.createElementNS(svgNS,'svg');
+  svg.setAttribute('viewBox','0 0 280 280');
+  svg.setAttribute('preserveAspectRatio','xMidYMid meet');
+  builder(svg);
+  stage.appendChild(svg);
+  wrap.appendChild(stage);
+  const cap = document.createElement('div');
+  cap.className = 'caption';
+  cap.innerHTML = `<span class="name">${name}</span><span class="tag"><span class="dot"></span>tracksuit</span>`;
+  wrap.appendChild(cap);
+  grid.appendChild(wrap);
+  return svg;
+}
+function circle(svg, cx, cy, r, attrs = {}){
+  const c = document.createElementNS(svgNS,'circle');
+  c.setAttribute('cx',cx); c.setAttribute('cy',cy); c.setAttribute('r',r);
+  Object.entries(attrs).forEach(([k,v])=>c.setAttribute(k,v));
+  svg.appendChild(c); return c;
+}
+function ellipse(svg, cx, cy, rx, ry, attrs={}){
+  const e = document.createElementNS(svgNS,'ellipse');
+  e.setAttribute('cx',cx); e.setAttribute('cy',cy); e.setAttribute('rx',rx); e.setAttribute('ry',ry);
+  Object.entries(attrs).forEach(([k,v])=>e.setAttribute(k,v));
+  svg.appendChild(e); return e;
+}
+function group(parent, attrs={}){
+  const g = document.createElementNS(svgNS,'g');
+  Object.entries(attrs).forEach(([k,v])=>g.setAttribute(k,v));
+  parent.appendChild(g); return g;
+}
+/* apply one of our predeclared .anim classes with a given keyframe + duration */
+function anim(el, name, dur, delay=0, extraTransformOrigin){
+  el.classList.add('anim');
+  el.style.animationName = name;
+  el.style.setProperty('--dur', dur+'s');
+  el.style.animationDelay = delay+'s';
+  if (extraTransformOrigin) el.style.transformOrigin = extraTransformOrigin;
+}
+/* overlay a subtle green-world reflection onto a shape — done by adding a second shape with worldTint fill */
+function tintOverlay(svg, shapeMaker){
+  const s = shapeMaker();
+  s.setAttribute('fill','url(#worldTint)');
+  s.style.mixBlendMode = 'screen';
+  s.style.pointerEvents = 'none';
+  svg.appendChild(s);
+  return s;
+}
+
+/* ================ the 4 loaders (280x280) ================ */
+
+/* TREFOIL — three blobs collapsing into a point and re-emerging */
+tileEl('trefoil', (svg)=>{
+  const g = group(svg,{filter:'url(#gooStrong)'});
+  const R = 56;                 // distance from center
+  const center = [140,140];
+  const pts = [
+    [center[0],             center[1] + R],      // bottom
+    [center[0] + R*0.866,   center[1] - R*0.5],  // top-right
+    [center[0] - R*0.866,   center[1] - R*0.5],  // top-left
+  ];
+  const colors = ['url(#merc)','url(#mercB)','url(#merc)'];
+  const keys = ['tref_0','tref_1','tref_2'];
+  pts.forEach(([x,y],i)=>{
+    const c = circle(g,x,y,36,{fill:colors[i]});
+    anim(c, keys[i], 5.2, -i*0.35, `${x}px ${y}px`);
+  });
+  // soft green world-reflection over the whole cluster
+  const t = document.createElementNS(svgNS,'circle');
+  t.setAttribute('cx',140); t.setAttribute('cy',140); t.setAttribute('r',92);
+  t.setAttribute('fill','url(#worldTint)');
+  t.style.mixBlendMode = 'screen';
+  t.style.pointerEvents='none';
+  svg.appendChild(t);
+});
+
+/* EYE — horizontal lozenge with iris moving, three merging satellites */
+tileEl('eye', (svg)=>{
+  const g = group(svg,{filter:'url(#goo)'});
+  // the body "eyelid" ellipse
+  ellipse(g,140,140, 104, 46, {fill:'url(#merc)'});
+  // iris
+  const iris = circle(g,140,140,26,{fill:'url(#mercB)'});
+  anim(iris,'eye_iris', 6.0, 0, '140px 140px');
+  // three incoming satellites that converge into iris
+  const s0 = circle(g,140,140,14,{fill:'url(#mercB)'});
+  const s1 = circle(g,140,140,12,{fill:'url(#mercB)'});
+  const s2 = circle(g,140,140,10,{fill:'url(#mercB)'});
+  anim(s0,'eye_s0',6.0, -1.8, '140px 140px');
+  anim(s1,'eye_s1',6.0, -3.6, '140px 140px');
+  anim(s2,'eye_s2',6.0, -0.6, '140px 140px');
+  // green reflection on top of the eye — gives the chrome its world-tint
+  const tint = document.createElementNS(svgNS,'ellipse');
+  tint.setAttribute('cx',140); tint.setAttribute('cy',128); tint.setAttribute('rx',98); tint.setAttribute('ry',38);
+  tint.setAttribute('fill','url(#worldTint)');
+  tint.style.mixBlendMode='screen';
+  tint.style.pointerEvents='none';
+  svg.appendChild(tint);
+});
+
+/* GATHER — 4 satellites orbit out then gather + merge into a breathing core */
+tileEl('gather', (svg)=>{
+  const g = group(svg,{filter:'url(#gooStrong)'});
+  // breathing core
+  const core = circle(g,140,140,28,{fill:'url(#merc)'});
+  anim(core,'gather_core',5.2,0,'140px 140px');
+  // satellites
+  const defs = [
+    { r: 24, fill:'url(#mercB)', key:'gather_A' },
+    { r: 22, fill:'url(#merc)',  key:'gather_B' },
+    { r: 23, fill:'url(#mercB)', key:'gather_C' },
+    { r: 20, fill:'url(#merc)',  key:'gather_D' },
+  ];
+  defs.forEach((d,i)=>{
+    const c = circle(g,140,140,d.r,{fill:d.fill});
+    anim(c, d.key, 5.2, -i*0.18, '140px 140px');
+  });
+  const tint = document.createElementNS(svgNS,'circle');
+  tint.setAttribute('cx',140); tint.setAttribute('cy',140); tint.setAttribute('r',92);
+  tint.setAttribute('fill','url(#worldTint)');
+  tint.style.mixBlendMode='screen';
+  tint.style.pointerEvents='none';
+  svg.appendChild(tint);
+});
+
+/* DRIP — top reservoir with a pulsing neck; beads form, fall, merge into the pool */
+tileEl('drip', (svg)=>{
+  const g = group(svg,{filter:'url(#goo)'});
+  // top reservoir
+  ellipse(g,140,56, 56, 22, {fill:'url(#merc)'});
+  // neck (pulsing ellipse)
+  const neck = ellipse(g,140,92,12,34,{fill:'url(#mercB)'});
+  anim(neck,'drip_neck',5.2,0,'140px 80px');
+  // falling drops (staggered)
+  for(let i=0;i<3;i++){
+    const d = circle(g,140,92,16,{fill:'url(#mercB)'});
+    anim(d,'drip',5.2, -i*1.7, '140px 92px');
+  }
+  // pool at bottom (pulsing on impact)
+  const pool = ellipse(g,140,232,70,18,{fill:'url(#merc)'});
+  anim(pool,'drip_pool',5.2,-0.2,'140px 232px');
+
+  // world tint — a vertical band that catches the green
+  const tint = document.createElementNS(svgNS,'rect');
+  tint.setAttribute('x',60); tint.setAttribute('y',30);
+  tint.setAttribute('width',160); tint.setAttribute('height',220);
+  tint.setAttribute('fill','url(#worldTint)');
+  tint.style.mixBlendMode='screen';
+  tint.style.pointerEvents='none';
+  svg.appendChild(tint);
+});
+</script>
+
+</body>
+</html>

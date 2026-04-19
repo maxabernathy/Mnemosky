@@ -1,0 +1,790 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>mnemosky — ui audit & master concept</title>
+<style>
+  :root{
+    --bg: #12110f;
+    --panel: #1a1916;
+    --panel-2: #221f1a;
+    --ink: #e9ead9;
+    --ink-2: #9aa088;
+    --line: #2b2924;
+    --mint: #9fe7c2;   /* a warmer, less acid take on the current #50FFC8 */
+    --merc: #c9d3ba;   /* warm mercury */
+    --gold: #d7b877;
+    --orange: #d98e5a;
+    --magenta: #c98fb6;
+    --grass: #7c9270;
+    --grass-soft: #aec099;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--ink)}
+  body{
+    font-family: "Times New Roman", Times, serif;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap{ max-width: 1080px; margin: 0 auto; padding: 80px 56px 120px }
+
+  /* ----- typography ----- */
+  .wordmark{
+    font-family: "Times New Roman", serif;
+    font-style: italic;
+    font-size: 52px;
+    color: #f1efe0;
+    letter-spacing: .005em;
+    line-height: 1;
+    margin: 0 0 8px;
+  }
+  .eyebrow, .mono{
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    letter-spacing: .28em;
+    text-transform: uppercase;
+    color: var(--ink-2);
+  }
+  h2{
+    font-family: "Times New Roman", serif;
+    font-style: italic;
+    font-size: 32px;
+    font-weight: 400;
+    color: #f1efe0;
+    margin: 72px 0 6px;
+    letter-spacing: .005em;
+  }
+  h3{
+    font-family: "Times New Roman", serif;
+    font-style: italic;
+    font-size: 22px;
+    font-weight: 400;
+    color: #e9ead9;
+    margin: 28px 0 8px;
+  }
+  p{ max-width: 72ch; color: #d9dac8 }
+  p.lede{ font-size: 19px; line-height: 1.55; color: #eceadc; max-width: 68ch }
+
+  a{ color: var(--mint); text-decoration: none; border-bottom: 1px solid rgba(159,231,194,.25) }
+
+  .rule{
+    height: 1px; background: var(--line);
+    margin: 18px 0;
+  }
+  .section-head{
+    display:flex; align-items:baseline; justify-content: space-between;
+    gap: 24px;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 18px;
+    margin-bottom: 22px;
+  }
+  .section-head .n{
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    letter-spacing: .28em;
+    color: var(--mint);
+  }
+
+  /* ----- hero ----- */
+  .hero{
+    position: relative;
+    padding: 64px 56px 56px;
+    margin: 0 -56px 8px;
+    border-radius: 18px;
+    overflow: hidden;
+    isolation: isolate;
+    background:
+      radial-gradient(800px 500px at 80% -10%, rgba(159,231,194,.08), transparent 60%),
+      radial-gradient(600px 400px at -5% 120%, rgba(124,146,112,.12), transparent 60%),
+      linear-gradient(180deg, #14130f, #19170f);
+    border: 1px solid var(--line);
+  }
+  .hero .meta-row{
+    display:flex; gap: 24px; flex-wrap: wrap;
+    margin-top: 18px;
+  }
+  .hero .meta-row span{
+    color: var(--ink-2);
+  }
+
+  /* ----- grids, cards ----- */
+  .grid{ display:grid; gap: 18px; }
+  .grid.c2{ grid-template-columns: 1fr 1fr }
+  .grid.c3{ grid-template-columns: repeat(3, 1fr) }
+
+  .card{
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 22px 22px 20px;
+  }
+  .card .label{
+    font-family: ui-monospace, monospace;
+    font-size: 10.5px;
+    letter-spacing: .22em;
+    text-transform: uppercase;
+    color: var(--ink-2);
+    margin-bottom: 8px;
+  }
+  .card h4{
+    font-family: "Times New Roman", serif;
+    font-style: italic;
+    font-weight: 400;
+    font-size: 20px;
+    margin: 0 0 10px;
+    color: #f1efe0;
+  }
+  .card p{ margin: 0; font-size: 15.5px; }
+
+  .pill{
+    display:inline-flex; align-items:center; gap: 8px;
+    padding: 4px 10px;
+    font-family: ui-monospace, monospace;
+    font-size: 10px;
+    letter-spacing: .2em;
+    text-transform: uppercase;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    color: var(--ink-2);
+  }
+  .pill.keep{ color: var(--mint); border-color: rgba(159,231,194,.35) }
+  .pill.evolve{ color: var(--gold); border-color: rgba(215,184,119,.35) }
+  .pill.retire{ color: var(--magenta); border-color: rgba(201,143,182,.35) }
+  .pill.new{ color: var(--merc); border-color: rgba(201,211,186,.35) }
+
+  .kv{
+    display:grid; grid-template-columns: 160px 1fr;
+    gap: 6px 18px;
+    font-family: ui-monospace, monospace;
+    font-size: 12.5px;
+    color: #d9dac8;
+  }
+  .kv .k{ color: var(--ink-2); letter-spacing: .08em }
+
+  /* ----- palette row ----- */
+  .swatches{
+    display:grid; grid-template-columns: repeat(6, 1fr); gap: 10px;
+  }
+  .sw{
+    border-radius: 10px; padding: 16px 14px 14px;
+    height: 96px;
+    display:flex; flex-direction:column; justify-content: space-between;
+    color: #0c0b09;
+    font-family: ui-monospace, monospace;
+    font-size: 10.5px;
+    letter-spacing: .12em;
+    border: 1px solid rgba(255,255,255,.06);
+  }
+  .sw .name{ text-transform: uppercase; letter-spacing: .22em; }
+  .sw .hex{ opacity: .75 }
+  .sw.dark{ color: #e9ead9 }
+
+  /* ----- wireframe mock ----- */
+  .mock{
+    background: #0f0e0c;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 18px;
+  }
+  .app{
+    position: relative;
+    aspect-ratio: 16 / 10;
+    width: 100%;
+    background:
+      radial-gradient(70% 60% at 20% 10%, rgba(124,146,112,.12), transparent 60%),
+      linear-gradient(180deg, #16140f, #11100c);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+    display: grid;
+    grid-template-columns: 72px 1fr 320px;
+    grid-template-rows: 40px 1fr 36px;
+    font-family: ui-monospace, monospace;
+    font-size: 10.5px;
+    color: var(--ink-2);
+  }
+  .app > div{ border-right: 1px solid var(--line); border-bottom: 1px solid var(--line) }
+  .app .topbar{
+    grid-column: 1 / -1;
+    display:flex; align-items:center; gap: 18px;
+    padding: 0 16px;
+    letter-spacing: .22em;
+    color: #b8bca7;
+    background: linear-gradient(180deg, rgba(255,255,255,.03), transparent);
+  }
+  .app .topbar .brand{
+    font-family: "Times New Roman", serif;
+    font-style: italic;
+    font-size: 16px;
+    letter-spacing: .005em;
+    text-transform: none;
+    color: #f1efe0;
+  }
+  .app .topbar .mode{ color: var(--mint); letter-spacing: .3em }
+  .app .topbar .obs{ margin-left:auto; color: #9aa088 }
+
+  .app .rail{
+    display:flex; flex-direction:column; align-items:center;
+    padding: 14px 0; gap: 16px;
+    color: #8c907d;
+  }
+  .app .rail .ico{
+    width: 28px; height: 28px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    display:grid; place-items:center;
+    color: #b8bca7;
+  }
+  .app .rail .ico.active{
+    color: #0f0e0c;
+    background: var(--mint);
+    border-color: var(--mint);
+  }
+
+  .app .canvas{
+    position: relative;
+    background:
+      radial-gradient(40% 50% at 70% 30%, rgba(215,184,119,.10), transparent 70%),
+      linear-gradient(180deg, #0c0b09, #100e0b);
+    overflow: hidden;
+  }
+  .app .canvas .frame{
+    position: absolute; inset: 24px;
+    border: 1px dashed var(--line);
+    border-radius: 6px;
+  }
+  .app .canvas .bbox{
+    position: absolute;
+    border: 1.5px solid var(--gold);
+    border-radius: 2px;
+    box-shadow: 0 0 0 1px rgba(215,184,119,.18), 0 0 18px rgba(215,184,119,.14);
+  }
+  .app .canvas .bbox.plane{ border-color: var(--orange); box-shadow: 0 0 0 1px rgba(217,142,90,.2), 0 0 18px rgba(217,142,90,.14) }
+  .app .canvas .bbox .tag{
+    position:absolute; top:-18px; left:0;
+    font-size: 9.5px; letter-spacing: .22em; text-transform:uppercase;
+    color: var(--gold);
+  }
+  .app .canvas .bbox.plane .tag{ color: var(--orange) }
+
+  .app .canvas .star{
+    position:absolute; width: 2px; height: 2px; border-radius: 50%;
+    background: rgba(233,234,217,.55);
+    box-shadow: 0 0 6px rgba(233,234,217,.3);
+  }
+
+  .app .side{
+    display:flex; flex-direction: column;
+    padding: 16px 16px 12px;
+    gap: 14px;
+    background: linear-gradient(180deg, #151310, #12110e);
+    color: var(--ink-2);
+  }
+  .app .side .head{ color: #d9dac8; letter-spacing: .24em; }
+  .app .side .block{
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px 12px;
+    background: #141310;
+  }
+  .app .side .block h5{
+    margin:0 0 6px;
+    font-family: "Times New Roman", serif;
+    font-style: italic;
+    font-weight: 400;
+    font-size: 15px;
+    color: #f1efe0;
+    letter-spacing: 0;
+    text-transform: none;
+  }
+  .app .side .kv2{
+    display:grid; grid-template-columns: 78px 1fr;
+    gap: 2px 10px;
+    font-size: 10.5px;
+  }
+  .app .side .bar{
+    height: 6px; border-radius: 4px; background: #211e18;
+    overflow: hidden; position:relative;
+  }
+  .app .side .bar::after{
+    content:""; position:absolute; inset:0 40% 0 0;
+    background: linear-gradient(90deg, var(--mint), #c9d3ba);
+    border-radius: 4px;
+  }
+  .app .side .keys{
+    display:flex; flex-wrap:wrap; gap: 6px;
+  }
+  .app .side .key{
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 9.5px;
+    color: #c8ccb7;
+  }
+
+  .app .status{
+    grid-column: 1 / -1;
+    border-right: none;
+    display:flex; align-items:center; gap: 18px;
+    padding: 0 16px;
+    letter-spacing: .22em;
+  }
+  .app .status .dot{
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--mint);
+    box-shadow: 0 0 0 3px rgba(159,231,194,.15);
+  }
+  .app .status .right{ margin-left: auto; color: #8c907d }
+
+  /* ----- loader preview strip ----- */
+  .strip{
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px;
+    margin-top: 18px;
+  }
+  .tile{
+    aspect-ratio: 1/1;
+    border-radius: 12px;
+    background:
+      radial-gradient(1400px 900px at 12% 18%, rgba(233,240,223,.12) 0%, transparent 55%),
+      radial-gradient(900px 700px at 88% 8%, rgba(208,220,190,.14) 0%, transparent 60%),
+      linear-gradient(180deg, rgba(174,192,153,.35) 0%, rgba(124,146,112,.55) 100%);
+    border: 1px solid var(--line);
+    display:flex; align-items:center; justify-content:center;
+    color: #eef2e3;
+    font-family: "Times New Roman", serif; font-style: italic; font-size: 20px;
+    letter-spacing: .01em;
+  }
+
+  /* footer */
+  footer{
+    border-top: 1px solid var(--line);
+    margin-top: 64px; padding-top: 24px;
+    display:flex; justify-content: space-between;
+    color: var(--ink-2);
+  }
+
+  /* decorative chrome blobs illustration (hero) */
+  .hero-art{
+    position:absolute; right: 32px; top: 38px; width: 180px; height: 180px;
+    opacity: .9;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+<!-- ============================= HERO ============================= -->
+<section class="hero">
+  <div class="eyebrow">mnemozine · tracksuit · ui audit</div>
+  <h1 class="wordmark">mnemosky</h1>
+  <p class="lede">An audit of the current UI surfaces and a proposal for a unifying master concept — a coherent shell that makes Mnemosky feel less like three good OpenCV utilities bolted together and more like one instrument for situated observation.</p>
+  <div class="meta-row mono">
+    <span>v0.2.0-sts · foundation for v0.3.0</span>
+    <span>single-file python · opencv · numpy</span>
+    <span>reviewed 2026-04-19</span>
+  </div>
+
+  <!-- small decorative chrome blob -->
+  <svg class="hero-art" viewBox="0 0 200 200" aria-hidden="true">
+    <defs>
+      <radialGradient id="h_merc" cx="38%" cy="28%" r="85%">
+        <stop offset="0%" stop-color="#fbfdf6"/>
+        <stop offset="14%" stop-color="#e9efdf"/>
+        <stop offset="34%" stop-color="#a9b8a2"/>
+        <stop offset="58%" stop-color="#5b6a5a"/>
+        <stop offset="82%" stop-color="#2e3830"/>
+        <stop offset="100%" stop-color="#141a16"/>
+      </radialGradient>
+      <filter id="h_goo">
+        <feGaussianBlur in="SourceGraphic" stdDeviation="6"/>
+        <feColorMatrix values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 22 -11"/>
+        <feComposite in="SourceGraphic" operator="atop"/>
+      </filter>
+    </defs>
+    <g filter="url(#h_goo)">
+      <circle cx="100" cy="100" r="30" fill="url(#h_merc)"/>
+      <circle cx="60"  cy="70"  r="18" fill="url(#h_merc)"/>
+      <circle cx="140" cy="70"  r="16" fill="url(#h_merc)"/>
+      <circle cx="150" cy="140" r="14" fill="url(#h_merc)"/>
+      <circle cx="60"  cy="140" r="14" fill="url(#h_merc)"/>
+    </g>
+  </svg>
+</section>
+
+<!-- ============================= 01 AUDIT ============================= -->
+<h2>01 &nbsp; audit of the current surfaces</h2>
+<div class="section-head">
+  <span class="eyebrow">five opencv windows, one theme, no shell</span>
+  <span class="n">01 / 04</span>
+</div>
+
+<p class="lede">Mnemosky currently ships five distinct UI surfaces, each well-made on its own, but without a shared shell or wayfinding. A user processing a video will move between the preprocessing preview, the processing dashboard, the review UI, and the debug view — four different mental models in one run.</p>
+
+<div class="grid c2" style="margin-top: 22px">
+
+  <div class="card">
+    <div class="label">surface · 01</div>
+    <h4>Preview windows (× 3)</h4>
+    <p>One per algorithm: <span class="mono">--preview</span> (Canny/Hough), <span class="mono">show_radon_preview</span>, <span class="mono">show_nn_preview</span>. Custom-drawn sliders, click-to-mark-trail, single-window layout.</p>
+    <div class="rule"></div>
+    <div class="kv">
+      <span class="k">strength</span><span>Dense, algorithm-specific, immediate feedback.</span>
+      <span class="k">friction</span><span>Three separate windows with overlapping vocabulary.</span>
+      <span class="k">verdict</span><span><span class="pill evolve">evolve</span> unify as Tuning mode with algorithm tabs.</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="label">surface · 02</div>
+    <h4>Processing dashboard</h4>
+    <p><span class="mono">ProcessingWindow</span> — LIVE FRAME · TRAIL MAP · DETECTION TIMELINE · STATUS BAR. Throttled ≈20fps, redraws immediately on detections.</p>
+    <div class="rule"></div>
+    <div class="kv">
+      <span class="k">strength</span><span>Quadrant layout is legible; detection pulse is satisfying.</span>
+      <span class="k">friction</span><span>Isolated from review — no way to pin a moment for later.</span>
+      <span class="k">verdict</span><span><span class="pill keep">keep</span> becomes the default Observe mode.</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="label">surface · 03</div>
+    <h4>Review UI</h4>
+    <p>Main frame + 280 px sidebar + 56 px status bar. Keyboard-driven (A/R/S/P/M/Z/L/Tab/Space/X/F/H/Q). HITL corrections feed Tier 1 + Tier 2 learners.</p>
+    <div class="rule"></div>
+    <div class="kv">
+      <span class="k">strength</span><span>Keyboard rhythm is the best part of the app.</span>
+      <span class="k">friction</span><span>The shortcut vocabulary doesn't transfer to the previews.</span>
+      <span class="k">verdict</span><span><span class="pill keep">keep</span> promote shortcuts to global grammar.</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="label">surface · 04</div>
+    <h4>Debug view</h4>
+    <p><span class="mono">--debug</span> / <span class="mono">--debug-only</span> — side-by-side preprocessing, masks, classifications.</p>
+    <div class="rule"></div>
+    <div class="kv">
+      <span class="k">strength</span><span>Essential for tuning; the ledger surfaces <em>why</em>.</span>
+      <span class="k">friction</span><span>Separate window, no link to the detection it explains.</span>
+      <span class="k">verdict</span><span><span class="pill evolve">evolve</span> becomes an inline "inspect" panel on any frame.</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="label">surface · 05</div>
+    <h4>Translation Ledger printout</h4>
+    <p>End-of-run rejection audit (14 types across pipeline stages). Currently text-only in stdout + JSONL sidecar.</p>
+    <div class="rule"></div>
+    <div class="kv">
+      <span class="k">strength</span><span>The STS-ness of Mnemosky lives here — its philosophical spine.</span>
+      <span class="k">friction</span><span>It is invisible to anyone who isn't reading stdout.</span>
+      <span class="k">verdict</span><span><span class="pill new">promote</span> make it a first-class surface, not a footnote.</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="label">surface · 06</div>
+    <h4>Config &amp; learned params</h4>
+    <p><span class="mono">~/.mnemosky/config.json</span>, <span class="mono">learned_params.json</span>, <span class="mono">rescue.json</span>, <span class="mono">platt.json</span>, <span class="mono">fusion_head.json</span>, <span class="mono">hypernet.json</span>.</p>
+    <div class="rule"></div>
+    <div class="kv">
+      <span class="k">strength</span><span>Profiles-per-camera is the right mental model.</span>
+      <span class="k">friction</span><span>No UI — you have to know the files exist.</span>
+      <span class="k">verdict</span><span><span class="pill new">new</span> a small "Profiles" pane in the shell.</span>
+    </div>
+  </div>
+
+</div>
+
+<h3 style="margin-top:36px">What the theme already gets right</h3>
+<p>The existing palette (<span class="mono">#1E1E1E</span> bg, <span class="mono">#2A2A2A</span> panels, <span class="mono">#D2D2D2</span> / <span class="mono">#787878</span> text, <span class="mono">#50FFC8</span> mint accent) plus the semantic markers (<span style="color:var(--gold)">gold</span> satellite, <span style="color:var(--orange)">orange</span> airplane, <span style="color:var(--magenta)">magenta</span> anomalous) is already a coherent signal system. The shell should amplify it, not replace it. The one move worth making: warm it slightly — currently the mint reads acid against pure grey; softened against a warmer off-black it becomes calmer and easier to live with across long observation sessions.</p>
+
+
+<!-- ============================= 02 CONCEPT ============================= -->
+<h2>02 &nbsp; master concept — <em>The Observatory</em></h2>
+<div class="section-head">
+  <span class="eyebrow">one shell, four modes, one grammar</span>
+  <span class="n">02 / 04</span>
+</div>
+
+<p class="lede">Mnemosky is an instrument for <em>situated observation</em>: the Ledger and observer-metadata flags make that explicit. The UI should make it felt. The proposal is a single windowed shell — <strong>The Observatory</strong> — that frames every run as a session at a telescope, with four modes that share a single grammar of frame, sidebar, status, and keyboard.</p>
+
+<div class="grid c2" style="margin-top: 24px">
+  <div class="card">
+    <div class="label">pillar · 01</div>
+    <h4>One shell, four modes</h4>
+    <p><strong>Tune · Observe · Review · Inspect.</strong> Every surface today maps cleanly to one of these. Switching modes is a single keystroke (1/2/3/4); the frame stays, the sidebar reconfigures.</p>
+  </div>
+  <div class="card">
+    <div class="label">pillar · 02</div>
+    <h4>The Ledger is always visible</h4>
+    <p>A thin, quiet ribbon along the bottom counts rejections live, categorised. Click any category to dim the main frame and highlight only those rejections. The STS spine becomes an ambient presence.</p>
+  </div>
+  <div class="card">
+    <div class="label">pillar · 03</div>
+    <h4>Observer card, not observer flags</h4>
+    <p>Lat/lon/Bortle/FOV/notes collapse into a single card in the top bar — readable in one glance, editable inline. Situated knowledge made a literal object on screen.</p>
+  </div>
+  <div class="card">
+    <div class="label">pillar · 04</div>
+    <h4>Organic feedback, scientific data</h4>
+    <p>The loading, saving, and "learning…" states use the mercury-blob loaders. Detections, SNR bars, histograms stay precise and geometric. The warm organic moments only appear at transitions — they signal <em>the instrument is thinking</em>.</p>
+  </div>
+</div>
+
+<h3>The four modes</h3>
+
+<div class="grid c2" style="margin-top: 8px">
+  <div class="card">
+    <div class="label">mode · 1 · tune</div>
+    <h4>Tune</h4>
+    <p>Today's three preview windows, merged. One frame, algorithm tabs (<span class="mono">default</span> / <span class="mono">radon</span> / <span class="mono">nn</span>), sidebar of custom sliders grouped by pipeline stage. "Apply to session" commits to a run; "Save to profile" writes to <span class="mono">learned_params.json</span>.</p>
+  </div>
+  <div class="card">
+    <div class="label">mode · 2 · observe</div>
+    <h4>Observe</h4>
+    <p>Today's <span class="mono">ProcessingWindow</span>, promoted to default. Quadrants become a single frame with a floating trail-map minimap and a timeline ribbon. Pressing <span class="mono">F</span> freezes; <span class="mono">.</span> pins the current detection for review later.</p>
+  </div>
+  <div class="card">
+    <div class="label">mode · 3 · review</div>
+    <h4>Review</h4>
+    <p>Current Review UI, kept almost as-is — the keyboard rhythm (A/R/S/P/M/Z/L/Tab) is the best thing in the app. The new sidebar surfaces the learned-parameter delta inline so you can <em>see</em> your correction move the model.</p>
+  </div>
+  <div class="card">
+    <div class="label">mode · 4 · inspect</div>
+    <h4>Inspect</h4>
+    <p>Today's debug view, but bound to a single detection. Click a bbox in Observe or Review, press <span class="mono">I</span> — the frame splits into pre-processing, Canny mask, matched-filter response, and the classification decision tree, all for that one line.</p>
+  </div>
+</div>
+
+<!-- ============================= 03 MOCKUP ============================= -->
+<h2>03 &nbsp; the shell, roughly</h2>
+<div class="section-head">
+  <span class="eyebrow">low-fi wireframe · observe mode · default algorithm</span>
+  <span class="n">03 / 04</span>
+</div>
+
+<div class="mock">
+  <div class="app">
+    <div class="topbar">
+      <div class="brand">mnemosky</div>
+      <div class="mode">observe</div>
+      <div class="obs">obs · 40.71°N -74.01°W · bortle 5 · fov 22° · “clear night, high cirrus”</div>
+    </div>
+
+    <div class="rail">
+      <div class="ico">T</div>
+      <div class="ico active">O</div>
+      <div class="ico">R</div>
+      <div class="ico">I</div>
+    </div>
+
+    <div class="canvas">
+      <div class="frame"></div>
+      <!-- scattered stars -->
+      <div class="star" style="top:12%; left:18%"></div>
+      <div class="star" style="top:22%; left:44%"></div>
+      <div class="star" style="top:38%; left:72%"></div>
+      <div class="star" style="top:52%; left:24%"></div>
+      <div class="star" style="top:62%; left:58%"></div>
+      <div class="star" style="top:74%; left:82%"></div>
+      <div class="star" style="top:16%; left:88%"></div>
+      <div class="star" style="top:84%; left:12%"></div>
+      <div class="star" style="top:34%; left:10%"></div>
+      <div class="star" style="top:46%; left:92%"></div>
+      <!-- a detection -->
+      <div class="bbox" style="top:28%; left:40%; width:24%; height:3%">
+        <span class="tag">sat · snr 3.2</span>
+      </div>
+      <div class="bbox plane" style="top:62%; left:22%; width:14%; height:2.6%">
+        <span class="tag">plane</span>
+      </div>
+    </div>
+
+    <div class="side">
+      <div class="head mono">session · tracksuit</div>
+
+      <div class="block">
+        <h5>Current detection</h5>
+        <div class="kv2">
+          <span>type</span><span style="color:var(--gold)">satellite</span>
+          <span>snr</span><span>3.2</span>
+          <span>length</span><span>285 px</span>
+          <span>angle</span><span>135°</span>
+          <span>tracklet</span><span>#5 · 7 frames</span>
+        </div>
+      </div>
+
+      <div class="block">
+        <h5>Confidence</h5>
+        <div class="bar"></div>
+        <div class="kv2" style="margin-top:6px">
+          <span>platt</span><span>0.82</span>
+          <span>fusion</span><span>0.74</span>
+        </div>
+      </div>
+
+      <div class="block">
+        <h5>Ledger · live</h5>
+        <div class="kv2">
+          <span>too short</span><span>128</span>
+          <span>star-like</span><span>44</span>
+          <span>low SNR</span><span>22</span>
+          <span>confirmed</span><span style="color:var(--mint)">17</span>
+        </div>
+      </div>
+
+      <div class="block">
+        <h5>Keys</h5>
+        <div class="keys">
+          <span class="key">F · freeze</span>
+          <span class="key">. · pin</span>
+          <span class="key">I · inspect</span>
+          <span class="key">3 · review</span>
+          <span class="key">L · learn</span>
+          <span class="key">Q · quit</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="status">
+      <span class="dot"></span>
+      <span>observing · frame 4,812 / 9,360</span>
+      <span style="color:#8c907d">· 51 % · 128 fps · gpu on</span>
+      <span class="right">output · ursa-minor-01.mp4</span>
+    </div>
+  </div>
+</div>
+
+<p style="margin-top:14px; color: var(--ink-2); font-size: 14px">
+Notes — the left rail is the mode switcher (Tune · Observe · Review · Inspect). The sidebar reconfigures per mode but keeps the same rhythm (session · current · confidence · ledger · keys). The live Ledger at the bottom of the sidebar replaces the end-of-run printout; clicking a row filters the frame to that rejection category.
+</p>
+
+<!-- ============================= LOADERS STRIP ============================= -->
+<h3 style="margin-top:42px">Loading + learning states</h3>
+<p>Any mode-transition, profile save, Tier-2 optimiser pass, or dataset export uses a mercury-blob loader as its waiting state. Organic moments for the software's slow thoughts; geometric precision for its fast ones.</p>
+<div class="strip">
+  <div class="tile">trefoil · resolving targets</div>
+  <div class="tile">eye · learning</div>
+  <div class="tile">gather · tier-2 optimising</div>
+  <div class="tile">drip · exporting dataset</div>
+</div>
+
+<!-- ============================= 04 SYSTEM ============================= -->
+<h2>04 &nbsp; the proposed system, in one page</h2>
+<div class="section-head">
+  <span class="eyebrow">palette · type · motion · iconography</span>
+  <span class="n">04 / 04</span>
+</div>
+
+<h3>Palette — warmer Mnemosky</h3>
+<div class="swatches">
+  <div class="sw dark" style="background: #12110f">
+    <span class="name">night</span>
+    <span class="hex">#12110F</span>
+  </div>
+  <div class="sw dark" style="background: #1a1916">
+    <span class="name">panel</span>
+    <span class="hex">#1A1916</span>
+  </div>
+  <div class="sw" style="background: #e9ead9">
+    <span class="name">ink</span>
+    <span class="hex">#E9EAD9</span>
+  </div>
+  <div class="sw" style="background: #9fe7c2">
+    <span class="name">mint</span>
+    <span class="hex">#9FE7C2</span>
+  </div>
+  <div class="sw" style="background: #c9d3ba">
+    <span class="name">mercury</span>
+    <span class="hex">#C9D3BA</span>
+  </div>
+  <div class="sw" style="background: #7c9270">
+    <span class="name">grass</span>
+    <span class="hex">#7C9270</span>
+  </div>
+  <div class="sw" style="background: #d7b877">
+    <span class="name">satellite</span>
+    <span class="hex">#D7B877</span>
+  </div>
+  <div class="sw" style="background: #d98e5a">
+    <span class="name">airplane</span>
+    <span class="hex">#D98E5A</span>
+  </div>
+  <div class="sw" style="background: #c98fb6">
+    <span class="name">anomalous</span>
+    <span class="hex">#C98FB6</span>
+  </div>
+  <div class="sw dark" style="background: #2b2924">
+    <span class="name">line</span>
+    <span class="hex">#2B2924</span>
+  </div>
+  <div class="sw" style="background: #aec099">
+    <span class="name">daytime</span>
+    <span class="hex">#AEC099</span>
+  </div>
+  <div class="sw dark" style="background: #221f1a">
+    <span class="name">sink</span>
+    <span class="hex">#221F1A</span>
+  </div>
+</div>
+
+<div class="grid c2" style="margin-top: 26px">
+  <div class="card">
+    <div class="label">type</div>
+    <h4>Serif italic + monospace</h4>
+    <p>Times New Roman italic for headings and wordmark — continues the reference image's liquid-serif personality. A monospace (JetBrains Mono / IBM Plex Mono fallback to system monospace) for all numeric, keyboard and metadata UI. Never mix cases on mono labels — always uppercase with tracked letter-spacing.</p>
+  </div>
+  <div class="card">
+    <div class="label">motion</div>
+    <h4>Two motion registers</h4>
+    <p><strong>Meditative</strong> (4–6 s loops) for mercury-blob loaders and mode transitions. <strong>Responsive</strong> (100–200 ms) for every UI interaction — slider drag, mode switch, keypress feedback. Never blend the two; each has a clear role.</p>
+  </div>
+  <div class="card">
+    <div class="label">iconography</div>
+    <h4>One icon grammar</h4>
+    <p>Single-weight, 1.5 px stroke, slightly rounded terminals. The four mode icons (T/O/R/I) should start as typographic letterforms (pragmatic, matches the single-file ethos). Replace with glyphs later if and when the project moves to a richer GUI toolkit.</p>
+  </div>
+  <div class="card">
+    <div class="label">tone of voice</div>
+    <h4>Instrument, not app</h4>
+    <p>Copy is quiet and technical: "observing · frame 4,812", "gathering frames", "ledger · live". Never chirpy, never exclamatory. The wordmark sits in italic serif once, at top-left, and never shouts again.</p>
+  </div>
+</div>
+
+<!-- ============================= NEXT ============================= -->
+<h2>next steps</h2>
+<div class="section-head">
+  <span class="eyebrow">from audit to instrument</span>
+  <span class="n">end</span>
+</div>
+
+<div class="grid c3">
+  <div class="card">
+    <div class="label">phase · 01</div>
+    <h4>Ratify the shell</h4>
+    <p>Pick one or two of the four modes (Observe feels the highest-value) and mock it at full fidelity before touching Python. Confirm the mode grammar with the team.</p>
+  </div>
+  <div class="card">
+    <div class="label">phase · 02</div>
+    <h4>Port the theme, keep OpenCV</h4>
+    <p>The shell can live inside OpenCV for v0.3.x — just a warmer palette, unified sidebar, and a live Ledger ribbon. No framework migration required.</p>
+  </div>
+  <div class="card">
+    <div class="label">phase · 03</div>
+    <h4>Open the question of Qt / web</h4>
+    <p>If the review + inspect modes demand richer interaction (draggable bboxes, inline histograms), consider a minimal Qt/PySide shell with OpenCV as the frame renderer. Defer the decision until after Phase 02.</p>
+  </div>
+</div>
+
+<footer class="mono">
+  <span>mnemozine · tracksuit · master ui concept</span>
+  <span>v.01 · april 2026</span>
+</footer>
+
+</div>
+
+</body>
+</html>

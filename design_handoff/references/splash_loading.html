@@ -1,0 +1,547 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>mnemosky — loading</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;height:100%;overflow:hidden}
+  body{
+    font-family: "Times New Roman", Times, serif;
+    color: #eef2e3;
+    min-height: 100vh;
+    display: grid; place-items: center;
+    background:
+      radial-gradient(1400px 900px at 12% 18%, #e9f0df 0%, transparent 55%),
+      radial-gradient(1000px 800px at 88% 8%,  #d0dcbe 0%, transparent 60%),
+      radial-gradient(1200px 1000px at 68% 88%,#9aad86 0%, transparent 60%),
+      radial-gradient(900px 700px at 8% 92%,   #b7c5a1 0%, transparent 55%),
+      linear-gradient(180deg, #aec099 0%, #7c9270 100%);
+    background-attachment: fixed;
+    filter: saturate(1.03);
+  }
+  body::before{
+    content:""; position: fixed; inset:0; pointer-events:none; z-index:0;
+    background:
+      radial-gradient(260px 260px at 10% 28%, rgba(255,255,255,.55), transparent 70%),
+      radial-gradient(200px 200px at 22% 80%, rgba(255,255,255,.42), transparent 70%),
+      radial-gradient(320px 320px at 80% 22%, rgba(255,255,255,.36), transparent 70%),
+      radial-gradient(240px 240px at 90% 72%, rgba(255,255,255,.38), transparent 70%),
+      radial-gradient(140px 140px at 50% 52%, rgba(255,255,255,.28), transparent 70%);
+    filter: blur(30px);
+  }
+
+  .splash{
+    position: relative; z-index: 2;
+    display: flex; flex-direction: column; align-items: center;
+    gap: 48px;
+    color: #1a271d;
+  }
+  .stage{
+    width: 420px; height: 420px;
+    position: relative;
+    border-radius: 24px;
+    overflow: hidden;
+    isolation: isolate;
+  }
+  .stage svg{
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    opacity: 0;
+    transition: opacity 1.2s ease;
+  }
+  .stage svg.active{ opacity: 1; }
+
+  .wordmark{
+    font-family: "Times New Roman", serif;
+    font-style: italic;
+    font-size: 52px;
+    color: #17221a;
+    text-shadow: 0 1px 0 rgba(255,255,255,.4);
+    letter-spacing: .005em;
+    line-height: 1;
+    margin: 0;
+  }
+  .brand-block{
+    display:flex; flex-direction:column; align-items:center; gap: 10px;
+  }
+  .tagline{
+    font-family: "Times New Roman", serif;
+    font-style: italic;
+    font-size: 15px;
+    letter-spacing: .22em;
+    text-transform: lowercase;
+    color: #1e2b21;
+    opacity: .62;
+    text-shadow: 0 1px 0 rgba(255,255,255,.25);
+  }
+  .status{
+    display:flex; align-items:center; gap: 14px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px;
+    letter-spacing: .28em;
+    text-transform: uppercase;
+    color: #1e2b21;
+    opacity: .82;
+  }
+  .status .dot{
+    width: 7px; height: 7px; border-radius: 50%;
+    background: #1e2b21;
+    box-shadow: 0 0 0 3px rgba(255,255,255,.28);
+    animation: pulse 2.4s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:.25} 50%{opacity:1} }
+
+  .foot{
+    position: fixed; left: 0; right: 0; bottom: 0;
+    padding: 22px 28px;
+    display: flex; justify-content: space-between;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 10.5px;
+    letter-spacing: .26em;
+    text-transform: uppercase;
+    color: #1b281e; opacity: .7;
+    z-index: 2;
+  }
+  .hidden{ display: none !important; }
+
+  /* -------- Tweaks panel -------- */
+  .tweaks{
+    position: fixed; right: 20px; bottom: 20px;
+    width: 280px;
+    background: rgba(18,22,18,.88);
+    color: #e9ead9;
+    border: 1px solid rgba(233,234,217,.14);
+    border-radius: 12px;
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    letter-spacing: .06em;
+    z-index: 10;
+    box-shadow: 0 18px 40px -18px rgba(0,0,0,.6);
+    display: none;
+  }
+  .tweaks.on{ display: block; }
+  .tweaks h3{
+    margin: 0; padding: 12px 14px;
+    font-family: "Times New Roman", serif;
+    font-style: italic;
+    font-size: 16px;
+    font-weight: 400;
+    letter-spacing: .01em;
+    border-bottom: 1px solid rgba(233,234,217,.08);
+    color: #f1efe0;
+  }
+  .tweaks .body{ padding: 10px 14px 14px; display:flex; flex-direction:column; gap: 10px; }
+  .tweaks label{ display:flex; flex-direction:column; gap: 5px; color:#b8bca7; text-transform: uppercase; letter-spacing: .18em; font-size: 9.5px; }
+  .tweaks input[type=text]{
+    background: #0f120f;
+    border: 1px solid rgba(233,234,217,.12);
+    color: #e9ead9;
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-family: inherit;
+    font-size: 11px;
+  }
+  .tweaks input[type=range]{ width:100%; accent-color:#9fe7c2; }
+  .tweaks .row{ display:flex; align-items:center; justify-content: space-between; gap: 8px; color:#d9dac8; font-size: 10.5px; text-transform: uppercase; letter-spacing: .18em; }
+  .tweaks .val{ color:#9fe7c2; }
+  .tweaks .toggle{
+    appearance:none; width: 28px; height: 16px; border-radius: 999px;
+    background: rgba(233,234,217,.15); position:relative; cursor:pointer; transition: background .2s;
+  }
+  .tweaks .toggle::after{
+    content:""; position:absolute; top:2px; left:2px; width:12px; height:12px; border-radius:50%;
+    background: #e9ead9; transition: transform .2s;
+  }
+  .tweaks .toggle:checked{ background: #9fe7c2; }
+  .tweaks .toggle:checked::after{ transform: translateX(12px); background:#12110f; }
+
+  /* ------ loader keyframes ------ */
+  /* trefoil */
+  @keyframes tref_0 { 0%,100%{transform:translate(0,0) scale(1)} 50%{transform:translate(0,56px) scale(.5)} }
+  @keyframes tref_1 { 0%,100%{transform:translate(0,0) scale(1)} 50%{transform:translate(50px,-28px) scale(.5)} }
+  @keyframes tref_2 { 0%,100%{transform:translate(0,0) scale(1)} 50%{transform:translate(-50px,-28px) scale(.5)} }
+
+  /* gather */
+  @keyframes gather_A { 0%,100%{transform:translate(-60px,-44px) scale(.85)} 46%,54%{transform:translate(0,0) scale(1)} }
+  @keyframes gather_B { 0%,100%{transform:translate(58px,-46px) scale(.82)} 46%,54%{transform:translate(0,0) scale(1)} }
+  @keyframes gather_C { 0%,100%{transform:translate(-48px,52px) scale(.86)} 46%,54%{transform:translate(0,0) scale(1)} }
+  @keyframes gather_D { 0%,100%{transform:translate(50px,48px) scale(.78)} 46%,54%{transform:translate(0,0) scale(1)} }
+  @keyframes gather_core { 0%,100%{transform:scale(.9)} 50%{transform:scale(1.12)} }
+
+  /* drip */
+  @keyframes drip {
+    0%   { transform: translateY(-16px) scaleY(.9); opacity: 0; }
+    12%  { opacity: 1; }
+    60%  { transform: translateY(120px) scaleY(1.25); }
+    86%  { transform: translateY(172px) scaleY(.85); }
+    100% { transform: translateY(190px) scaleY(.6); opacity: 0; }
+  }
+  @keyframes drip_neck { 0%,100%{transform:scaleY(.85) scaleX(1.05)} 50%{transform:scaleY(1.25) scaleX(.88)} }
+  @keyframes drip_pool { 0%,100%{transform:scale(1,1)} 50%{transform:scale(1.06,.85)} }
+
+  /* eye */
+  @keyframes eye_iris { 0%,100%{transform:translateX(-50px) scale(.88)} 50%{transform:translateX(50px) scale(1.06)} }
+  @keyframes eye_s0   { 0%,100%{transform:translate(-86px,-10px) scale(.3); opacity:.0} 20%{opacity:1} 50%{transform:translate(0,0) scale(1); opacity:1} 80%{opacity:1} }
+  @keyframes eye_s1   { 0%,100%{transform:translate(84px,14px) scale(.3); opacity:.0}  20%{opacity:1} 50%{transform:translate(0,0) scale(1); opacity:1} 80%{opacity:1} }
+  @keyframes eye_s2   { 0%,100%{transform:translate(10px,-30px) scale(.2); opacity:.0} 20%{opacity:1} 50%{transform:translate(0,0) scale(1); opacity:1} 80%{opacity:1} }
+
+  @keyframes breathe { 0%,100%{transform:scale(.92)} 50%{transform:scale(1.06)} }
+
+  .anim{
+    animation-duration: var(--dur, 5.2s);
+    animation-timing-function: cubic-bezier(.5,.0,.5,1);
+    animation-iteration-count: infinite;
+  }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <radialGradient id="merc" cx="38%" cy="28%" r="85%">
+      <stop offset="0%"   stop-color="#fbfdf6"/>
+      <stop offset="14%"  stop-color="#e9efdf"/>
+      <stop offset="34%"  stop-color="#a9b8a2"/>
+      <stop offset="58%"  stop-color="#5b6a5a"/>
+      <stop offset="82%"  stop-color="#2e3830"/>
+      <stop offset="100%" stop-color="#141a16"/>
+    </radialGradient>
+    <radialGradient id="mercB" cx="68%" cy="72%" r="90%">
+      <stop offset="0%"   stop-color="#f4f7ec"/>
+      <stop offset="18%"  stop-color="#c9d3ba"/>
+      <stop offset="46%"  stop-color="#6f7e69"/>
+      <stop offset="74%"  stop-color="#333e34"/>
+      <stop offset="100%" stop-color="#111614"/>
+    </radialGradient>
+    <radialGradient id="worldTint" cx="30%" cy="20%" r="90%">
+      <stop offset="0%"   stop-color="#dff0c6" stop-opacity=".55"/>
+      <stop offset="45%"  stop-color="#a9c48f" stop-opacity=".18"/>
+      <stop offset="100%" stop-color="#3a4e36" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="goo">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="10"/>
+      <feColorMatrix values="
+        1 0 0 0 0
+        0 1 0 0 0
+        0 0 1 0 0
+        0 0 0 22 -11"/>
+      <feComposite in="SourceGraphic" operator="atop"/>
+    </filter>
+    <filter id="gooStrong">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="14"/>
+      <feColorMatrix values="
+        1 0 0 0 0
+        0 1 0 0 0
+        0 0 1 0 0
+        0 0 0 26 -13"/>
+      <feComposite in="SourceGraphic" operator="atop"/>
+    </filter>
+  </defs>
+</svg>
+
+<div class="splash">
+  <div class="stage" id="stage"></div>
+  <div class="brand-block">
+    <div class="wordmark">mnemosky</div>
+    <div class="tagline" id="tagline">centrifugal data management</div>
+  </div>
+  <div class="status"><span class="dot"></span><span id="status-text">initialising · tracksuit</span></div>
+</div>
+
+<div class="foot">
+  <span>mnemozine · tracksuit</span>
+  <span>v0.3.0 · loading</span>
+</div>
+
+<div class="tweaks" id="tweaks">
+  <h3>Tweaks</h3>
+  <div class="body">
+    <label>Tagline
+      <input type="text" id="tw-tagline" />
+    </label>
+    <div class="row">Show tagline <input type="checkbox" class="toggle" id="tw-tag-on" checked></div>
+    <div class="row">Show status <input type="checkbox" class="toggle" id="tw-status-on" checked></div>
+    <div class="row">Show footer <input type="checkbox" class="toggle" id="tw-foot-on" checked></div>
+    <label>Cycle (s) <span class="row" style="padding:0"><span></span><span class="val" id="tw-cycle-val">7</span></span>
+      <input type="range" id="tw-cycle" min="3" max="15" step="1" />
+    </label>
+    <label>Motion speed <span class="row" style="padding:0"><span></span><span class="val" id="tw-speed-val">1.0×</span></span>
+      <input type="range" id="tw-speed" min="0.4" max="2.2" step="0.05" />
+    </label>
+    <label>Loader
+      <select id="tw-loader" style="background:#0f120f;border:1px solid rgba(233,234,217,.12);color:#e9ead9;border-radius:6px;padding:6px 8px;font-family:inherit;font-size:11px;">
+        <option value="cycle">cycle all four</option>
+        <option value="trefoil">trefoil only</option>
+        <option value="eye">eye only</option>
+        <option value="gather">gather only</option>
+        <option value="drip">drip only</option>
+      </select>
+    </label>
+  </div>
+</div>
+
+<script>
+const svgNS = "http://www.w3.org/2000/svg";
+const stage = document.getElementById('stage');
+
+function mkSvg(){
+  const s = document.createElementNS(svgNS,'svg');
+  s.setAttribute('viewBox','0 0 420 420');
+  s.setAttribute('preserveAspectRatio','xMidYMid meet');
+  return s;
+}
+function circle(p, cx, cy, r, attrs={}){
+  const c = document.createElementNS(svgNS,'circle');
+  c.setAttribute('cx',cx); c.setAttribute('cy',cy); c.setAttribute('r',r);
+  Object.entries(attrs).forEach(([k,v])=>c.setAttribute(k,v));
+  p.appendChild(c); return c;
+}
+function ellipse(p, cx, cy, rx, ry, attrs={}){
+  const e = document.createElementNS(svgNS,'ellipse');
+  e.setAttribute('cx',cx); e.setAttribute('cy',cy); e.setAttribute('rx',rx); e.setAttribute('ry',ry);
+  Object.entries(attrs).forEach(([k,v])=>e.setAttribute(k,v));
+  p.appendChild(e); return e;
+}
+function group(p, attrs={}){
+  const g = document.createElementNS(svgNS,'g');
+  Object.entries(attrs).forEach(([k,v])=>g.setAttribute(k,v));
+  p.appendChild(g); return g;
+}
+function anim(el, name, dur=5.2, delay=0, origin){
+  el.classList.add('anim');
+  el.style.animationName = name;
+  el.style.setProperty('--dur', dur+'s');
+  el.style.animationDelay = delay+'s';
+  if(origin) el.style.transformOrigin = origin;
+}
+
+/* Center of 420×420 is 210,210. Keyframes were tuned for 280×280 (center 140),
+   so scale distances by 1.5 where explicit. We re-use the small keyframes and
+   simply position the shapes at 420 coordinates; offsets in the keyframes look
+   slightly smaller but read nicely at this scale. */
+
+function buildTrefoil(){
+  const svg = mkSvg();
+  const g = group(svg,{filter:'url(#gooStrong)'});
+  const R = 84, cx = 210, cy = 210;
+  const pts = [
+    [cx,          cy + R],
+    [cx + R*.866, cy - R*.5],
+    [cx - R*.866, cy - R*.5],
+  ];
+  const colors = ['url(#merc)','url(#mercB)','url(#merc)'];
+  const keys = ['tref_0','tref_1','tref_2'];
+  pts.forEach(([x,y],i)=>{
+    const c = circle(g,x,y,54,{fill:colors[i]});
+    anim(c, keys[i], 5.6, -i*0.4, `${x}px ${y}px`);
+  });
+  const t = document.createElementNS(svgNS,'circle');
+  t.setAttribute('cx',cx); t.setAttribute('cy',cy); t.setAttribute('r',140);
+  t.setAttribute('fill','url(#worldTint)');
+  t.style.mixBlendMode='screen'; t.style.pointerEvents='none';
+  svg.appendChild(t);
+  return svg;
+}
+function buildEye(){
+  const svg = mkSvg();
+  const g = group(svg,{filter:'url(#goo)'});
+  ellipse(g,210,210,156,70,{fill:'url(#merc)'});
+  const iris = circle(g,210,210,40,{fill:'url(#mercB)'});
+  anim(iris,'eye_iris',6.4,0,'210px 210px');
+  const s0 = circle(g,210,210,22,{fill:'url(#mercB)'});
+  const s1 = circle(g,210,210,18,{fill:'url(#mercB)'});
+  const s2 = circle(g,210,210,15,{fill:'url(#mercB)'});
+  anim(s0,'eye_s0',6.4,-1.9,'210px 210px');
+  anim(s1,'eye_s1',6.4,-3.8,'210px 210px');
+  anim(s2,'eye_s2',6.4,-0.6,'210px 210px');
+  const tint = document.createElementNS(svgNS,'ellipse');
+  tint.setAttribute('cx',210); tint.setAttribute('cy',192); tint.setAttribute('rx',148); tint.setAttribute('ry',58);
+  tint.setAttribute('fill','url(#worldTint)');
+  tint.style.mixBlendMode='screen'; tint.style.pointerEvents='none';
+  svg.appendChild(tint);
+  return svg;
+}
+function buildGather(){
+  const svg = mkSvg();
+  const g = group(svg,{filter:'url(#gooStrong)'});
+  const core = circle(g,210,210,42,{fill:'url(#merc)'});
+  anim(core,'gather_core',5.6,0,'210px 210px');
+  const defs = [
+    { r:36, fill:'url(#mercB)', key:'gather_A' },
+    { r:33, fill:'url(#merc)',  key:'gather_B' },
+    { r:34, fill:'url(#mercB)', key:'gather_C' },
+    { r:30, fill:'url(#merc)',  key:'gather_D' },
+  ];
+  defs.forEach((d,i)=>{
+    const c = circle(g,210,210,d.r,{fill:d.fill});
+    anim(c,d.key,5.6,-i*0.2,'210px 210px');
+  });
+  const tint = document.createElementNS(svgNS,'circle');
+  tint.setAttribute('cx',210); tint.setAttribute('cy',210); tint.setAttribute('r',140);
+  tint.setAttribute('fill','url(#worldTint)');
+  tint.style.mixBlendMode='screen'; tint.style.pointerEvents='none';
+  svg.appendChild(tint);
+  return svg;
+}
+function buildDrip(){
+  const svg = mkSvg();
+  const g = group(svg,{filter:'url(#goo)'});
+  ellipse(g,210,84,84,32,{fill:'url(#merc)'});
+  const neck = ellipse(g,210,138,18,50,{fill:'url(#mercB)'});
+  anim(neck,'drip_neck',5.6,0,'210px 120px');
+  for(let i=0;i<3;i++){
+    const d = circle(g,210,138,24,{fill:'url(#mercB)'});
+    anim(d,'drip',5.6,-i*1.85,'210px 138px');
+  }
+  const pool = ellipse(g,210,348,105,26,{fill:'url(#merc)'});
+  anim(pool,'drip_pool',5.6,-0.2,'210px 348px');
+  const tint = document.createElementNS(svgNS,'rect');
+  tint.setAttribute('x',90); tint.setAttribute('y',40);
+  tint.setAttribute('width',240); tint.setAttribute('height',340);
+  tint.setAttribute('fill','url(#worldTint)');
+  tint.style.mixBlendMode='screen'; tint.style.pointerEvents='none';
+  svg.appendChild(tint);
+  return svg;
+}
+
+const variants = [
+  { name: 'trefoil', status: 'warming the optics', build: buildTrefoil },
+  { name: 'eye',     status: 'resolving targets',  build: buildEye },
+  { name: 'gather',  status: 'gathering frames',   build: buildGather },
+  { name: 'drip',    status: 'calibrating pipeline', build: buildDrip },
+];
+
+const statusEl = document.getElementById('status-text');
+variants.forEach(v => {
+  v.svg = v.build();
+  stage.appendChild(v.svg);
+});
+
+/* ---------------- Tweakable defaults ---------------- */
+const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+  "tagline": "centrifugal data management",
+  "showTagline": true,
+  "showStatus": true,
+  "showFooter": true,
+  "cycleSeconds": 7,
+  "motionSpeed": 1.0,
+  "loader": "cycle"
+}/*EDITMODE-END*/;
+
+let tweaks = {...TWEAK_DEFAULTS};
+
+const taglineEl = document.getElementById('tagline');
+const footEl    = document.querySelector('.foot');
+const statusWrap= document.querySelector('.status');
+const splashEl  = document.querySelector('.splash');
+
+function applyTweaks(){
+  // tagline text + visibility
+  taglineEl.textContent = tweaks.tagline || '';
+  taglineEl.classList.toggle('hidden', !tweaks.showTagline || !tweaks.tagline);
+  statusWrap.classList.toggle('hidden', !tweaks.showStatus);
+  footEl.classList.toggle('hidden', !tweaks.showFooter);
+
+  // motion speed — retarget animation-duration on all animated elements
+  const speed = Math.max(0.2, tweaks.motionSpeed || 1);
+  document.querySelectorAll('.anim').forEach(el => {
+    const base = parseFloat(el.getAttribute('data-base-dur') || el.style.getPropertyValue('--dur') || '5.2');
+    if (!el.getAttribute('data-base-dur')) el.setAttribute('data-base-dur', base);
+    el.style.setProperty('--dur', (base / speed) + 's');
+  });
+}
+
+function setVariant(mode){
+  if (mode === 'cycle') return;
+  const idxFixed = variants.findIndex(v => v.name === mode);
+  if (idxFixed >= 0) show(idxFixed);
+}
+
+let idx = 0;
+let cycleTimer = null;
+function show(i){
+  variants.forEach((v,j)=>{
+    if (j===i) v.svg.classList.add('active');
+    else v.svg.classList.remove('active');
+  });
+  statusEl.textContent = `${variants[i].status} · tracksuit`;
+}
+function startCycle(){
+  clearInterval(cycleTimer);
+  if (tweaks.loader !== 'cycle'){
+    setVariant(tweaks.loader);
+    return;
+  }
+  show(idx);
+  cycleTimer = setInterval(()=>{
+    idx = (idx+1) % variants.length;
+    show(idx);
+  }, Math.max(1000, (tweaks.cycleSeconds||7)*1000));
+}
+
+show(0);
+applyTweaks();
+startCycle();
+
+/* ---------------- Tweaks panel wiring ---------------- */
+const tweaksEl = document.getElementById('tweaks');
+
+// Init controls from defaults
+const twTagline = document.getElementById('tw-tagline');
+const twTagOn   = document.getElementById('tw-tag-on');
+const twStatus  = document.getElementById('tw-status-on');
+const twFoot    = document.getElementById('tw-foot-on');
+const twCycle   = document.getElementById('tw-cycle');
+const twCycleV  = document.getElementById('tw-cycle-val');
+const twSpeed   = document.getElementById('tw-speed');
+const twSpeedV  = document.getElementById('tw-speed-val');
+const twLoader  = document.getElementById('tw-loader');
+
+function syncControls(){
+  twTagline.value = tweaks.tagline;
+  twTagOn.checked = !!tweaks.showTagline;
+  twStatus.checked = !!tweaks.showStatus;
+  twFoot.checked = !!tweaks.showFooter;
+  twCycle.value = tweaks.cycleSeconds;
+  twCycleV.textContent = tweaks.cycleSeconds;
+  twSpeed.value = tweaks.motionSpeed;
+  twSpeedV.textContent = Number(tweaks.motionSpeed).toFixed(2)+'×';
+  twLoader.value = tweaks.loader;
+}
+syncControls();
+
+function persist(edits){
+  tweaks = {...tweaks, ...edits};
+  applyTweaks();
+  try { window.parent.postMessage({type:'__edit_mode_set_keys', edits}, '*'); } catch(e){}
+}
+
+twTagline.addEventListener('input', e => persist({tagline: e.target.value}));
+twTagOn.addEventListener('change', e => persist({showTagline: e.target.checked}));
+twStatus.addEventListener('change', e => persist({showStatus: e.target.checked}));
+twFoot.addEventListener('change', e => persist({showFooter: e.target.checked}));
+twCycle.addEventListener('input', e => {
+  const v = +e.target.value; twCycleV.textContent = v;
+  persist({cycleSeconds: v}); startCycle();
+});
+twSpeed.addEventListener('input', e => {
+  const v = +e.target.value; twSpeedV.textContent = v.toFixed(2)+'×';
+  persist({motionSpeed: v});
+});
+twLoader.addEventListener('change', e => {
+  persist({loader: e.target.value}); idx = 0; startCycle();
+});
+
+// Edit-mode protocol — register listener FIRST, then announce
+window.addEventListener('message', (ev)=>{
+  const d = ev.data || {};
+  if (d.type === '__activate_edit_mode') tweaksEl.classList.add('on');
+  else if (d.type === '__deactivate_edit_mode') tweaksEl.classList.remove('on');
+});
+try { window.parent.postMessage({type:'__edit_mode_available'}, '*'); } catch(e){}
+</script>
+</body>
+</html>

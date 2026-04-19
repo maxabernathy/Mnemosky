@@ -47,6 +47,82 @@ from datetime import datetime, timezone
 
 __version__ = '0.2.0-sts'
 
+
+# ── Observatory palette (design_handoff/tokens.json, Phase 2 port) ────────────
+# Hex values from 02_design_tokens.md converted to BGR for OpenCV.
+# Every UI surface (preview, review, processing, ledger) draws from this block.
+class OBSERVATORY:
+    # Surface (darkest → card)
+    NIGHT   = (11, 14, 15)     # #0F0E0B  — outer shell bg
+    NIGHT2  = (15, 19, 21)     # #15130F  — panel / canvas bg
+    PANEL   = (19, 23, 26)     # #1A1713  — cards, blocks
+    PANEL2  = (24, 30, 33)     # #211E18  — elevated inside panel
+    LINE    = (33, 40, 43)     # #2B2821  — dividers, borders
+
+    # Ink (foreground on dark)
+    INK     = (220, 238, 237)  # #EDEEDC  — primary text
+    INK2    = (151, 176, 170)  # #AAB097  — metadata, mono labels
+    INK3    = (100, 117, 111)  # #6F7564  — tertiary, least salient
+
+    # Accent
+    MINT    = (194, 231, 159)  # #9FE7C2  — live, active, confirmed
+    MERCURY = (186, 211, 201)  # #C9D3BA  — loaders, secondary accent
+    GRASS   = (112, 146, 124)  # #7C9270  — grass-bokeh (title/splash only)
+    GRASS_SOFT = (153, 192, 174)  # #AEC099 — grass highlight
+
+    # Semantic (detections)
+    SATELLITE = (119, 184, 215)  # #D7B877 — gold
+    AIRPLANE  = (90, 142, 217)   # #D98E5A — orange
+    ANOMALOUS = (182, 143, 201)  # #C98FB6 — magenta
+
+
+# Fixed Translation Ledger ribbon categories (see 05_ledger_and_observer.md).
+# Order is pipeline-canonical — do not alphabetise or rename. The label is what
+# the public reads; the `attr` is the corresponding TranslationLedger counter
+# (or 'classified_*' for the terminal positive CONFIRMED cell).
+LEDGER_RIBBON_CATEGORIES = (
+    ('TOO SHORT',      'rejected_too_short'),
+    ('STAR-LIKE',      'rejected_star_like'),
+    ('LOW SNR',        'rejected_low_contrast'),
+    ('ECCENTRIC',      'rejected_aspect_ratio'),
+    ('BRIGHT CLUSTER', 'rejected_too_bright'),
+    ('DUPE',           'rejected_segment_variation'),
+    ('CONFIRMED',      '_confirmed_total'),   # synthesized from classified_* sum
+)
+
+
+def format_observer_card(observer_context, algorithm=None):
+    """Build the uppercase-mono Observer card sentence (05_ledger_and_observer.md).
+
+    Returns a single tracked-uppercase line. Empty fields collapse quietly.
+    The free-text notes stay in their original case inside quotes (deliberate —
+    the surrounding frame is uppercase, the quoted note is literal).
+    """
+    parts = ['OBSERVER']
+    if not observer_context:
+        return 'OBSERVER · UNLOCATED'
+    lat = observer_context.get('lat')
+    lon = observer_context.get('lon')
+    if lat is not None:
+        parts.append(f"{abs(lat):.2f}°{'N' if lat >= 0 else 'S'}")
+    if lon is not None:
+        parts.append(f"{abs(lon):.2f}°{'W' if lon < 0 else 'E'}")
+    bortle = observer_context.get('bortle_class', observer_context.get('bortle'))
+    if bortle is not None:
+        parts.append(f"BORTLE {bortle}")
+    fov = observer_context.get('fov_degrees')
+    if fov is not None:
+        parts.append(f"FOV {fov:g}°")
+    notes = observer_context.get('notes')
+    if notes:
+        # Strip; keep original case inside quotes.
+        parts.append(f'"{notes.strip()}"')
+    line = ' · '.join(parts)
+    if algorithm:
+        line += f' · ALGORITHM: {algorithm.upper()}'
+    return line
+
+
 try:
     from scipy.ndimage import maximum_filter as _scipy_maximum_filter
     _HAS_SCIPY = True
@@ -872,13 +948,13 @@ def _draw_doc_overlay(canvas, page_index, pages, konami_unlocked=False):
     """
     h, w = canvas.shape[:2]
 
-    # Theme (same as preview windows)
-    BG_PANEL = (42, 42, 42)
-    BORDER = (58, 58, 58)
-    TEXT_PRIMARY = (210, 210, 210)
-    TEXT_DIM = (120, 120, 120)
-    ACCENT = (200, 255, 80)
-    ACCENT_DIM = (100, 170, 50)
+    # Theme (same as preview windows) — Observatory palette, Phase 2 port
+    BG_PANEL = OBSERVATORY.PANEL
+    BORDER = OBSERVATORY.LINE
+    TEXT_PRIMARY = OBSERVATORY.INK
+    TEXT_DIM = OBSERVATORY.INK3
+    ACCENT = OBSERVATORY.MINT
+    ACCENT_DIM = OBSERVATORY.INK2
 
     # Semi-transparent overlay (85% black)
     overlay = np.zeros_like(canvas)
@@ -1048,23 +1124,25 @@ def show_preprocessing_preview(video_path, initial_params=None):
         ranges from the marked trails.
     """
 
-    # ── Theme colours (BGR) ──────────────────────────────────────────
-    BG_DARK = (30, 30, 30)           # Main background
-    BG_PANEL = (42, 42, 42)          # Panel / card background
-    BG_SIDEBAR = (36, 36, 36)        # Sidebar background
-    BORDER = (58, 58, 58)            # Subtle panel borders
-    TEXT_PRIMARY = (210, 210, 210)    # Primary text (light grey)
-    TEXT_DIM = (120, 120, 120)        # Secondary / dim text
-    TEXT_HEADING = (180, 180, 180)    # Section headings
-    ACCENT = (200, 255, 80)          # Fluorescent green-yellow accent (BGR)
-    ACCENT_DIM = (100, 170, 50)      # Dimmed accent for less emphasis
-    ACCENT_CYAN = (220, 220, 60)     # Cyan-ish accent for edges panel (BGR)
-    ACCENT_MF = (120, 60, 255)       # Warm magenta for matched-filter panel (BGR)
-    ACCENT_MF_DIM = (70, 40, 140)   # Dimmed MF accent (below threshold)
-    ACCENT_MF_LINE = (140, 100, 255) # Bright MF accent for detected lines
-    SLIDER_TRACK = (50, 50, 50)      # Slider track background
-    SLIDER_FILL = (200, 255, 80)     # Slider filled portion (accent)
-    SLIDER_THUMB = (240, 255, 160)   # Slider thumb highlight
+    # ── Theme colours (BGR) — Observatory palette (design_handoff/tokens.json) ──
+    BG_DARK = OBSERVATORY.NIGHT      # outer shell
+    BG_PANEL = OBSERVATORY.PANEL     # card bg
+    BG_SIDEBAR = OBSERVATORY.NIGHT2  # sidebar / canvas bg
+    BORDER = OBSERVATORY.LINE        # dividers
+    TEXT_PRIMARY = OBSERVATORY.INK   # primary text
+    TEXT_DIM = OBSERVATORY.INK3      # least-salient
+    TEXT_HEADING = OBSERVATORY.INK2  # metadata / labels
+    ACCENT = OBSERVATORY.MINT        # live / confirmed
+    ACCENT_DIM = OBSERVATORY.INK2    # secondary accent
+    # Channel-specific tints for the multi-panel preview. Edge panel keeps a
+    # cooler ink, matched-filter keeps the mercury/anomalous pair.
+    ACCENT_CYAN = OBSERVATORY.MERCURY
+    ACCENT_MF = OBSERVATORY.ANOMALOUS
+    ACCENT_MF_DIM = tuple(int(c * 0.45) for c in OBSERVATORY.ANOMALOUS)
+    ACCENT_MF_LINE = OBSERVATORY.ANOMALOUS
+    SLIDER_TRACK = OBSERVATORY.PANEL2
+    SLIDER_FILL = OBSERVATORY.MINT
+    SLIDER_THUMB = OBSERVATORY.MERCURY
 
     # Default parameters
     defaults = {
@@ -2207,29 +2285,31 @@ def show_radon_preview(video_path, initial_params=None):
         Dict with selected Radon parameters, or None if cancelled.
     """
 
-    # ── Theme colours (BGR) — shared with preprocessing preview ─────
-    BG_DARK = (30, 30, 30)
-    BG_PANEL = (42, 42, 42)
-    BG_SIDEBAR = (36, 36, 36)
-    BORDER = (58, 58, 58)
-    TEXT_PRIMARY = (210, 210, 210)
-    TEXT_DIM = (120, 120, 120)
-    TEXT_HEADING = (180, 180, 180)
-    ACCENT = (200, 255, 80)           # Fluorescent green-yellow
-    ACCENT_DIM = (100, 170, 50)
-    SLIDER_TRACK = (50, 50, 50)
-    SLIDER_FILL = (200, 255, 80)
-    SLIDER_THUMB = (240, 255, 160)
+    # ── Theme colours (BGR) — Observatory palette ───────────────────────
+    BG_DARK = OBSERVATORY.NIGHT
+    BG_PANEL = OBSERVATORY.PANEL
+    BG_SIDEBAR = OBSERVATORY.NIGHT2
+    BORDER = OBSERVATORY.LINE
+    TEXT_PRIMARY = OBSERVATORY.INK
+    TEXT_DIM = OBSERVATORY.INK3
+    TEXT_HEADING = OBSERVATORY.INK2
+    ACCENT = OBSERVATORY.MINT
+    ACCENT_DIM = OBSERVATORY.INK2
+    SLIDER_TRACK = OBSERVATORY.PANEL2
+    SLIDER_FILL = OBSERVATORY.MINT
+    SLIDER_THUMB = OBSERVATORY.MERCURY
 
-    # Panel-specific accent colours
-    ACCENT_RESIDUAL = (200, 180, 60)      # Teal for residual panel
-    ACCENT_RESIDUAL_STAR = (60, 60, 180)  # Dim red for star mask overlay
-    ACCENT_SINOGRAM = (50, 160, 255)      # Amber/orange for sinogram
-    ACCENT_SINOGRAM_PEAK = (50, 255, 255) # Bright yellow for peaks
-    ACCENT_LSD = (80, 255, 120)           # Green-yellow for LSD lines
-    ACCENT_DET_RADON = (50, 180, 255)     # Amber for raw Radon candidates
-    ACCENT_DET_PCF = (80, 255, 80)        # Bright green for PCF-confirmed
-    ACCENT_DET_REJECT = (80, 80, 140)     # Dim red for rejected
+    # Panel-specific accents — mapped onto the Observatory semantic pair so
+    # each Radon stage reads as one of our three kinds (confirmed / candidate /
+    # rejected), not as an arbitrary colour wheel.
+    ACCENT_RESIDUAL = OBSERVATORY.MERCURY
+    ACCENT_RESIDUAL_STAR = OBSERVATORY.ANOMALOUS
+    ACCENT_SINOGRAM = OBSERVATORY.SATELLITE
+    ACCENT_SINOGRAM_PEAK = OBSERVATORY.MINT
+    ACCENT_LSD = OBSERVATORY.MINT
+    ACCENT_DET_RADON = OBSERVATORY.SATELLITE
+    ACCENT_DET_PCF = OBSERVATORY.MINT
+    ACCENT_DET_REJECT = OBSERVATORY.INK3
 
     # Default parameters (stored as ints for slider precision)
     defaults = {
@@ -3211,21 +3291,21 @@ def show_nn_preview(video_path, nn_params=None):
         print("Error: --model is required for NN preview.")
         return None
 
-    # ── Theme colours (BGR) — shared with other previews ─────────────
-    BG_DARK = (30, 30, 30)
-    BG_PANEL = (42, 42, 42)
-    BG_SIDEBAR = (36, 36, 36)
-    BORDER = (58, 58, 58)
-    TEXT_PRIMARY = (210, 210, 210)
-    TEXT_DIM = (120, 120, 120)
-    TEXT_HEADING = (180, 180, 180)
-    ACCENT = (200, 255, 80)           # Fluorescent green-yellow
-    ACCENT_DIM = (100, 170, 50)
-    SLIDER_TRACK = (50, 50, 50)
-    SLIDER_FILL = (200, 255, 80)
-    SLIDER_THUMB = (240, 255, 160)
-    COLOR_SATELLITE = (0, 185, 255)   # GOLD (BGR)
-    COLOR_AIRPLANE = (0, 140, 255)    # ORANGE (BGR)
+    # ── Theme colours (BGR) — Observatory palette ──────────────────────
+    BG_DARK = OBSERVATORY.NIGHT
+    BG_PANEL = OBSERVATORY.PANEL
+    BG_SIDEBAR = OBSERVATORY.NIGHT2
+    BORDER = OBSERVATORY.LINE
+    TEXT_PRIMARY = OBSERVATORY.INK
+    TEXT_DIM = OBSERVATORY.INK3
+    TEXT_HEADING = OBSERVATORY.INK2
+    ACCENT = OBSERVATORY.MINT
+    ACCENT_DIM = OBSERVATORY.INK2
+    SLIDER_TRACK = OBSERVATORY.PANEL2
+    SLIDER_FILL = OBSERVATORY.MINT
+    SLIDER_THUMB = OBSERVATORY.MERCURY
+    COLOR_SATELLITE = OBSERVATORY.SATELLITE
+    COLOR_AIRPLANE = OBSERVATORY.AIRPLANE
     COLOR_CONF_BAR = (80, 200, 80)    # Green for confidence bars
 
     def _fill_rect(img, x, y, w, h, color):
@@ -6577,16 +6657,16 @@ class ReviewUI:
     and feeds corrections to AnnotationDatabase and ParameterAdapter.
     """
 
-    # Theme colours (BGR)
-    BG_COLOR = (30, 30, 30)
-    PANEL_COLOR = (42, 42, 42)
-    TEXT_COLOR = (210, 210, 210)
-    DIM_TEXT = (120, 120, 120)
-    ACCENT = (200, 255, 80)          # Fluorescent green-yellow
-    CONFIRMED_COLOR = (80, 200, 80)  # Green
-    REJECTED_COLOR = (80, 80, 180)   # Dim red
-    MISSED_COLOR = (255, 100, 200)   # Magenta
-    AMBER = (0, 200, 255)            # Warning amber
+    # Theme colours (BGR) — Observatory palette
+    BG_COLOR = OBSERVATORY.NIGHT
+    PANEL_COLOR = OBSERVATORY.PANEL
+    TEXT_COLOR = OBSERVATORY.INK
+    DIM_TEXT = OBSERVATORY.INK3
+    ACCENT = OBSERVATORY.MINT
+    CONFIRMED_COLOR = OBSERVATORY.MINT
+    REJECTED_COLOR = OBSERVATORY.INK3
+    MISSED_COLOR = OBSERVATORY.ANOMALOUS
+    AMBER = OBSERVATORY.SATELLITE
 
     SIDEBAR_W = 280
     STATUS_H = 56
@@ -12964,14 +13044,14 @@ def convert_raw_folder_to_video(folder_path, output_video_path,
         print("Error: Could not create output video.")
         return None
 
-    # ── Progress window setup ────────────────────────────────────────────────
+    # ── Progress window setup ───────────────────────────── Observatory palette
     CANVAS_W, CANVAS_H = 1280, 720
-    BG = (30, 30, 30)
-    BG_CARD = (42, 42, 42)
-    TEXT = (210, 210, 210)
-    TEXT_DIM = (120, 120, 120)
-    ACCENT = (200, 255, 80)  # fluorescent green-yellow (BGR)
-    BAR_BG = (50, 50, 50)
+    BG = OBSERVATORY.NIGHT
+    BG_CARD = OBSERVATORY.PANEL
+    TEXT = OBSERVATORY.INK
+    TEXT_DIM = OBSERVATORY.INK3
+    ACCENT = OBSERVATORY.MINT
+    BAR_BG = OBSERVATORY.PANEL2
     HEADER_H = 40
     PROGRESS_H = 32
     SIDEBAR_W = 340
@@ -13406,38 +13486,48 @@ class ProcessingWindow:
     Press Q or ESC in the window to abort processing early.
     """
 
-    # ── Theme (matches preview windows) ──────────────────────────────
-    BG_DARK      = (30, 30, 30)
-    BG_PANEL     = (42, 42, 42)
-    BORDER       = (58, 58, 58)
-    TEXT_PRIMARY  = (210, 210, 210)
-    TEXT_DIM      = (120, 120, 120)
-    ACCENT        = (200, 255, 80)       # fluorescent green-yellow
-    ACCENT_DIM    = (100, 170, 50)
-    COLOR_SAT     = (0, 185, 255)        # GOLD for satellites
-    COLOR_AIR     = (0, 140, 255)        # ORANGE for airplanes
-    GRID_COLOR    = (45, 45, 45)
-    WAVEFORM_BG   = (36, 36, 36)
+    # ── Theme — Observatory palette (design_handoff/tokens.json) ─────
+    BG_DARK       = OBSERVATORY.NIGHT
+    BG_PANEL      = OBSERVATORY.PANEL
+    BORDER        = OBSERVATORY.LINE
+    TEXT_PRIMARY  = OBSERVATORY.INK
+    TEXT_DIM      = OBSERVATORY.INK3
+    TEXT_META     = OBSERVATORY.INK2        # Observer card, mono labels
+    ACCENT        = OBSERVATORY.MINT
+    ACCENT_DIM    = OBSERVATORY.INK2
+    COLOR_SAT     = OBSERVATORY.SATELLITE   # gold
+    COLOR_AIR     = OBSERVATORY.AIRPLANE    # orange
+    COLOR_ANOM    = OBSERVATORY.ANOMALOUS   # magenta
+    GRID_COLOR    = OBSERVATORY.PANEL2
+    WAVEFORM_BG   = OBSERVATORY.NIGHT2
 
     # ── Layout constants ──────────────────────────────────────────────
+    # Observatory shell grammar: Observer card on top, Ledger ribbon above status.
+    # See design_handoff/03_shell_spec.md and 05_ledger_and_observer.md.
     WIN_W        = 1100
-    WIN_H        = 680
+    WIN_H        = 760
+    OBSERVER_H   = 36           # topbar — Observer card sentence
     TOP_ROW_H    = 400          # live frame + trail map
-    TIMELINE_H   = 110          # detection timeline strip
+    TIMELINE_H   = 100          # detection timeline strip
+    LEDGER_H     = 90           # 7-cell Translation Ledger ribbon
     STATUS_H     = 56           # bottom status bar
     GAP          = 2
 
     # Detection timeline ring buffer length (in frames)
     _TIMELINE_BUCKETS = 200
 
-    WINDOW_NAME = 'Mnemosky  \u2013  Processing'
+    WINDOW_NAME = 'Mnemosky  \u2013  Observatory'
 
-    def __init__(self, total_frames, fps, video_w, video_h, algorithm='default'):
+    def __init__(self, total_frames, fps, video_w, video_h, algorithm='default',
+                 observer_context=None, ledger=None):
         self._total = max(1, int(total_frames)) if total_frames != float('inf') else 0
         self._fps = fps or 30.0
         self._vid_w = video_w
         self._vid_h = video_h
         self._algorithm = algorithm
+        self._observer_context = observer_context
+        self._ledger = ledger
+        self._observer_line = format_observer_card(observer_context, algorithm)
 
         # Running statistics
         self._frame_count = 0
@@ -13462,13 +13552,19 @@ class ProcessingWindow:
         self._thumb_w = 0
         self._thumb_h = 0
 
-        # Pre-compute panel geometry
+        # Pre-compute panel geometry. Layout (top → bottom):
+        #   OBSERVER | TOP ROW (frame + map) | TIMELINE | LEDGER | STATUS
         half_w = (self.WIN_W - self.GAP) // 2
-        self._frame_rect = (0, 0, half_w, self.TOP_ROW_H)
-        self._map_rect = (half_w + self.GAP, 0, self.WIN_W - half_w - self.GAP, self.TOP_ROW_H)
-        tl_y = self.TOP_ROW_H + self.GAP
+        self._observer_rect = (0, 0, self.WIN_W, self.OBSERVER_H)
+        tr_y = self.OBSERVER_H + self.GAP
+        self._frame_rect = (0, tr_y, half_w, self.TOP_ROW_H)
+        self._map_rect = (half_w + self.GAP, tr_y,
+                          self.WIN_W - half_w - self.GAP, self.TOP_ROW_H)
+        tl_y = tr_y + self.TOP_ROW_H + self.GAP
         self._timeline_rect = (0, tl_y, self.WIN_W, self.TIMELINE_H)
-        sb_y = tl_y + self.TIMELINE_H + self.GAP
+        lg_y = tl_y + self.TIMELINE_H + self.GAP
+        self._ledger_rect = (0, lg_y, self.WIN_W, self.LEDGER_H)
+        sb_y = lg_y + self.LEDGER_H + self.GAP
         self._status_rect = (0, sb_y, self.WIN_W, self.STATUS_H)
 
         # Pre-allocate canvas
@@ -13594,10 +13690,126 @@ class ProcessingWindow:
         c = self._canvas
         c[:] = self.BG_DARK
 
+        self._draw_observer_bar(c)
         self._draw_frame_panel(c)
         self._draw_trail_map(c)
         self._draw_timeline(c)
+        self._draw_ledger_ribbon(c)
         self._draw_status_bar(c)
+
+    # -- Observer card (top strip) --
+
+    def _draw_observer_bar(self, c):
+        """Render the uppercase-mono Observer card sentence (Haraway made literal)."""
+        x, y, w, h = self._observer_rect
+        cv2.rectangle(c, (x, y), (x + w, y + h), self.BG_DARK, -1)
+        # Hairline divider at bottom
+        cv2.line(c, (x, y + h - 1), (x + w, y + h - 1), self.BORDER, 1)
+
+        # Brand wordmark (italic serif stand-in via COMPLEX face) on the left
+        brand = "mnemosky"
+        cv2.putText(c, brand, (14, y + h - 11),
+                    cv2.FONT_HERSHEY_COMPLEX, 0.52, self.TEXT_PRIMARY, 1, cv2.LINE_AA)
+        (bw, _), _ = cv2.getTextSize(brand, cv2.FONT_HERSHEY_COMPLEX, 0.52, 1)
+        x_cursor = 14 + bw + 20
+
+        # Active mode tag, mint accent
+        mode_tag = "OBSERVE"
+        cv2.putText(c, mode_tag, (x_cursor, y + h - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, self.ACCENT, 1, cv2.LINE_AA)
+        (mw, _), _ = cv2.getTextSize(mode_tag, cv2.FONT_HERSHEY_SIMPLEX, 0.34, 1)
+        x_cursor += mw + 24
+
+        # Observer sentence, centred in the remaining width, truncated if needed.
+        obs = self._observer_line
+        max_w = w - x_cursor - 130  # leave room for local time on the right
+        scale = 0.34
+        while scale >= 0.26:
+            (ow, _), _ = cv2.getTextSize(obs, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+            if ow <= max_w:
+                break
+            scale -= 0.02
+        if ow > max_w:
+            # Truncate with ellipsis rather than overflow.
+            while obs and ow > max_w:
+                obs = obs[:-1]
+                (ow, _), _ = cv2.getTextSize(obs + '…', cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+            obs = obs + '…'
+        cv2.putText(c, obs, (x_cursor, y + h - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, scale, self.TEXT_META, 1, cv2.LINE_AA)
+
+        # Local time on the right
+        local = time.strftime('T · %Hh%Mm%Ss · LOCAL')
+        (tw, _), _ = cv2.getTextSize(local, cv2.FONT_HERSHEY_SIMPLEX, 0.32, 1)
+        cv2.putText(c, local, (w - tw - 14, y + h - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, self.TEXT_DIM, 1, cv2.LINE_AA)
+
+    # -- Ledger ribbon (7 cells) --
+
+    def _draw_ledger_ribbon(self, c):
+        """Render the 7-cell Translation Ledger ribbon (05_ledger_and_observer.md)."""
+        x, y, w, h = self._ledger_rect
+        cv2.rectangle(c, (x, y), (x + w, y + h), self.BG_DARK, -1)
+
+        # Label above the cells
+        label = "TRANSLATION LEDGER"
+        cv2.putText(c, label, (x + 14, y + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, self.TEXT_META, 1, cv2.LINE_AA)
+
+        # Seven equal cells
+        pad_x = 14
+        gap = 6
+        ribbon_top = y + 20
+        ribbon_h = h - 24
+        n = len(LEDGER_RIBBON_CATEGORIES)
+        cell_w = (w - pad_x * 2 - gap * (n - 1)) // n
+
+        # Find which cell has the most recent update — it becomes "active" mint.
+        # For CONFIRMED, pull from classified_* totals.
+        def _count(attr):
+            if self._ledger is None:
+                return 0
+            if attr == '_confirmed_total':
+                return getattr(self._ledger, 'total_classified', 0)
+            return getattr(self._ledger, attr, 0)
+
+        counts = [_count(attr) for _, attr in LEDGER_RIBBON_CATEGORIES]
+        # Active cell is CONFIRMED if we have any confirmations, else the highest rejection.
+        confirmed_idx = n - 1
+        if counts[confirmed_idx] > 0:
+            active_idx = confirmed_idx
+        else:
+            active_idx = max(range(n), key=lambda i: counts[i]) if any(counts) else -1
+
+        for i, ((name, _), val) in enumerate(zip(LEDGER_RIBBON_CATEGORIES, counts)):
+            cx = x + pad_x + i * (cell_w + gap)
+            cy = ribbon_top
+            cw = cell_w
+            ch = ribbon_h
+            active = (i == active_idx)
+
+            # Cell background — translucent panel
+            cv2.rectangle(c, (cx, cy), (cx + cw, cy + ch), self.BG_PANEL, -1)
+            border = self.ACCENT if active else self.BORDER
+            cv2.rectangle(c, (cx, cy), (cx + cw - 1, cy + ch - 1), border, 1)
+
+            # Value: big italic-serif numeral
+            val_txt = f"{val}"
+            (vw, vh), _ = cv2.getTextSize(val_txt, cv2.FONT_HERSHEY_COMPLEX, 0.82, 1)
+            val_color = self.ACCENT if active else self.TEXT_PRIMARY
+            cv2.putText(c, val_txt, (cx + 12, cy + 32),
+                        cv2.FONT_HERSHEY_COMPLEX, 0.82, val_color, 1, cv2.LINE_AA)
+
+            # Category label: uppercase mono
+            lbl_color = self.ACCENT if active else self.TEXT_DIM
+            # Fit the label — two-word labels may need to shrink.
+            lbl_scale = 0.30
+            (lw, _), _ = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, lbl_scale, 1)
+            while lw > cw - 18 and lbl_scale > 0.22:
+                lbl_scale -= 0.02
+                (lw, _), _ = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, lbl_scale, 1)
+            cv2.putText(c, name, (cx + 12, cy + ch - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, lbl_scale, lbl_color, 1, cv2.LINE_AA)
 
     # -- Live frame panel --
 
@@ -14315,7 +14527,9 @@ def process_video(input_path, output_path, sensitivity='medium', freeze_duration
         proc_win = ProcessingWindow(
             total_frames=max_frames, fps=fps,
             video_w=width, video_h=height,
-            algorithm=algorithm)
+            algorithm=algorithm,
+            observer_context=observer_context,
+            ledger=getattr(detector, 'ledger', None))
         proc_win.open()
 
     # ── Unified frame-result generator ─────────────────────────────

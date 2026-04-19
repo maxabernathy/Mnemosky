@@ -1,0 +1,660 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>mnemozine · tracksuit · loaders</title>
+<style>
+  :root{
+    --tile: 200px;
+    --gap: 28px;
+    --ink: #0f1410;
+    --muted: #3a4a3d;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    font-family: "Times New Roman", Times, serif;
+    color: var(--ink);
+    min-height: 100vh;
+    background:
+      radial-gradient(1200px 800px at 15% 20%, #e7efe0 0%, transparent 55%),
+      radial-gradient(900px 700px at 85% 10%, #cfdcbf 0%, transparent 60%),
+      radial-gradient(1100px 900px at 70% 85%, #9fb28b 0%, transparent 60%),
+      radial-gradient(800px 600px at 10% 90%, #b9c7a4 0%, transparent 55%),
+      linear-gradient(180deg, #aebf98 0%, #7e9472 100%);
+    background-attachment: fixed;
+    filter: saturate(1.02);
+  }
+  /* Blurred bokeh highlights layered on top of the body via pseudo-element */
+  body::before{
+    content:"";
+    position: fixed; inset:0;
+    pointer-events:none;
+    background:
+      radial-gradient(180px 180px at 12% 30%, rgba(255,255,255,.55), transparent 70%),
+      radial-gradient(140px 140px at 22% 78%, rgba(255,255,255,.45), transparent 70%),
+      radial-gradient(220px 220px at 78% 22%, rgba(255,255,255,.35), transparent 70%),
+      radial-gradient(160px 160px at 88% 70%, rgba(255,255,255,.40), transparent 70%),
+      radial-gradient(90px 90px at 50% 50%, rgba(255,255,255,.30), transparent 70%);
+    filter: blur(22px);
+    z-index:0;
+  }
+
+  header, footer{
+    position: relative; z-index: 2;
+    max-width: calc((var(--tile) + var(--gap)) * 5);
+    margin: 0 auto;
+    padding: 56px 28px 8px;
+    display:flex; align-items:baseline; justify-content: space-between;
+    color: #1a231b;
+  }
+  header .wordmark{
+    font-family: "Times New Roman", serif;
+    font-style: italic;
+    font-weight: 400;
+    font-size: 34px;
+    letter-spacing: .01em;
+    color: #1c2a1f;
+    text-shadow: 0 1px 0 rgba(255,255,255,.35);
+  }
+  header .meta{
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    letter-spacing: .18em;
+    text-transform: uppercase;
+    color: #2a3a2d;
+    opacity:.8;
+  }
+  footer{
+    padding: 18px 28px 60px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    letter-spacing: .18em;
+    text-transform: uppercase;
+    opacity:.8;
+  }
+
+  .grid{
+    position: relative; z-index: 2;
+    max-width: calc((var(--tile) + var(--gap)) * 5);
+    margin: 16px auto 0;
+    padding: 20px 28px 40px;
+    display:grid;
+    grid-template-columns: repeat(auto-fill, var(--tile));
+    gap: var(--gap);
+    justify-content: center;
+  }
+  .tile{
+    width: var(--tile); height: var(--tile);
+    position: relative;
+    border-radius: 14px;
+    background: rgba(255,255,255,.06);
+    backdrop-filter: blur(2px);
+    -webkit-backdrop-filter: blur(2px);
+    box-shadow:
+      inset 0 0 0 1px rgba(255,255,255,.18),
+      0 10px 30px -18px rgba(0,0,0,.35);
+    overflow: hidden;
+    isolation: isolate;
+  }
+  .tile .cap{
+    position:absolute; left:10px; bottom:8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 9.5px;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: rgba(255,255,255,.72);
+    mix-blend-mode: screen;
+    pointer-events:none;
+  }
+  .tile .num{
+    position:absolute; right:10px; top:8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 9.5px;
+    letter-spacing: .14em;
+    color: rgba(255,255,255,.55);
+    mix-blend-mode: screen;
+  }
+  .tile svg{ width:100%; height:100%; display:block; }
+
+  /* tiny subtle watermark inside the tile (appears on some tiles only) */
+  .tile .mark{
+    position:absolute; inset:0;
+    display:flex; align-items:center; justify-content:center;
+    font-family: "Times New Roman", serif;
+    font-style: italic;
+    font-size: 64px;
+    color: rgba(255,255,255,.06);
+    pointer-events:none;
+    user-select:none;
+  }
+
+  /* ---------- shared goo filter defs are inline inside each svg ---------- */
+
+  /* Some keyframes reused across loaders */
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes spinR { to { transform: rotate(-360deg); } }
+  @keyframes pulse { 0%,100%{ transform:scale(1)} 50%{ transform:scale(.78)} }
+  @keyframes breathe { 0%,100%{ transform:scale(.9)} 50%{ transform:scale(1.08)} }
+  @keyframes floaty { 0%,100%{ transform: translateY(0)} 50%{ transform: translateY(6px)} }
+  @keyframes drift1 { 0%{transform: translate(0,0)} 50%{transform: translate(10px,-8px)} 100%{transform: translate(0,0)} }
+  @keyframes drift2 { 0%{transform: translate(0,0)} 50%{transform: translate(-9px,10px)} 100%{transform: translate(0,0)} }
+  @keyframes drift3 { 0%{transform: translate(0,0)} 50%{transform: translate(12px,12px)} 100%{transform: translate(0,0)} }
+
+  /* collect → merge at center */
+  @keyframes gatherA { 0%,100%{ transform: translate(-38px,-28px) scale(.9)} 45%,55%{ transform: translate(0,0) scale(1)} }
+  @keyframes gatherB { 0%,100%{ transform: translate(36px,-30px) scale(.85)} 45%,55%{ transform: translate(0,0) scale(1)} }
+  @keyframes gatherC { 0%,100%{ transform: translate(-30px,34px) scale(.9)} 45%,55%{ transform: translate(0,0) scale(1)} }
+  @keyframes gatherD { 0%,100%{ transform: translate(32px,32px) scale(.8)} 45%,55%{ transform: translate(0,0) scale(1)} }
+
+  /* blob shape morph */
+  @keyframes morphA {
+    0%,100% { border-radius: 62% 38% 54% 46% / 46% 60% 40% 54%; }
+    33% { border-radius: 42% 58% 38% 62% / 58% 42% 58% 42%; }
+    66% { border-radius: 58% 42% 66% 34% / 40% 62% 38% 60%; }
+  }
+  @keyframes morphB {
+    0%,100% { border-radius: 50% 50% 42% 58% / 60% 44% 56% 40%; }
+    50% { border-radius: 40% 60% 62% 38% / 44% 58% 42% 56%; }
+  }
+
+  /* dripping down */
+  @keyframes drip {
+    0% { transform: translateY(-120%); }
+    60% { transform: translateY(50%); }
+    100% { transform: translateY(120%); }
+  }
+  @keyframes orbit {
+    from { transform: rotate(0deg) translateX(40px) rotate(0deg); }
+    to   { transform: rotate(360deg) translateX(40px) rotate(-360deg); }
+  }
+
+  /* specific per-tile use of transforms that need to also be translated */
+  .origin-center > * { transform-origin: 100px 100px; transform-box: view-box; }
+
+</style>
+</head>
+<body>
+
+<!-- ======= Shared defs: chrome gradient + goo filter ======= -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <!-- Liquid chrome radial -->
+    <radialGradient id="chrome" cx="40%" cy="30%" r="80%">
+      <stop offset="0%"  stop-color="#ffffff"/>
+      <stop offset="22%" stop-color="#e9eef0"/>
+      <stop offset="45%" stop-color="#9aa4a9"/>
+      <stop offset="70%" stop-color="#4f585c"/>
+      <stop offset="100%" stop-color="#1f2528"/>
+    </radialGradient>
+    <radialGradient id="chromeB" cx="65%" cy="70%" r="85%">
+      <stop offset="0%"  stop-color="#f6f8f7"/>
+      <stop offset="25%" stop-color="#c9d0cf"/>
+      <stop offset="55%" stop-color="#6b7478"/>
+      <stop offset="100%" stop-color="#161a1c"/>
+    </radialGradient>
+    <linearGradient id="chromeStripe" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#eef2f1"/>
+      <stop offset="30%" stop-color="#8a9397"/>
+      <stop offset="55%" stop-color="#2b3235"/>
+      <stop offset="72%" stop-color="#8a9397"/>
+      <stop offset="100%" stop-color="#1b1f21"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity=".9"/>
+      <stop offset="40%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- The classic "gooey" filter -->
+    <filter id="goo">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="6"/>
+      <feColorMatrix values="
+        1 0 0 0 0
+        0 1 0 0 0
+        0 0 1 0 0
+        0 0 0 22 -11"/>
+      <feComposite in="SourceGraphic" operator="atop"/>
+    </filter>
+    <filter id="gooStrong">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="9"/>
+      <feColorMatrix values="
+        1 0 0 0 0
+        0 1 0 0 0
+        0 0 1 0 0
+        0 0 0 26 -13"/>
+      <feComposite in="SourceGraphic" operator="atop"/>
+    </filter>
+    <filter id="gooSoft">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="4"/>
+      <feColorMatrix values="
+        1 0 0 0 0
+        0 1 0 0 0
+        0 0 1 0 0
+        0 0 0 18 -9"/>
+      <feComposite in="SourceGraphic" operator="atop"/>
+    </filter>
+  </defs>
+</svg>
+
+<header>
+  <div class="wordmark">mnemozine</div>
+  <div class="meta">tracksuit &nbsp;/&nbsp; loading states &nbsp;·&nbsp; v.01</div>
+</header>
+
+<section class="grid" id="grid">
+  <!-- Tiles injected by JS below -->
+</section>
+
+<footer>
+  <span>mnemozine · tracksuit</span>
+  <span>200 × 200 · indeterminate · 20 variants</span>
+</footer>
+
+<script>
+/* ---------------- helpers ---------------- */
+const svgNS = "http://www.w3.org/2000/svg";
+const grid = document.getElementById('grid');
+
+function tile(n, caption, mark, builder){
+  const el = document.createElement('div');
+  el.className = 'tile';
+  const svg = document.createElementNS(svgNS, 'svg');
+  svg.setAttribute('viewBox','0 0 200 200');
+  svg.setAttribute('width','200'); svg.setAttribute('height','200');
+  builder(svg);
+  el.appendChild(svg);
+  if (mark){
+    const m = document.createElement('div'); m.className='mark'; m.textContent = mark; el.appendChild(m);
+  }
+  const c = document.createElement('div'); c.className='cap'; c.textContent = caption; el.appendChild(c);
+  const num = document.createElement('div'); num.className='num'; num.textContent = String(n).padStart(2,'0'); el.appendChild(num);
+  grid.appendChild(el);
+  return svg;
+}
+
+function circle(svg, cx, cy, r, attrs = {}){
+  const c = document.createElementNS(svgNS,'circle');
+  c.setAttribute('cx',cx); c.setAttribute('cy',cy); c.setAttribute('r',r);
+  Object.entries(attrs).forEach(([k,v])=>c.setAttribute(k,v));
+  svg.appendChild(c); return c;
+}
+function ellipse(svg, cx, cy, rx, ry, attrs = {}){
+  const c = document.createElementNS(svgNS,'ellipse');
+  c.setAttribute('cx',cx); c.setAttribute('cy',cy); c.setAttribute('rx',rx); c.setAttribute('ry',ry);
+  Object.entries(attrs).forEach(([k,v])=>c.setAttribute(k,v));
+  svg.appendChild(c); return c;
+}
+function rect(svg, x,y,w,h,attrs={}){
+  const r = document.createElementNS(svgNS,'rect');
+  r.setAttribute('x',x); r.setAttribute('y',y); r.setAttribute('width',w); r.setAttribute('height',h);
+  Object.entries(attrs).forEach(([k,v])=>r.setAttribute(k,v));
+  svg.appendChild(r); return r;
+}
+function group(svg, attrs={}){
+  const g = document.createElementNS(svgNS,'g');
+  Object.entries(attrs).forEach(([k,v])=>g.setAttribute(k,v));
+  svg.appendChild(g); return g;
+}
+
+/* =====================================================
+   20 loaders
+   ===================================================== */
+
+/* 01 — Orbiters merging into core.  Three satellites orbit and get absorbed. */
+tile(1, 'orbiters', '', (svg)=>{
+  const g = group(svg, { filter:'url(#goo)' });
+  // core
+  const core = circle(g, 100, 100, 22, { fill:'url(#chrome)' });
+  core.style.transformOrigin='100px 100px';
+  core.style.animation='breathe 2.4s ease-in-out infinite';
+  // orbiters
+  const anims = [
+    { d: 2.1, r: 10, delay: 0 },
+    { d: 2.4, r: 8,  delay: -0.7 },
+    { d: 2.7, r: 11, delay: -1.4 },
+  ];
+  anims.forEach(a=>{
+    const sub = document.createElementNS(svgNS,'g');
+    sub.style.transformOrigin='100px 100px';
+    sub.style.animation = `spin ${a.d}s linear infinite`;
+    sub.style.animationDelay = a.delay+'s';
+    const dot = circle(sub, 100, 100 - 46, a.r, { fill:'url(#chromeB)' });
+    // breath on satellite
+    dot.style.transformOrigin='100px 54px';
+    dot.style.animation = `pulse ${a.d}s ease-in-out infinite`;
+    dot.style.animationDelay = a.delay+'s';
+    g.appendChild(sub);
+  });
+});
+
+/* 02 — Gather: 4 blobs come to center, merge, dissolve, repeat */
+tile(2, 'gather', '', (svg)=>{
+  const g = group(svg, { filter:'url(#gooStrong)' });
+  circle(g,100,100,18,{fill:'url(#chrome)'}).style.animation='breathe 3s ease-in-out infinite';
+  const blobs = [
+    {cx:100,cy:100,r:16,grad:'url(#chromeB)',anim:'gatherA'},
+    {cx:100,cy:100,r:14,grad:'url(#chrome)',anim:'gatherB'},
+    {cx:100,cy:100,r:15,grad:'url(#chromeB)',anim:'gatherC'},
+    {cx:100,cy:100,r:13,grad:'url(#chrome)',anim:'gatherD'},
+  ];
+  blobs.forEach((b,i)=>{
+    const c = circle(g,b.cx,b.cy,b.r,{fill:b.grad});
+    c.style.transformOrigin='100px 100px';
+    c.style.animation = `${b.anim} 3s ease-in-out infinite`;
+    c.style.animationDelay = (-i*.15)+'s';
+  });
+});
+
+/* 03 — Pendulum drip */
+tile(3, 'drip', '', (svg)=>{
+  const g = group(svg, { filter:'url(#goo)' });
+  // top reservoir
+  ellipse(g,100,48,36,14,{fill:'url(#chrome)'});
+  // neck morphs
+  const neck = ellipse(g,100,76,8,26,{fill:'url(#chromeB)'});
+  neck.style.transformOrigin='100px 60px';
+  neck.style.animation='pulse 1.6s ease-in-out infinite';
+  // dripping drops
+  for(let i=0;i<3;i++){
+    const d = circle(g, 100, 70, 11, {fill:'url(#chromeB)'});
+    d.style.animation = `drip 2.4s ${-i*0.8}s ease-in infinite`;
+  }
+  // bottom pool
+  ellipse(g,100,162,44,12,{fill:'url(#chrome)'});
+});
+
+/* 04 — Two-lobe merge (infinity) */
+tile(4, 'merge', '', (svg)=>{
+  const g = group(svg, { filter:'url(#gooStrong)' });
+  const a = circle(g,70,100,26,{fill:'url(#chrome)'});
+  const b = circle(g,130,100,26,{fill:'url(#chromeB)'});
+  a.style.transformOrigin='70px 100px';
+  b.style.transformOrigin='130px 100px';
+  a.style.animation = 'b04a 2.4s ease-in-out infinite';
+  b.style.animation = 'b04b 2.4s ease-in-out infinite';
+  // inject @keyframes
+  const st = document.createElement('style');
+  st.textContent = `
+    @keyframes b04a { 0%,100%{transform: translateX(-14px) scale(.9)} 50%{transform: translateX(30px) scale(1.05)}}
+    @keyframes b04b { 0%,100%{transform: translateX(14px) scale(.9)} 50%{transform: translateX(-30px) scale(1.05)}}
+  `;
+  document.head.appendChild(st);
+});
+
+/* 05 — CSS blob morph (single) */
+tile(5, 'morph', 'm', (svg)=>{
+  const fo = document.createElementNS(svgNS,'foreignObject');
+  fo.setAttribute('x',0); fo.setAttribute('y',0); fo.setAttribute('width',200); fo.setAttribute('height',200);
+  fo.innerHTML = `<div xmlns="http://www.w3.org/1999/xhtml" style="
+    width:100%;height:100%;display:flex;align-items:center;justify-content:center;">
+    <div style="
+      width:110px;height:110px;
+      background: radial-gradient(60% 60% at 35% 30%, #ffffff, #cdd5d9 30%, #6a7377 60%, #1b1f21 100%);
+      border-radius: 62% 38% 54% 46% / 46% 60% 40% 54%;
+      box-shadow: inset 10px -10px 30px rgba(255,255,255,.25), inset -10px 10px 30px rgba(0,0,0,.4);
+      animation: morphA 4s ease-in-out infinite, floaty 3.2s ease-in-out infinite;
+    "></div>
+  </div>`;
+  svg.appendChild(fo);
+});
+
+/* 06 — Goo bar: pills sliding & merging left→right */
+tile(6, 'bar', '', (svg)=>{
+  const g = group(svg, { filter:'url(#goo)' });
+  ellipse(g,100,100,70,10,{fill:'url(#chrome)'});
+  for (let i=0;i<4;i++){
+    const c = circle(g, 40, 100, 12, { fill:'url(#chromeB)'});
+    c.style.animation = `b06 2.6s linear infinite`;
+    c.style.animationDelay = (-i*.65)+'s';
+  }
+  const st = document.createElement('style');
+  st.textContent = `@keyframes b06 { 0%{transform:translateX(-10px) scale(.6); opacity:.0} 10%{opacity:1} 50%{transform:translateX(60px) scale(1.05)} 90%{opacity:1} 100%{transform:translateX(130px) scale(.6); opacity:0}}`;
+  document.head.appendChild(st);
+});
+
+/* 07 — Rotating chrome lozenge with satellite that re-merges */
+tile(7, 'satellite', '', (svg)=>{
+  const g = group(svg, { filter:'url(#goo)' });
+  const body = ellipse(g,100,100,30,20,{fill:'url(#chrome)'});
+  body.style.transformOrigin='100px 100px';
+  body.style.animation='spin 5s linear infinite, morphB 4s ease-in-out infinite';
+  const sat = circle(g,100,100,10,{fill:'url(#chromeB)'});
+  sat.style.transformOrigin='100px 100px';
+  sat.style.animation = 'b07 2.8s ease-in-out infinite';
+  const st=document.createElement('style');
+  st.textContent = `@keyframes b07 { 0%,100%{transform:translate(40px,0) scale(1)} 50%{transform:translate(0,0) scale(.3)} }`;
+  document.head.appendChild(st);
+});
+
+/* 08 — Quad merge (two sides collide) */
+tile(8, 'collide', '', (svg)=>{
+  const g = group(svg,{filter:'url(#gooStrong)'});
+  const l = circle(g,40,100,22,{fill:'url(#chrome)'});
+  const r = circle(g,160,100,22,{fill:'url(#chromeB)'});
+  const t = circle(g,100,40,16,{fill:'url(#chromeB)'});
+  const b = circle(g,100,160,16,{fill:'url(#chrome)'});
+  [l,r,t,b].forEach(e=>e.style.transformOrigin='100px 100px');
+  l.style.animation = 'b08l 2.4s ease-in-out infinite';
+  r.style.animation = 'b08r 2.4s ease-in-out infinite';
+  t.style.animation = 'b08t 2.4s ease-in-out infinite .6s';
+  b.style.animation = 'b08b 2.4s ease-in-out infinite .6s';
+  const st=document.createElement('style');
+  st.textContent = `
+    @keyframes b08l { 0%,100%{transform:translateX(0)} 50%{transform:translateX(60px) scale(1.05)} }
+    @keyframes b08r { 0%,100%{transform:translateX(0)} 50%{transform:translateX(-60px) scale(1.05)} }
+    @keyframes b08t { 0%,100%{transform:translateY(0)} 50%{transform:translateY(60px) scale(1.05)} }
+    @keyframes b08b { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-60px) scale(1.05)} }`;
+  document.head.appendChild(st);
+});
+
+/* 09 — Bouncing blob (mercury bead) */
+tile(9, 'bead', '', (svg)=>{
+  const g = group(svg, {filter:'url(#gooSoft)'});
+  ellipse(g,100,170,48,8,{fill:'url(#chrome)', opacity:.55});
+  const bead = ellipse(g,100,90,20,20,{fill:'url(#chrome)'});
+  bead.style.transformOrigin='100px 100px';
+  bead.style.animation = 'b09 1.6s cubic-bezier(.5,0,.5,1) infinite';
+  const st=document.createElement('style');
+  st.textContent = `@keyframes b09 {
+    0%{transform:translateY(-40px) scaleY(.85) scaleX(1.15)}
+    45%{transform:translateY(60px) scaleY(1.1) scaleX(.9)}
+    55%{transform:translateY(70px) scaleY(.55) scaleX(1.4)}
+    100%{transform:translateY(-40px) scaleY(.85) scaleX(1.15)}
+  }`;
+  document.head.appendChild(st);
+});
+
+/* 10 — Ring of 6 dots gooing together */
+tile(10, 'wreath', '', (svg)=>{
+  const g = group(svg, {filter:'url(#goo)'});
+  const R = 50;
+  for (let i=0;i<6;i++){
+    const a = (i/6)*Math.PI*2;
+    const cx = 100 + Math.cos(a)*R, cy = 100 + Math.sin(a)*R;
+    const d = circle(g,cx,cy,13,{fill: i%2 ? 'url(#chromeB)':'url(#chrome)'});
+    d.style.transformOrigin=`${cx}px ${cy}px`;
+    d.style.animation = `pulse 1.8s ease-in-out infinite`;
+    d.style.animationDelay = (-i*.25)+'s';
+  }
+  // rotating group
+  g.style.transformOrigin='100px 100px';
+  g.style.animation='spin 6s linear infinite';
+});
+
+/* 11 — Vertical drip + runup */
+tile(11, 'column', '', (svg)=>{
+  const g = group(svg,{filter:'url(#goo)'});
+  // column bar
+  rect(g,92,30,16,140,{fill:'url(#chromeStripe)', rx:8});
+  // rising/falling bead inside
+  const bead = circle(g,100,40,14,{fill:'url(#chrome)'});
+  bead.style.animation = 'b11 2.6s ease-in-out infinite';
+  const st=document.createElement('style');
+  st.textContent = `@keyframes b11 { 0%,100%{transform:translateY(-10px) scale(.9)} 50%{transform:translateY(115px) scale(1.15)}}`;
+  document.head.appendChild(st);
+});
+
+/* 12 — Three-blob triangle morphing */
+tile(12, 'trefoil', '', (svg)=>{
+  const g = group(svg,{filter:'url(#gooStrong)'});
+  const pts = [[100,60],[60,140],[140,140]];
+  pts.forEach(([x,y],i)=>{
+    const c = circle(g,x,y,26,{fill: i===1 ? 'url(#chromeB)' : 'url(#chrome)'});
+    c.style.transformOrigin=`${x}px ${y}px`;
+    c.style.animation = 'b12 2.6s ease-in-out infinite';
+    c.style.animationDelay = (-i*.5)+'s';
+  });
+  const st=document.createElement('style');
+  st.textContent = `@keyframes b12 { 0%,100%{transform:scale(1)} 50%{transform:translate(${0}px,${0}px) scale(.55)} }`;
+  document.head.appendChild(st);
+  // custom per-index translate
+  const kids = g.children;
+  kids[0].style.setProperty('animation-name','b12_0');
+  kids[1].style.setProperty('animation-name','b12_1');
+  kids[2].style.setProperty('animation-name','b12_2');
+  const st2=document.createElement('style');
+  st2.textContent = `
+    @keyframes b12_0 { 0%,100%{transform:translate(0,0) scale(1)} 50%{transform:translate(0,40px) scale(.55)} }
+    @keyframes b12_1 { 0%,100%{transform:translate(0,0) scale(1)} 50%{transform:translate(40px,-40px) scale(.55)} }
+    @keyframes b12_2 { 0%,100%{transform:translate(0,0) scale(1)} 50%{transform:translate(-40px,-40px) scale(.55)} }`;
+  document.head.appendChild(st2);
+});
+
+/* 13 — Horizontal s-curve blob snake */
+tile(13, 'snake', '', (svg)=>{
+  const g = group(svg,{filter:'url(#goo)'});
+  for (let i=0;i<7;i++){
+    const c = circle(g, 20+i*26, 100, 14, {fill: i%2?'url(#chrome)':'url(#chromeB)'});
+    c.style.transformOrigin=`${20+i*26}px 100px`;
+    c.style.animation = 'b13 1.8s ease-in-out infinite';
+    c.style.animationDelay = (-i*.18)+'s';
+  }
+  const st=document.createElement('style');
+  st.textContent = `@keyframes b13 { 0%,100%{transform:translateY(-16px) scale(.9)} 50%{transform:translateY(16px) scale(1.05)}}`;
+  document.head.appendChild(st);
+});
+
+/* 14 — Big blob with inner child blob morphing */
+tile(14, 'cell', '', (svg)=>{
+  const g = group(svg,{filter:'url(#goo)'});
+  const outer = ellipse(g,100,100,56,56,{fill:'url(#chrome)'});
+  outer.style.transformOrigin='100px 100px';
+  outer.style.animation='morphB 3.8s ease-in-out infinite';
+  // inner orbitor
+  const inner = circle(g,100,100,18,{fill:'url(#chromeB)'});
+  inner.style.transformOrigin='100px 100px';
+  inner.style.animation='b14 3s ease-in-out infinite';
+  const st=document.createElement('style');
+  st.textContent = `@keyframes b14 {
+    0%,100%{transform:translate(22px,-10px) scale(.8)}
+    33%{transform:translate(-18px,18px) scale(1.0)}
+    66%{transform:translate(10px,22px) scale(.7)}
+  }`;
+  document.head.appendChild(st);
+});
+
+/* 15 — Chromed progress pill (indeterminate sweep) */
+tile(15, 'sweep', 't', (svg)=>{
+  const g = group(svg, {filter:'url(#gooSoft)'});
+  // capsule
+  rect(g,30,92,140,16,{rx:8, fill:'rgba(255,255,255,.18)'});
+  const bead = rect(g,30,90,40,20,{rx:10, fill:'url(#chromeStripe)'});
+  bead.style.animation='b15 1.8s ease-in-out infinite';
+  const st=document.createElement('style');
+  st.textContent = `@keyframes b15 { 0%{transform:translateX(-10px) scaleX(.5)} 50%{transform:translateX(80px) scaleX(1.4)} 100%{transform:translateX(140px) scaleX(.5)}}`;
+  document.head.appendChild(st);
+});
+
+/* 16 — Two drops forming an "8" */
+tile(16, 'eight', '', (svg)=>{
+  const g = group(svg,{filter:'url(#gooStrong)'});
+  const top = circle(g,100,70,24,{fill:'url(#chrome)'});
+  const bot = circle(g,100,130,24,{fill:'url(#chromeB)'});
+  top.style.transformOrigin='100px 70px';
+  bot.style.transformOrigin='100px 130px';
+  top.style.animation = 'b16t 2.6s ease-in-out infinite';
+  bot.style.animation = 'b16b 2.6s ease-in-out infinite';
+  const st=document.createElement('style');
+  st.textContent = `
+    @keyframes b16t { 0%,100%{transform:translateY(-20px) scale(1)} 50%{transform:translateY(30px) scale(.85)} }
+    @keyframes b16b { 0%,100%{transform:translateY(20px) scale(1)} 50%{transform:translateY(-30px) scale(.85)} }`;
+  document.head.appendChild(st);
+});
+
+/* 17 — Pendulum arm with merging bead */
+tile(17, 'pendulum', '', (svg)=>{
+  const g = group(svg,{filter:'url(#goo)'});
+  const pivot = circle(g,100,40,10,{fill:'url(#chrome)'});
+  const armG = document.createElementNS(svgNS,'g');
+  armG.style.transformOrigin='100px 40px';
+  armG.style.animation='b17 2s ease-in-out infinite';
+  g.appendChild(armG);
+  // rod as stretched ellipse
+  ellipse(armG,100,100,7,60,{fill:'url(#chromeStripe)'});
+  circle(armG,100,150,18,{fill:'url(#chromeB)'});
+  const st=document.createElement('style');
+  st.textContent = `@keyframes b17 { 0%,100%{transform:rotate(-35deg)} 50%{transform:rotate(35deg)} }`;
+  document.head.appendChild(st);
+});
+
+/* 18 — Breathing cluster (many small blobs) */
+tile(18, 'cluster', 'm', (svg)=>{
+  const g = group(svg,{filter:'url(#gooStrong)'});
+  const pts = [
+    [100,100,24],[72,82,14],[130,80,13],[80,130,15],[128,128,14],
+    [100,66,10],[64,110,10],[138,112,11],[100,138,10]
+  ];
+  pts.forEach(([x,y,r],i)=>{
+    const c = circle(g,x,y,r,{fill: i%2?'url(#chromeB)':'url(#chrome)'});
+    c.style.transformOrigin=`${x}px ${y}px`;
+    c.style.animation = 'breathe 2.6s ease-in-out infinite';
+    c.style.animationDelay = (-i*.15)+'s';
+  });
+});
+
+/* 19 — Eye — iris merges from satellites */
+tile(19, 'eye', '', (svg)=>{
+  const g = group(svg,{filter:'url(#goo)'});
+  ellipse(g,100,100,70,30,{fill:'url(#chrome)'});
+  const iris = circle(g,100,100,18,{fill:'url(#chromeB)'});
+  iris.style.transformOrigin='100px 100px';
+  iris.style.animation = 'b19iris 3s ease-in-out infinite';
+  for (let i=0;i<3;i++){
+    const s = circle(g,100,100,9,{fill:'url(#chromeB)'});
+    s.style.transformOrigin='100px 100px';
+    s.style.animation = `b19s${i} 3s ease-in-out infinite`;
+  }
+  const st=document.createElement('style');
+  st.textContent = `
+    @keyframes b19iris { 0%,100%{transform:translateX(-30px) scale(.9)} 50%{transform:translateX(30px) scale(1.05)} }
+    @keyframes b19s0 { 0%,100%{transform:translate(-50px,-6px) scale(.2)} 50%{transform:translate(0,0) scale(1)} }
+    @keyframes b19s1 { 0%,100%{transform:translate(50px,8px) scale(.2)} 50%{transform:translate(0,0) scale(1)} }
+    @keyframes b19s2 { 0%,100%{transform:translate(10px,-18px) scale(.2)} 50%{transform:translate(0,0) scale(1)} }
+  `;
+  document.head.appendChild(st);
+});
+
+/* 20 — Spinner of 3 bold blobs with goo merging (mercury gear) */
+tile(20, 'gear', 't', (svg)=>{
+  const outer = document.createElementNS(svgNS,'g');
+  outer.style.transformOrigin='100px 100px';
+  outer.style.animation='spin 3.2s cubic-bezier(.7,0,.3,1) infinite';
+  svg.appendChild(outer);
+  const g = document.createElementNS(svgNS,'g');
+  g.setAttribute('filter','url(#gooStrong)');
+  outer.appendChild(g);
+  circle(g,100,100,16,{fill:'url(#chrome)'});
+  for (let i=0;i<3;i++){
+    const a = (i/3)*Math.PI*2;
+    const x = 100 + Math.cos(a)*44;
+    const y = 100 + Math.sin(a)*44;
+    const d = circle(g,x,y,18,{fill: i===1 ? 'url(#chromeB)' : 'url(#chrome)'});
+    d.style.transformOrigin=`${x}px ${y}px`;
+    d.style.animation = `pulse 1.6s ease-in-out infinite`;
+    d.style.animationDelay = (-i*.3)+'s';
+  }
+});
+</script>
+
+</body>
+</html>
