@@ -155,6 +155,11 @@ def main():
         f"--output-filename={args.output_name}.exe",
         "--output-dir=build",
 
+        # Auto-accept Nuitka's MinGW64 / ccache / depends-tool downloads
+        # so the build runs unattended.  On Windows without a pre-installed
+        # C compiler, Nuitka fetches MinGW64 itself (~400 MB).
+        "--assume-yes-for-downloads",
+
         # Keep console window for CLI output
         "--windows-console-mode=force",
 

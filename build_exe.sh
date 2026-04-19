@@ -125,6 +125,9 @@ CMD=(
     "--output-filename=${OUTPUT_NAME}.exe"
     --output-dir=build
 
+    # Auto-accept MinGW64 / ccache downloads (unattended builds)
+    --assume-yes-for-downloads
+
     # Keep console for CLI output
     --windows-console-mode=force
 
